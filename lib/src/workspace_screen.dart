@@ -59,6 +59,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   RealtimeChannel? _serverRosterChannel;
   final Map<String, RealtimeChannel> _voicePresenceChannels =
       <String, RealtimeChannel>{};
+  final Set<String> _pausedVoicePresenceChannelIds = <String>{};
   bool _displayNamePromptShown = false;
 
   @override
@@ -124,6 +125,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   Future<void> _closeVoicePresenceChannels({bool resetUi = true}) async {
     final channels = _voicePresenceChannels.values.toList();
     _voicePresenceChannels.clear();
+    _pausedVoicePresenceChannelIds.clear();
     if (resetUi && mounted) {
       setState(() {
         _voiceParticipantsByChannel = const <String, List<VoiceParticipant>>{};
@@ -351,7 +353,11 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     List<ChannelSummary> channels,
   ) async {
     final voiceChannels = channels
-        .where((channel) => channel.kind == ChannelKind.voice)
+        .where(
+          (channel) =>
+              channel.kind == ChannelKind.voice &&
+              !_pausedVoicePresenceChannelIds.contains(channel.id),
+        )
         .toList();
     final desiredChannelIds = voiceChannels
         .map((channel) => channel.id)
@@ -459,6 +465,39 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         );
       }
     }
+  }
+
+  Future<void> _pauseVoicePresenceChannel(String channelId) async {
+    _pausedVoicePresenceChannelIds.add(channelId);
+    final realtimeChannel = _voicePresenceChannels.remove(channelId);
+    if (realtimeChannel != null) {
+      await Supabase.instance.client.removeChannel(realtimeChannel);
+    }
+  }
+
+  Future<void> _resumeVoicePresenceChannel(String channelId) async {
+    _pausedVoicePresenceChannelIds.remove(channelId);
+    final selectedServer = _selectedServer;
+    if (selectedServer == null) {
+      return;
+    }
+    final channel = _channels.firstWhere(
+      (item) => item.id == channelId,
+      orElse: () => ChannelSummary(
+        id: '',
+        serverId: '',
+        categoryId: null,
+        name: '',
+        kind: ChannelKind.voice,
+        position: 0,
+        createdBy: '',
+        createdAt: DateTime.fromMillisecondsSinceEpoch(0),
+      ),
+    );
+    if (channel.id.isEmpty || channel.kind != ChannelKind.voice) {
+      return;
+    }
+    await _subscribeVoicePresenceChannel(selectedServer.id, channel);
   }
 
   void _syncVoicePresence(String channelId, RealtimeChannel realtimeChannel) {
@@ -622,14 +661,20 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
     if (_activeVoiceChannel?.id != selectedChannel.id) {
       final previousActive = _activeVoiceController;
+      final previousChannelId = _activeVoiceChannel?.id;
       _activeVoiceController = null;
       _activeVoiceChannel = null;
       setState(() {});
       await previousActive?.close();
+      if (previousChannelId != null) {
+        await _resumeVoicePresenceChannel(previousChannelId);
+      }
     }
 
+    await _pauseVoicePresenceChannel(selectedChannel.id);
     await targetController.join();
     if (!mounted || !targetController.joined) {
+      await _resumeVoicePresenceChannel(selectedChannel.id);
       return;
     }
 
@@ -665,6 +710,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
     if (!keepAsPreview) {
       await activeController.close();
+    }
+    if (activeChannel != null) {
+      await _resumeVoicePresenceChannel(activeChannel.id);
     }
   }
 
