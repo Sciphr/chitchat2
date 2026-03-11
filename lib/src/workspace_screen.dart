@@ -1930,8 +1930,12 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           final presenceParticipants =
               voiceParticipantsByChannel[activeChannelId] ??
               const <VoiceParticipant>[];
+          final activePresenceParticipants =
+              activeVoiceController.presenceParticipants.isEmpty
+              ? activeVoiceController.participants
+              : activeVoiceController.presenceParticipants;
           final liveParticipantsByUserId = {
-            for (final participant in activeVoiceController.participants)
+            for (final participant in activePresenceParticipants)
               participant.userId: participant,
           };
           final mergedParticipants = presenceParticipants
@@ -1954,8 +1958,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           final mergedUserIds = mergedParticipants
               .map((participant) => participant.userId)
               .toSet();
-          for (final liveParticipant in activeVoiceController.participants) {
-            if (!mergedUserIds.contains(liveParticipant.userId)) {
+          for (final liveParticipant in activePresenceParticipants) {
+            if (liveParticipant.isSelf &&
+                !mergedUserIds.contains(liveParticipant.userId)) {
               mergedParticipants.add(liveParticipant);
             }
           }
@@ -1996,11 +2001,12 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 onSelectChannel: _selectChannel,
                 onRenameCategory: _promptRenameCategory,
                 onReorderCategories: _reorderCategories,
-                onMoveChannel: _moveChannel,
-                onOpenSettings: _openServerSettings,
-                onOpenUserSettings: _openUserSettings,
-                onSignOut: widget.authService.signOut,
-                currentDisplayName: widget.authService.displayName,
+            onMoveChannel: _moveChannel,
+            onOpenSettings: _openServerSettings,
+            onCopyInviteCode: _copyInviteCode,
+            onOpenUserSettings: _openUserSettings,
+            onSignOut: widget.authService.signOut,
+            currentDisplayName: widget.authService.displayName,
                 onStartDirectMessage: ({
                   required userId,
                   required displayName,
@@ -2021,11 +2027,12 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                   onSelectChannel: _selectChannel,
                   onRenameCategory: _promptRenameCategory,
                   onReorderCategories: _reorderCategories,
-                  onMoveChannel: _moveChannel,
-                  onOpenSettings: _openServerSettings,
-                  onOpenUserSettings: _openUserSettings,
-                  onSignOut: widget.authService.signOut,
-                  currentDisplayName: widget.authService.displayName,
+              onMoveChannel: _moveChannel,
+              onOpenSettings: _openServerSettings,
+              onCopyInviteCode: _copyInviteCode,
+              onOpenUserSettings: _openUserSettings,
+              onSignOut: widget.authService.signOut,
+              currentDisplayName: widget.authService.displayName,
                   onStartDirectMessage: ({
                     required userId,
                     required displayName,
@@ -2064,6 +2071,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                     conversation: selectedDirectConversation,
                     repository: widget.workspaceRepository,
                     currentUserId: widget.authService.userId,
+                    use24HourTime: widget.preferences.use24HourTime,
                     motionDuration: widget.preferences.motionDuration,
                     animateMessages: widget.preferences.messageAnimations &&
                         !widget.preferences.reduceMotion,
@@ -2090,6 +2098,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 canManageMessages:
                     _serverAccess?.hasPermission(ServerPermission.manageMessages) ??
                     false,
+                use24HourTime: widget.preferences.use24HourTime,
                 motionDuration: widget.preferences.motionDuration,
                 animateMessages:
                     widget.preferences.messageAnimations &&
@@ -2405,10 +2414,13 @@ class _SidebarAccountFooter extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            FilledButton.tonalIcon(
+            IconButton.filledTonal(
               onPressed: onSignOut,
-              icon: const Icon(Icons.logout, size: 18),
-              label: const Text('Log out'),
+              icon: const Icon(Icons.logout, size: 20),
+              visualDensity: const VisualDensity(
+                horizontal: 0.6,
+                vertical: 0.6,
+              ),
             ),
           ],
         ),
@@ -2656,7 +2668,6 @@ class _UnreadBadge extends StatelessWidget {
 class _WorkspaceRailTile extends StatelessWidget {
   const _WorkspaceRailTile({
     required this.label,
-    required this.tooltip,
     required this.selected,
     required this.icon,
     required this.badgeCount,
@@ -2664,7 +2675,6 @@ class _WorkspaceRailTile extends StatelessWidget {
   });
 
   final String label;
-  final String tooltip;
   final bool selected;
   final IconData icon;
   final int badgeCount;
@@ -2673,48 +2683,71 @@ class _WorkspaceRailTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(18),
-        child: Ink(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
+    return InkWell(
+      onTap: onTap,
+      mouseCursor: SystemMouseCursors.click,
+      borderRadius: BorderRadius.circular(18),
+      child: Ink(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(
+          color: selected
+              ? Theme.of(context).colorScheme.primary
+              : palette.panelStrong,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
             color: selected
-                ? Theme.of(context).colorScheme.primary
-                : palette.panelStrong,
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(
-              color: selected
-                  ? Theme.of(context).colorScheme.secondary
-                  : palette.border,
-              width: selected ? 4 : 1.5,
-            ),
+                ? Theme.of(context).colorScheme.secondary
+                : palette.border,
+            width: selected ? 4 : 1.5,
           ),
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Positioned.fill(
-                child: Center(
-                  child: Icon(
-                    icon,
-                    size: 28,
-                    color: selected
-                        ? Theme.of(context).colorScheme.onPrimary
-                        : Theme.of(context).colorScheme.onSurface,
+          boxShadow: selected
+              ? [
+                  BoxShadow(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .primary
+                        .withAlpha(120),
+                    blurRadius: 20,
+                    spreadRadius: 3,
+                  ),
+                ]
+              : const [],
+        ),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Positioned.fill(
+              child: Center(
+                child: Icon(
+                  icon,
+                  size: 28,
+                  color: selected
+                      ? Theme.of(context).colorScheme.onPrimary
+                      : Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+            ),
+            if (selected)
+              Positioned(
+                left: -1,
+                top: 14,
+                bottom: 14,
+                child: Container(
+                  width: 6,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.secondary,
+                    borderRadius: BorderRadius.circular(999),
                   ),
                 ),
               ),
-              if (badgeCount > 0)
-                Positioned(
-                  top: -6,
-                  right: -6,
-                  child: _UnreadBadge(count: badgeCount),
-                ),
-            ],
-          ),
+            if (badgeCount > 0)
+              Positioned(
+                top: -6,
+                right: -6,
+                child: _UnreadBadge(count: badgeCount),
+              ),
+          ],
         ),
       ),
     );
@@ -2799,17 +2832,14 @@ class _ServerRail extends StatelessWidget {
           IconButton(
             onPressed: onCreateServer,
             icon: const Icon(Icons.add_business),
-            tooltip: 'Create server',
           ),
           IconButton(
             onPressed: onJoinServer,
             icon: const Icon(Icons.group_add),
-            tooltip: 'Join by invite',
           ),
           IconButton(
             onPressed: () => onRefresh(selectFirstServer: false),
             icon: const Icon(Icons.refresh),
-            tooltip: 'Refresh servers',
           ),
           const Divider(height: 1),
           Expanded(
@@ -2829,7 +2859,6 @@ class _ServerRail extends StatelessWidget {
                       if (index == 0) {
                         return _WorkspaceRailTile(
                           label: 'DMs',
-                          tooltip: 'Direct messages',
                           selected: selectedDirectMessages,
                           icon: Icons.forum_outlined,
                           badgeCount: directUnreadCount,
@@ -2838,81 +2867,78 @@ class _ServerRail extends StatelessWidget {
                       }
                       final server = servers[index - 1];
                       final selected = server.id == selectedServerId;
-                      return Tooltip(
-                        message: server.name,
-                        child: GestureDetector(
-                          onSecondaryTapDown: (details) {
-                            unawaited(
-                              _showServerMenu(
-                                context,
-                                details.globalPosition,
-                                server,
-                              ),
-                            );
-                          },
-                          child: InkWell(
-                            onTap: () => onSelectServer(server),
-                            mouseCursor: SystemMouseCursors.click,
-                            borderRadius: BorderRadius.circular(18),
-                            child: Ink(
-                              width: 64,
-                              height: 64,
-                              decoration: BoxDecoration(
+                      return GestureDetector(
+                        onSecondaryTapDown: (details) {
+                          unawaited(
+                            _showServerMenu(
+                              context,
+                              details.globalPosition,
+                              server,
+                            ),
+                          );
+                        },
+                        child: InkWell(
+                          onTap: () => onSelectServer(server),
+                          mouseCursor: SystemMouseCursors.click,
+                          borderRadius: BorderRadius.circular(18),
+                          child: Ink(
+                            width: 64,
+                            height: 64,
+                            decoration: BoxDecoration(
+                              color: selected
+                                  ? Theme.of(context).colorScheme.primary
+                                  : palette.panelStrong,
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(
                                 color: selected
-                                    ? Theme.of(context).colorScheme.primary
-                                    : palette.panelStrong,
-                                borderRadius: BorderRadius.circular(18),
-                                border: Border.all(
-                                  color: selected
-                                      ? Theme.of(context).colorScheme.secondary
-                                      : palette.border,
-                                  width: selected ? 4 : 1.5,
-                                ),
-                                boxShadow: selected
-                                    ? [
-                                        BoxShadow(
-                                          color: Theme.of(
-                                            context,
-                                          ).colorScheme.primary.withAlpha(120),
-                                          blurRadius: 20,
-                                          spreadRadius: 3,
-                                        ),
-                                      ]
-                                    : const [],
+                                    ? Theme.of(context).colorScheme.secondary
+                                    : palette.border,
+                                width: selected ? 4 : 1.5,
                               ),
-                              child: Stack(
-                                children: [
-                                  Positioned.fill(
-                                    child: ClipRRect(
-                                      borderRadius: BorderRadius.circular(15),
-                                      child: _ServerAvatar(
-                                        name: server.name,
-                                        avatarUrl: avatarUrlForPath(
-                                          server.avatarPath,
+                              boxShadow: selected
+                                  ? [
+                                      BoxShadow(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary.withAlpha(120),
+                                        blurRadius: 20,
+                                        spreadRadius: 3,
+                                      ),
+                                    ]
+                                  : const [],
+                            ),
+                            child: Stack(
+                              children: [
+                                Positioned.fill(
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(15),
+                                    child: _ServerAvatar(
+                                      name: server.name,
+                                      avatarUrl: avatarUrlForPath(
+                                        server.avatarPath,
+                                      ),
+                                      selected: selected,
+                                    ),
+                                  ),
+                                ),
+                                if (selected)
+                                  Positioned(
+                                    left: -1,
+                                    top: 14,
+                                    bottom: 14,
+                                    child: Container(
+                                      width: 6,
+                                      decoration: BoxDecoration(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.secondary,
+                                        borderRadius: BorderRadius.circular(
+                                          999,
                                         ),
-                                        selected: selected,
                                       ),
                                     ),
                                   ),
-                                  if (selected)
-                                    Positioned(
-                                      left: -1,
-                                      top: 14,
-                                      bottom: 14,
-                                      child: Container(
-                                        width: 6,
-                                        decoration: BoxDecoration(
-                                          color: Theme.of(
-                                            context,
-                                          ).colorScheme.secondary,
-                                          borderRadius: BorderRadius.circular(
-                                            999,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                ],
-                              ),
+                              ],
                             ),
                           ),
                         ),
@@ -2985,6 +3011,7 @@ class _ChannelSidebar extends StatefulWidget {
     required this.onReorderCategories,
     required this.onMoveChannel,
     required this.onOpenSettings,
+    required this.onCopyInviteCode,
     required this.onOpenUserSettings,
     required this.onSignOut,
     required this.currentDisplayName,
@@ -3010,6 +3037,7 @@ class _ChannelSidebar extends StatefulWidget {
   )
   onMoveChannel;
   final Future<void> Function() onOpenSettings;
+  final Future<void> Function() onCopyInviteCode;
   final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
   final String currentDisplayName;
@@ -3087,11 +3115,36 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                   : Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          selectedServer.name,
-                          style: const TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.w700,
+                        InkWell(
+                          onTap: widget.onCopyInviteCode,
+                          mouseCursor: SystemMouseCursors.click,
+                          borderRadius: BorderRadius.circular(14),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                              vertical: 2,
+                            ),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    selectedServer.name,
+                                    style: const TextStyle(
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Icon(
+                                  Icons.content_copy_outlined,
+                                  size: 18,
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant,
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                         const SizedBox(height: 12),
@@ -4214,6 +4267,7 @@ class TextChannelView extends StatefulWidget {
     required this.currentUserId,
     required this.canSendMessages,
     required this.canManageMessages,
+    required this.use24HourTime,
     required this.motionDuration,
     required this.animateMessages,
     required this.onStartDirectMessage,
@@ -4224,6 +4278,7 @@ class TextChannelView extends StatefulWidget {
   final String currentUserId;
   final bool canSendMessages;
   final bool canManageMessages;
+  final bool use24HourTime;
   final Duration motionDuration;
   final bool animateMessages;
   final Future<void> Function({
@@ -4372,6 +4427,7 @@ class _TextChannelViewState extends State<TextChannelView> {
                           senderDisplayName: message.senderDisplayName,
                           body: message.body,
                           createdAt: message.createdAt,
+                          use24HourTime: widget.use24HourTime,
                           replyToBody: message.replyToBody,
                           replyToSenderDisplayName:
                               message.replyToSenderDisplayName,
@@ -4425,7 +4481,6 @@ class _TextChannelViewState extends State<TextChannelView> {
                         }
                       : null,
                   icon: const Icon(Icons.sentiment_satisfied_alt),
-                  tooltip: 'Insert emoji',
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
@@ -4434,9 +4489,6 @@ class _TextChannelViewState extends State<TextChannelView> {
                       ? _sendGif
                       : null,
                   icon: const Icon(Icons.gif_box_outlined),
-                  tooltip: widget.repository.hasGiphyApiKey
-                      ? 'Send GIF'
-                      : 'Giphy API key not configured',
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -4486,6 +4538,7 @@ class DirectMessageView extends StatefulWidget {
     required this.conversation,
     required this.repository,
     required this.currentUserId,
+    required this.use24HourTime,
     required this.motionDuration,
     required this.animateMessages,
     required this.onStartDirectMessage,
@@ -4494,6 +4547,7 @@ class DirectMessageView extends StatefulWidget {
   final DirectConversationSummary conversation;
   final WorkspaceRepository repository;
   final String currentUserId;
+  final bool use24HourTime;
   final Duration motionDuration;
   final bool animateMessages;
   final Future<void> Function({
@@ -4648,6 +4702,7 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                           senderDisplayName: message.senderDisplayName,
                           body: message.body,
                           createdAt: message.createdAt,
+                          use24HourTime: widget.use24HourTime,
                           replyToBody: message.replyToBody,
                           replyToSenderDisplayName:
                               message.replyToSenderDisplayName,
@@ -4708,15 +4763,11 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                     }
                   },
                   icon: const Icon(Icons.sentiment_satisfied_alt),
-                  tooltip: 'Insert emoji',
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
                   onPressed: widget.repository.hasGiphyApiKey ? _sendGif : null,
                   icon: const Icon(Icons.gif_box_outlined),
-                  tooltip: widget.repository.hasGiphyApiKey
-                      ? 'Send GIF'
-                      : 'Giphy API key not configured',
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -4763,6 +4814,7 @@ class _ChatMessageCard extends StatefulWidget {
     required this.senderDisplayName,
     required this.body,
     required this.createdAt,
+    required this.use24HourTime,
     required this.replyToBody,
     required this.replyToSenderDisplayName,
     required this.deleted,
@@ -4779,6 +4831,7 @@ class _ChatMessageCard extends StatefulWidget {
   final String senderDisplayName;
   final String body;
   final DateTime createdAt;
+  final bool use24HourTime;
   final String? replyToBody;
   final String? replyToSenderDisplayName;
   final bool deleted;
@@ -4828,7 +4881,10 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                           style: const TextStyle(fontWeight: FontWeight.w700),
                         ),
                         Text(
-                          _formatTime(widget.createdAt),
+                          _formatTime(
+                            widget.createdAt,
+                            use24HourTime: widget.use24HourTime,
+                          ),
                           style: TextStyle(
                             color: Theme.of(context).colorScheme.onSurfaceVariant,
                           ),
@@ -4845,7 +4901,6 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                         IconButton(
                           onPressed: widget.onReply,
                           icon: const Icon(Icons.reply, size: 18),
-                          tooltip: 'Reply',
                           visualDensity: VisualDensity.compact,
                         ),
                         IconButton(
@@ -4856,14 +4911,12 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                             }
                           },
                           icon: const Icon(Icons.emoji_emotions_outlined, size: 18),
-                          tooltip: 'React',
                           visualDensity: VisualDensity.compact,
                         ),
                         if (widget.canDelete)
                           IconButton(
                             onPressed: widget.onDelete,
                             icon: const Icon(Icons.delete_outline, size: 18),
-                            tooltip: 'Delete',
                             visualDensity: VisualDensity.compact,
                           ),
                       ],
@@ -5523,18 +5576,12 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                     children: [
                       IconButton.filledTonal(
                         onPressed: voiceController.toggleMute,
-                        tooltip: voiceController.muted
-                            ? 'Unmute microphone'
-                            : 'Mute microphone',
                         icon: Icon(
                           voiceController.muted ? Icons.mic_off : Icons.mic,
                         ),
                       ),
                       IconButton.filledTonal(
                         onPressed: voiceController.toggleDeafen,
-                        tooltip: voiceController.deafened
-                            ? 'Undeafen'
-                            : 'Deafen',
                         icon: Icon(
                           voiceController.deafened
                               ? Icons.hearing_disabled
@@ -5547,9 +5594,6 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                                   ? voiceController.stopVisualShare
                                   : voiceController.startCameraShare)
                             : null,
-                        tooltip: voiceController.shareKind == ShareKind.camera
-                            ? 'Stop camera'
-                            : 'Toggle camera',
                         icon: Icon(
                           voiceController.shareKind == ShareKind.camera
                               ? Icons.videocam_off
@@ -5584,9 +5628,6 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                                 }
                               }
                             : null,
-                        tooltip: voiceController.shareKind == ShareKind.screen
-                            ? 'Stop screen share'
-                            : 'Share screen',
                         icon: Icon(
                           voiceController.shareKind == ShareKind.screen
                               ? Icons.stop_screen_share
@@ -5595,7 +5636,6 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                       ),
                       IconButton.filled(
                         onPressed: voiceController.leave,
-                        tooltip: 'Leave call',
                         icon: const Icon(Icons.call_end),
                       ),
                     ],
@@ -6047,18 +6087,12 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                     children: [
                       IconButton.filledTonal(
                         onPressed: voiceController.toggleMute,
-                        tooltip: voiceController.muted
-                            ? 'Unmute microphone'
-                            : 'Mute microphone',
                         icon: Icon(
                           voiceController.muted ? Icons.mic_off : Icons.mic,
                         ),
                       ),
                       IconButton.filledTonal(
                         onPressed: voiceController.toggleDeafen,
-                        tooltip: voiceController.deafened
-                            ? 'Undeafen'
-                            : 'Deafen',
                         icon: Icon(
                           voiceController.deafened
                               ? Icons.hearing_disabled
@@ -6071,9 +6105,6 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                                   ? voiceController.stopVisualShare
                                   : voiceController.startCameraShare)
                             : null,
-                        tooltip: voiceController.shareKind == ShareKind.camera
-                            ? 'Stop camera'
-                            : 'Toggle camera',
                         icon: Icon(
                           voiceController.shareKind == ShareKind.camera
                               ? Icons.videocam_off
@@ -6109,9 +6140,6 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                                 }
                               }
                             : null,
-                        tooltip: voiceController.shareKind == ShareKind.screen
-                            ? 'Stop screen share'
-                            : 'Share screen',
                         icon: Icon(
                           voiceController.shareKind == ShareKind.screen
                               ? Icons.stop_screen_share
@@ -6120,7 +6148,6 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                       ),
                       IconButton.filled(
                         onPressed: widget.onLeaveCall,
-                        tooltip: 'Leave call',
                         icon: const Icon(Icons.call_end),
                       ),
                     ],
@@ -6241,9 +6268,6 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                             onPressed: widget.fullscreenMode
                                 ? () => Navigator.of(context).pop()
                                 : () => _openFullscreen(context),
-                            tooltip: widget.fullscreenMode
-                                ? 'Exit full screen'
-                                : 'Full screen',
                             icon: Icon(
                               widget.fullscreenMode
                                   ? Icons.fullscreen_exit
@@ -7030,8 +7054,13 @@ class _EmptyState extends StatelessWidget {
   }
 }
 
-String _formatTime(DateTime timestamp) {
-  final hours = timestamp.hour.toString().padLeft(2, '0');
+String _formatTime(DateTime timestamp, {bool use24HourTime = false}) {
+  final hours = timestamp.hour;
   final minutes = timestamp.minute.toString().padLeft(2, '0');
-  return '$hours:$minutes';
+  if (use24HourTime) {
+    return '${hours.toString().padLeft(2, '0')}:$minutes';
+  }
+  final suffix = hours >= 12 ? 'PM' : 'AM';
+  final normalizedHour = hours % 12 == 0 ? 12 : hours % 12;
+  return '$normalizedHour:$minutes $suffix';
 }

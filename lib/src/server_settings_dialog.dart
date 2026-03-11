@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'app_preferences.dart';
 import 'models.dart';
@@ -419,7 +420,9 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                           spacing: 8,
                           runSpacing: 8,
                           children: [
-                            Chip(
+                            ActionChip(
+                              onPressed: () => _runGeneralAction(widget.onCopyInvite),
+                              avatar: const Icon(Icons.content_copy, size: 18),
                               label: Text('Invite ${widget.server.inviteCode}'),
                             ),
                             if (widget.access.isOwner)
@@ -575,9 +578,27 @@ class _GeneralTab extends StatelessWidget {
               const SizedBox(height: 10),
               Text('Name: ${server.name}'),
               const SizedBox(height: 6),
-              Text('Invite code: ${server.inviteCode}'),
+              OutlinedButton.icon(
+                onPressed: onCopyInvite,
+                icon: const Icon(Icons.content_copy, size: 18),
+                label: Text('Invite code: ${server.inviteCode}'),
+              ),
               const SizedBox(height: 6),
               Text('Created: ${_formatServerDate(server.createdAt)}'),
+              const SizedBox(height: 6),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: server.id));
+                  if (!context.mounted) {
+                    return;
+                  }
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Server ID copied to clipboard.')),
+                  );
+                },
+                icon: const Icon(Icons.badge_outlined, size: 18),
+                label: const Text('Copy server ID'),
+              ),
             ],
           ),
         ),

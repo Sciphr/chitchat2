@@ -706,6 +706,16 @@ class _AppearanceSettingsTab extends StatelessWidget {
                 unawaited(preferences.setReduceMotion(value));
               },
             ),
+            SwitchListTile(
+              value: preferences.use24HourTime,
+              title: const Text('24-hour timestamps'),
+              subtitle: const Text(
+                'Show message times in 24-hour format instead of AM/PM.',
+              ),
+              onChanged: (value) {
+                unawaited(preferences.setUse24HourTime(value));
+              },
+            ),
           ],
         );
       },

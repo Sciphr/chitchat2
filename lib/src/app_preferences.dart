@@ -9,6 +9,7 @@ class AppPreferences extends ChangeNotifier {
   bool _playSounds = true;
   bool _messageAnimations = true;
   bool _reduceMotion = false;
+  bool _use24HourTime = false;
   String? _preferredAudioInputId;
   String? _preferredAudioOutputId;
   String? _preferredVideoInputId;
@@ -20,6 +21,7 @@ class AppPreferences extends ChangeNotifier {
   bool get playSounds => _playSounds;
   bool get messageAnimations => _messageAnimations;
   bool get reduceMotion => _reduceMotion;
+  bool get use24HourTime => _use24HourTime;
   String? get preferredAudioInputId => _preferredAudioInputId;
   String? get preferredAudioOutputId => _preferredAudioOutputId;
   String? get preferredVideoInputId => _preferredVideoInputId;
@@ -34,6 +36,7 @@ class AppPreferences extends ChangeNotifier {
   static const _soundsKey = 'prefs.play_sounds';
   static const _messageAnimationsKey = 'prefs.message_animations';
   static const _reduceMotionKey = 'prefs.reduce_motion';
+  static const _use24HourTimeKey = 'prefs.use_24_hour_time';
   static const _audioInputKey = 'prefs.audio_input_id';
   static const _audioOutputKey = 'prefs.audio_output_id';
   static const _videoInputKey = 'prefs.video_input_id';
@@ -51,6 +54,7 @@ class AppPreferences extends ChangeNotifier {
     _playSounds = prefs.getBool(_soundsKey) ?? true;
     _messageAnimations = prefs.getBool(_messageAnimationsKey) ?? true;
     _reduceMotion = prefs.getBool(_reduceMotionKey) ?? false;
+    _use24HourTime = prefs.getBool(_use24HourTimeKey) ?? false;
     _preferredAudioInputId = prefs.getString(_audioInputKey);
     _preferredAudioOutputId = prefs.getString(_audioOutputKey);
     _preferredVideoInputId = prefs.getString(_videoInputKey);
@@ -95,6 +99,13 @@ class AppPreferences extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_reduceMotionKey, value);
+  }
+
+  Future<void> setUse24HourTime(bool value) async {
+    _use24HourTime = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_use24HourTimeKey, value);
   }
 
   Future<void> setPreferredAudioInputId(String? value) async {

@@ -106,8 +106,9 @@ class VoiceRemotePeer {
   VoiceParticipant participant;
   final RTCVideoRenderer renderer;
   MediaStream? remoteStream;
+  bool hasVisual = false;
 
-  bool get hasMedia => renderer.srcObject != null;
+  bool get hasMedia => hasVisual && renderer.srcObject != null;
 }
 
 class VoiceChannelSessionController extends ChangeNotifier {
@@ -148,6 +149,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
   String _status = 'Select Join Voice to connect.';
 
   List<VoiceParticipant> _participants = const <VoiceParticipant>[];
+  List<VoiceParticipant> _presenceParticipants = const <VoiceParticipant>[];
 
   bool get joined => _joined;
   bool get busy => _busy;
@@ -158,6 +160,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
   bool get hasLocalPreview => localRenderer.srcObject != null;
   List<VoiceParticipant> get participants =>
       List<VoiceParticipant>.unmodifiable(_participants);
+  List<VoiceParticipant> get presenceParticipants =>
+      List<VoiceParticipant>.unmodifiable(_presenceParticipants);
   List<VoiceRemotePeer> get remotePeers {
     final peers = _peerStates.values.toList()
       ..sort(
@@ -239,6 +243,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     final wasJoined = _joined;
     _joined = false;
     _participants = const <VoiceParticipant>[];
+    _presenceParticipants = const <VoiceParticipant>[];
     _status = 'Disconnected from voice channel.';
 
     await _detachRoom();
@@ -502,13 +507,14 @@ class VoiceChannelSessionController extends ChangeNotifier {
       ),
     );
 
+    realtimeChannel
+      ..onPresenceSync((_) => _syncPresenceState(realtimeChannel))
+      ..onPresenceJoin((_) => _syncPresenceState(realtimeChannel))
+      ..onPresenceLeave((_) => _syncPresenceState(realtimeChannel));
+
     realtimeChannel.subscribe((status, [error]) {
       if (_disposed || completer.isCompleted) {
         return;
-      }
-      if (status == RealtimeSubscribeStatus.subscribed &&
-          identical(_presenceChannel, realtimeChannel)) {
-        unawaited(_trackPresence());
       }
       switch (status) {
         case RealtimeSubscribeStatus.subscribed:
@@ -526,6 +532,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     await completer.future;
     _presenceChannel = realtimeChannel;
+    _syncPresenceState(realtimeChannel);
   }
 
   Future<void> _closePresenceChannel() async {
@@ -551,6 +558,46 @@ class VoiceChannelSessionController extends ChangeNotifier {
       'share_kind': _shareKind.name,
       'joined_at': DateTime.now().toIso8601String(),
     });
+  }
+
+  void _syncPresenceState(RealtimeChannel realtimeChannel) {
+    if (_disposed) {
+      return;
+    }
+
+    final participants = <VoiceParticipant>[];
+    for (final state in realtimeChannel.presenceState()) {
+      for (final presence in state.presences) {
+        final payload = presence.payload;
+        final userId = payload['user_id'] as String?;
+        if (userId == null || userId.isEmpty) {
+          continue;
+        }
+        final displayName =
+            payload['display_name'] as String? ?? 'Anonymous';
+        final shareKind = _shareKindFromName(
+          payload['share_kind'] as String? ?? ShareKind.audio.name,
+        );
+        participants.add(
+          VoiceParticipant(
+            clientId: state.key,
+            userId: userId,
+            displayName: displayName,
+            isSelf: userId == authService.userId,
+            isMuted: payload['muted'] as bool? ?? false,
+            shareKind: shareKind,
+          ),
+        );
+      }
+    }
+
+    participants.sort(
+      (left, right) => left.displayName.toLowerCase().compareTo(
+        right.displayName.toLowerCase(),
+      ),
+    );
+    _presenceParticipants = participants;
+    _safeNotifyListeners();
   }
 
   Future<String> _fetchLiveKitToken() async {
@@ -756,10 +803,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
     VoiceRemotePeer peer,
     lk.RemoteParticipant participant,
   ) async {
-    final track =
-        _preferredVisualTrack(participant) ?? _preferredAudioTrack(participant);
+    final track = _preferredVisualTrack(participant);
     final stream = track?.mediaStream;
     peer.remoteStream = stream;
+    peer.hasVisual = track != null && stream != null;
     if (!identical(peer.renderer.srcObject, stream)) {
       peer.renderer.srcObject = stream;
     }
@@ -777,6 +824,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   Future<void> _disposePeer(VoiceRemotePeer peer) async {
     peer.remoteStream = null;
+    peer.hasVisual = false;
     peer.renderer.srcObject = null;
     await peer.renderer.dispose();
   }
@@ -829,6 +877,17 @@ class VoiceChannelSessionController extends ChangeNotifier {
     return ShareKind.audio;
   }
 
+  ShareKind _shareKindFromName(String value) {
+    switch (value) {
+      case 'camera':
+        return ShareKind.camera;
+      case 'screen':
+        return ShareKind.screen;
+      default:
+        return ShareKind.audio;
+    }
+  }
+
   lk.Track? _preferredVisualTrack(lk.Participant? participant) {
     if (participant == null) {
       return null;
@@ -842,15 +901,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
   lk.LocalVideoTrack? _preferredVideoTrack(lk.LocalParticipant? participant) {
     final track = _preferredVisualTrack(participant);
     return track is lk.LocalVideoTrack ? track : null;
-  }
-
-  lk.Track? _preferredAudioTrack(lk.Participant? participant) {
-    if (participant == null) {
-      return null;
-    }
-    return participant
-        .getTrackPublicationBySource(lk.TrackSource.microphone)
-        ?.track;
   }
 
   Map<String, dynamic>? _decodeParticipantMetadata(String? metadata) {
