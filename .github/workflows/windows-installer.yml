@@ -1,0 +1,83 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    env:
+      APP_NAME: ChitChat
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve app version
+        shell: pwsh
+        run: |
+          $versionLine = (Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$').Matches[0].Groups[1].Value.Trim()
+          $appVersion = $versionLine.Split('+')[0]
+          "APP_VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create CI dart defines
+        shell: pwsh
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SUPABASE_URL) -or [string]::IsNullOrWhiteSpace($env:SUPABASE_ANON_KEY)) {
+            throw "Missing GitHub secrets: SUPABASE_URL and/or SUPABASE_ANON_KEY."
+          }
+
+          $defines = @{
+            SUPABASE_URL = $env:SUPABASE_URL
+            SUPABASE_ANON_KEY = $env:SUPABASE_ANON_KEY
+          } | ConvertTo-Json
+
+          Set-Content -Path config/dart_defines.ci.json -Value $defines -Encoding utf8
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Windows app
+        run: flutter build windows --release --dart-define-from-file=config/dart_defines.ci.json
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build\installer | Out-Null
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=$env:APP_VERSION" `
+            "/DMyAppSourceDir=$pwd\build\windows\x64\runner\Release" `
+            "/DMyAppOutputDir=$pwd\build\installer" `
+            "packaging\windows\chitchat2.iss"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-${{ env.APP_VERSION }}
+          path: build/installer/*.exe
+          if-no-files-found: error
+
+      - name: Attach installer to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/installer/*.exe

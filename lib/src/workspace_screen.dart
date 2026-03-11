@@ -37,33 +37,187 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   bool _loadingServers = true;
   bool _loadingChannels = false;
   bool _loadingServerAccess = false;
+  bool _loadingMemberRoster = false;
   String? _serverError;
   String? _channelError;
+  String? _memberRosterError;
   List<ServerSummary> _servers = const <ServerSummary>[];
   List<ChannelCategorySummary> _categories = const <ChannelCategorySummary>[];
   List<ChannelSummary> _channels = const <ChannelSummary>[];
+  List<ServerRole> _serverRoles = const <ServerRole>[];
+  List<ServerMember> _serverMembers = const <ServerMember>[];
+  Set<String> _onlineMemberIds = const <String>{};
   ServerSummary? _selectedServer;
   ChannelSummary? _selectedChannel;
   ServerAccess? _serverAccess;
   ChannelSummary? _activeVoiceChannel;
   VoiceChannelSessionController? _activeVoiceController;
   VoiceChannelSessionController? _previewVoiceController;
+  RealtimeChannel? _serverPresenceChannel;
   bool _displayNamePromptShown = false;
 
   @override
   void initState() {
     super.initState();
+    widget.preferences.addListener(_handlePreferenceChanges);
+    unawaited(_applyPreferredAudioSettings());
     unawaited(_initializeWorkspace());
   }
 
   @override
   void dispose() {
+    widget.preferences.removeListener(_handlePreferenceChanges);
     unawaited(_activeVoiceController?.close());
     if (!identical(_previewVoiceController, _activeVoiceController)) {
       unawaited(_previewVoiceController?.close());
     }
+    unawaited(_closeServerPresenceChannel(resetUi: false));
     unawaited(_soundEffects.dispose());
     super.dispose();
+  }
+
+  void _handlePreferenceChanges() {
+    unawaited(_applyPreferredAudioSettings());
+  }
+
+  Future<void> _applyPreferredAudioOutput() async {
+    await _screenShareService.applyAudioOutputDevice(
+      widget.preferences.preferredAudioOutputId,
+    );
+  }
+
+  Future<void> _applyPreferredAudioSettings() async {
+    await _applyPreferredAudioOutput();
+    await _screenShareService.applyVoiceProcessingPreference(
+      widget.preferences.noiseCancellation,
+    );
+  }
+
+  Future<void> _closeServerPresenceChannel({bool resetUi = true}) async {
+    final presenceChannel = _serverPresenceChannel;
+    _serverPresenceChannel = null;
+    if (resetUi && mounted) {
+      setState(() {
+        _onlineMemberIds = const <String>{};
+      });
+    }
+    if (presenceChannel != null) {
+      await Supabase.instance.client.removeChannel(presenceChannel);
+    }
+  }
+
+  Future<void> _subscribeServerPresence(ServerSummary server) async {
+    await _closeServerPresenceChannel();
+    if (!mounted || _selectedServer?.id != server.id) {
+      return;
+    }
+
+    final client = Supabase.instance.client;
+    final completer = Completer<void>();
+    final realtimeChannel = client.channel(
+      _serverPresenceTopic(server.id),
+      opts: RealtimeChannelConfig(
+        ack: true,
+        enabled: true,
+        key: widget.authService.userId,
+        private: true,
+      ),
+    );
+
+    realtimeChannel
+      ..onPresenceSync((_) => _syncServerPresence(realtimeChannel))
+      ..onPresenceJoin((_) => _syncServerPresence(realtimeChannel))
+      ..onPresenceLeave((_) => _syncServerPresence(realtimeChannel));
+
+    realtimeChannel.subscribe((status, [error]) {
+      if (completer.isCompleted) {
+        return;
+      }
+      switch (status) {
+        case RealtimeSubscribeStatus.subscribed:
+          completer.complete();
+        case RealtimeSubscribeStatus.channelError:
+          completer.completeError(
+            StateError('Realtime error${error == null ? '' : ': $error'}'),
+          );
+        case RealtimeSubscribeStatus.closed:
+          completer.completeError(StateError('Realtime channel closed.'));
+        case RealtimeSubscribeStatus.timedOut:
+          completer.completeError(StateError('Realtime channel timed out.'));
+      }
+    });
+
+    try {
+      await completer.future;
+      if (!mounted || _selectedServer?.id != server.id) {
+        await client.removeChannel(realtimeChannel);
+        return;
+      }
+      _serverPresenceChannel = realtimeChannel;
+      await _trackServerPresence();
+      _syncServerPresence(realtimeChannel);
+    } catch (error) {
+      await client.removeChannel(realtimeChannel);
+      if (!mounted || _selectedServer?.id != server.id) {
+        return;
+      }
+      final formattedError = _formatServerPresenceError(error);
+      if (formattedError != null) {
+        debugPrint(
+          'Server presence subscription failed for ${server.id}: $error',
+        );
+      }
+      setState(() {
+        _memberRosterError = formattedError;
+      });
+    }
+  }
+
+  Future<void> _trackServerPresence() async {
+    await _serverPresenceChannel?.track({
+      'user_id': widget.authService.userId,
+      'display_name': widget.authService.displayName,
+      'tracked_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  void _syncServerPresence([RealtimeChannel? channel]) {
+    final realtimeChannel = channel ?? _serverPresenceChannel;
+    if (realtimeChannel == null || !mounted) {
+      return;
+    }
+
+    final nextOnlineMemberIds = <String>{};
+    for (final state in realtimeChannel.presenceState()) {
+      for (final presence in state.presences) {
+        final payload = presence.payload;
+        final userId = payload['user_id'] as String?;
+        if (userId != null && userId.isNotEmpty) {
+          nextOnlineMemberIds.add(userId);
+        }
+      }
+    }
+    if (_serverMembers.any(
+      (member) => member.userId == widget.authService.userId,
+    )) {
+      nextOnlineMemberIds.add(widget.authService.userId);
+    }
+
+    setState(() {
+      _onlineMemberIds = nextOnlineMemberIds;
+    });
+  }
+
+  String _serverPresenceTopic(String serverId) => 'server:presence:$serverId';
+
+  String? _formatServerPresenceError(Object error) {
+    final message = error.toString().toLowerCase();
+    if (message.contains('unauthorized') ||
+        message.contains('permission') ||
+        message.contains('read from this channel')) {
+      return null;
+    }
+    return 'Member presence unavailable right now.';
   }
 
   ChannelCategorySummary _copyCategoryWithPosition(
@@ -82,42 +236,19 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
   ChannelSummary _copyChannel({
     required ChannelSummary channel,
-    String? categoryId,
+    required String? categoryId,
     required int position,
   }) {
     return ChannelSummary(
       id: channel.id,
       serverId: channel.serverId,
-      categoryId: categoryId ?? channel.categoryId,
+      categoryId: categoryId,
       name: channel.name,
       kind: channel.kind,
       position: position,
       createdBy: channel.createdBy,
       createdAt: channel.createdAt,
     );
-  }
-
-  List<ChannelSummary> _optimisticallyReorderedChannels(
-    String? categoryId,
-    List<ChannelSummary> reorderedGroup,
-  ) {
-    final updatedGroup = [
-      for (var index = 0; index < reorderedGroup.length; index++)
-        _copyChannel(
-          channel: reorderedGroup[index],
-          categoryId: categoryId,
-          position: index,
-        ),
-    ];
-
-    var replacementIndex = 0;
-    return [
-      for (final channel in _channels)
-        if (channel.categoryId == categoryId)
-          updatedGroup[replacementIndex++]
-        else
-          channel,
-    ];
   }
 
   VoiceChannelSessionController? get _selectedVoiceController {
@@ -164,6 +295,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       channel: channel,
       client: Supabase.instance.client,
       authService: widget.authService,
+      preferences: widget.preferences,
       screenShareService: _screenShareService,
       soundEffects: _soundEffects,
     );
@@ -298,8 +430,40 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     if (!identical(_previewVoiceController, _activeVoiceController)) {
       await _previewVoiceController?.refreshLocalParticipantProfile();
     }
+    await _trackServerPresence();
     if (mounted) {
       setState(() {});
+    }
+  }
+
+  Future<void> _loadServerRoster(ServerSummary server) async {
+    setState(() {
+      _loadingMemberRoster = true;
+      _memberRosterError = null;
+    });
+
+    try {
+      final results = await Future.wait<dynamic>([
+        widget.workspaceRepository.fetchServerRoles(server.id),
+        widget.workspaceRepository.fetchServerMembers(server.id),
+      ]);
+      if (!mounted || _selectedServer?.id != server.id) {
+        return;
+      }
+      setState(() {
+        _serverRoles = results[0] as List<ServerRole>;
+        _serverMembers = results[1] as List<ServerMember>;
+        _loadingMemberRoster = false;
+      });
+      _syncServerPresence();
+    } catch (error) {
+      if (!mounted || _selectedServer?.id != server.id) {
+        return;
+      }
+      setState(() {
+        _memberRosterError = error.toString();
+        _loadingMemberRoster = false;
+      });
     }
   }
 
@@ -335,9 +499,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               if (!dialogContext.mounted) {
                 return;
               }
-              ScaffoldMessenger.of(dialogContext).showSnackBar(
-                SnackBar(content: Text(error.toString())),
-              );
+              ScaffoldMessenger.of(
+                dialogContext,
+              ).showSnackBar(SnackBar(content: Text(error.toString())));
             }
           }
 
@@ -432,10 +596,15 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
 
     await _selectChannel(null);
+    await _closeServerPresenceChannel();
     _selectedServer = server;
     _categories = const <ChannelCategorySummary>[];
     _channels = const <ChannelSummary>[];
+    _serverRoles = const <ServerRole>[];
+    _serverMembers = const <ServerMember>[];
     _serverAccess = null;
+    _memberRosterError = null;
+    _loadingMemberRoster = server != null;
     _loadingServerAccess = server != null;
     setState(() {});
 
@@ -443,6 +612,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       await Future.wait<void>([
         _loadChannels(server.id, selectFirst: true),
         _loadServerAccess(server),
+        _loadServerRoster(server),
+        _subscribeServerPresence(server),
       ]);
     }
   }
@@ -825,28 +996,94 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
   }
 
-  Future<void> _reorderChannels(
-    String? categoryId,
-    int oldIndex,
-    int newIndex,
+  Future<void> _moveChannel(
+    ChannelSummary channel,
+    String? targetCategoryId,
+    int targetIndex,
   ) async {
     final selectedServer = _selectedServer;
     if (selectedServer == null) {
       return;
     }
+
     final previousChannels = List<ChannelSummary>.from(_channels);
-    final nextChannels = _channels
-        .where((channel) => channel.categoryId == categoryId)
-        .toList();
-    if (newIndex > oldIndex) {
-      newIndex -= 1;
-    }
-    final moved = nextChannels.removeAt(oldIndex);
-    nextChannels.insert(newIndex, moved);
-    final updatedChannels = _optimisticallyReorderedChannels(
-      categoryId,
-      nextChannels,
+    final groupedChannels = <String?, List<ChannelSummary>>{
+      null: _channels.where((item) => item.categoryId == null).toList(),
+      for (final category in _categories)
+        category.id: _channels
+            .where((item) => item.categoryId == category.id)
+            .toList(),
+    };
+
+    final sourceCategoryId = channel.categoryId;
+    final sourceGroup = List<ChannelSummary>.from(
+      groupedChannels[sourceCategoryId] ?? const <ChannelSummary>[],
     );
+    final sourceIndex = sourceGroup.indexWhere((item) => item.id == channel.id);
+    if (sourceIndex == -1) {
+      return;
+    }
+    sourceGroup.removeAt(sourceIndex);
+
+    final targetGroup = sourceCategoryId == targetCategoryId
+        ? sourceGroup
+        : List<ChannelSummary>.from(
+            groupedChannels[targetCategoryId] ?? const <ChannelSummary>[],
+          );
+    final originalTargetIndex = targetIndex.clamp(
+      0,
+      sourceCategoryId == targetCategoryId
+          ? sourceGroup.length + 1
+          : targetGroup.length,
+    );
+    var insertIndex = originalTargetIndex;
+    if (sourceCategoryId == targetCategoryId &&
+        sourceIndex < originalTargetIndex) {
+      insertIndex = originalTargetIndex - 1;
+    }
+    insertIndex = insertIndex.clamp(0, targetGroup.length);
+    final unchangedCategory =
+        sourceCategoryId == targetCategoryId && sourceIndex == insertIndex;
+    if (unchangedCategory) {
+      return;
+    }
+
+    targetGroup.insert(
+      insertIndex,
+      _copyChannel(channel: channel, categoryId: targetCategoryId, position: 0),
+    );
+
+    final normalizedSource = sourceCategoryId == targetCategoryId
+        ? const <ChannelSummary>[]
+        : [
+            for (var index = 0; index < sourceGroup.length; index++)
+              _copyChannel(
+                channel: sourceGroup[index],
+                categoryId: sourceCategoryId,
+                position: index,
+              ),
+          ];
+    final normalizedTarget = [
+      for (var index = 0; index < targetGroup.length; index++)
+        _copyChannel(
+          channel: targetGroup[index],
+          categoryId: targetCategoryId,
+          position: index,
+        ),
+    ];
+
+    if (sourceCategoryId == targetCategoryId) {
+      groupedChannels[targetCategoryId] = normalizedTarget;
+    } else {
+      groupedChannels[sourceCategoryId] = normalizedSource;
+      groupedChannels[targetCategoryId] = normalizedTarget;
+    }
+
+    final updatedChannels = <ChannelSummary>[
+      ...(groupedChannels[null] ?? const <ChannelSummary>[]),
+      for (final category in _categories)
+        ...(groupedChannels[category.id] ?? const <ChannelSummary>[]),
+    ];
 
     setState(() {
       _channels = updatedChannels;
@@ -854,11 +1091,11 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
     try {
       await widget.workspaceRepository.reorderChannels([
-        for (var index = 0; index < nextChannels.length; index++)
+        for (final entry in [...normalizedSource, ...normalizedTarget])
           ChannelOrderUpdate(
-            channelId: nextChannels[index].id,
-            position: index,
-            categoryId: categoryId,
+            channelId: entry.id,
+            position: entry.position,
+            categoryId: entry.categoryId,
           ),
       ]);
     } catch (error) {
@@ -954,6 +1191,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
     await _loadServerAccess(selectedServer);
     await _loadChannels(selectedServer.id);
+    await _loadServerRoster(selectedServer);
   }
 
   Future<void> _openUserSettings() async {
@@ -994,8 +1232,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
             onSelectChannel: _selectChannel,
             onRenameCategory: _promptRenameCategory,
             onReorderCategories: _reorderCategories,
-            onReorderChannels: _reorderChannels,
+            onMoveChannel: _moveChannel,
             onOpenSettings: _openServerSettings,
+            onOpenUserSettings: _openUserSettings,
+            onSignOut: widget.authService.signOut,
           )
         : AnimatedBuilder(
             animation: activeVoiceController,
@@ -1013,10 +1253,21 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               onSelectChannel: _selectChannel,
               onRenameCategory: _promptRenameCategory,
               onReorderCategories: _reorderCategories,
-              onReorderChannels: _reorderChannels,
+              onMoveChannel: _moveChannel,
               onOpenSettings: _openServerSettings,
+              onOpenUserSettings: _openUserSettings,
+              onSignOut: widget.authService.signOut,
             ),
           );
+    final membersPanel = _ServerMembersPanel(
+      server: selectedServer,
+      roles: _serverRoles,
+      members: _serverMembers,
+      onlineMemberIds: _onlineMemberIds,
+      loading: _loadingMemberRoster,
+      error: _memberRosterError,
+      currentUserId: widget.authService.userId,
+    );
 
     return Scaffold(
       body: Container(
@@ -1024,135 +1275,124 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         child: SafeArea(
           child: Padding(
             padding: const EdgeInsets.all(20),
-            child: Column(
+            child: Row(
               children: [
-                _WorkspaceHeader(
-                  displayName: widget.authService.displayName,
-                  onSignOut: widget.authService.signOut,
-                  onOpenSettings: _openUserSettings,
-                ),
-                const SizedBox(height: 20),
-                Expanded(
-                  child: Row(
-                    children: [
-                      SizedBox(
-                        width: 108,
-                        child: _ServerRail(
-                          servers: _servers,
-                          loading: _loadingServers,
-                          error: _serverError,
-                          selectedServerId: selectedServer?.id,
-                          onSelectServer: _selectServer,
-                          onCreateServer: _promptCreateServer,
-                          onJoinServer: _promptJoinServer,
-                          onRefresh: _loadServers,
-                          currentUserId: widget.authService.userId,
-                          onLeaveServer: _leaveServer,
-                          onDeleteServer: _deleteServer,
-                          avatarUrlForPath:
-                              widget.workspaceRepository.publicServerAvatarUrl,
-                        ),
-                      ),
-                      const SizedBox(width: 18),
-                      AnimatedSwitcher(
-                        duration: widget.preferences.motionDuration,
-                        switchInCurve: Curves.easeOutCubic,
-                        switchOutCurve: Curves.easeInCubic,
-                        transitionBuilder: (child, animation) {
-                          return FadeTransition(
-                            opacity: animation,
-                            child: SlideTransition(
-                              position: Tween<Offset>(
-                                begin: const Offset(0.04, 0),
-                                end: Offset.zero,
-                              ).animate(animation),
-                              child: child,
-                            ),
-                          );
-                        },
-                        child: SizedBox(
-                          key: ValueKey<String?>(selectedServer?.id),
-                          width: 320,
-                          child: sidebar,
-                        ),
-                      ),
-                      const SizedBox(width: 18),
-                      Expanded(
-                        child: AnimatedSwitcher(
-                          duration: widget.preferences.motionDuration,
-                          switchInCurve: Curves.easeOutCubic,
-                          switchOutCurve: Curves.easeInCubic,
-                          transitionBuilder: (child, animation) {
-                            return FadeTransition(
-                              opacity: animation,
-                              child: SlideTransition(
-                                position: Tween<Offset>(
-                                  begin: const Offset(0.02, 0.03),
-                                  end: Offset.zero,
-                                ).animate(animation),
-                                child: child,
-                              ),
-                            );
-                          },
-                          child: KeyedSubtree(
-                            key: ValueKey<String?>(
-                              '${selectedServer?.id}:${_selectedChannel?.id}',
-                            ),
-                            child: _selectedChannel == null
-                                ? const _EmptyState(
-                                    title: 'Select a channel',
-                                    message:
-                                        'Choose a text channel for chat or a voice channel for live audio, camera, and screen sharing.',
-                                  )
-                                : _selectedChannel!.kind == ChannelKind.text
-                                ? TextChannelView(
-                                    channel: _selectedChannel!,
-                                    repository: widget.workspaceRepository,
-                                    canSendMessages:
-                                        _serverAccess?.hasPermission(
-                                          ServerPermission.sendMessages,
-                                        ) ??
-                                        true,
-                                    motionDuration:
-                                        widget.preferences.motionDuration,
-                                    animateMessages:
-                                        widget.preferences.messageAnimations &&
-                                        !widget.preferences.reduceMotion,
-                                  )
-                                : VoiceChannelView(
-                                    channel: _selectedChannel!,
-                                    repository: widget.workspaceRepository,
-                                    controller: _selectedVoiceController,
-                                    activeChannelId: _activeVoiceChannel?.id,
-                                    canJoinVoice:
-                                        _serverAccess?.hasPermission(
-                                          ServerPermission.joinVoice,
-                                        ) ??
-                                        true,
-                                    canManageServer:
-                                        _serverAccess?.hasPermission(
-                                          ServerPermission.manageServer,
-                                        ) ??
-                                        false,
-                                    canStreamCamera:
-                                        _serverAccess?.hasPermission(
-                                          ServerPermission.streamCamera,
-                                        ) ??
-                                        true,
-                                    canShareScreen:
-                                        _serverAccess?.hasPermission(
-                                          ServerPermission.shareScreen,
-                                        ) ??
-                                        true,
-                                    onJoinCall: _joinSelectedVoiceChannel,
-                                    onLeaveCall: _leaveActiveVoiceChannel,
-                                  ),
-                          ),
-                        ),
-                      ),
-                    ],
+                SizedBox(
+                  width: 108,
+                  child: _ServerRail(
+                    servers: _servers,
+                    loading: _loadingServers,
+                    error: _serverError,
+                    selectedServerId: selectedServer?.id,
+                    onSelectServer: _selectServer,
+                    onCreateServer: _promptCreateServer,
+                    onJoinServer: _promptJoinServer,
+                    onRefresh: _loadServers,
+                    currentUserId: widget.authService.userId,
+                    onLeaveServer: _leaveServer,
+                    onDeleteServer: _deleteServer,
+                    avatarUrlForPath:
+                        widget.workspaceRepository.publicServerAvatarUrl,
                   ),
                 ),
+                const SizedBox(width: 18),
+                AnimatedSwitcher(
+                  duration: widget.preferences.motionDuration,
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, animation) {
+                    return FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: Tween<Offset>(
+                          begin: const Offset(0.04, 0),
+                          end: Offset.zero,
+                        ).animate(animation),
+                        child: child,
+                      ),
+                    );
+                  },
+                  child: SizedBox(
+                    key: ValueKey<String?>(selectedServer?.id),
+                    width: 320,
+                    child: sidebar,
+                  ),
+                ),
+                const SizedBox(width: 18),
+                Expanded(
+                  child: AnimatedSwitcher(
+                    duration: widget.preferences.motionDuration,
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) {
+                      return FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: Tween<Offset>(
+                            begin: const Offset(0.02, 0.03),
+                            end: Offset.zero,
+                          ).animate(animation),
+                          child: child,
+                        ),
+                      );
+                    },
+                    child: KeyedSubtree(
+                      key: ValueKey<String?>(
+                        '${selectedServer?.id}:${_selectedChannel?.id}',
+                      ),
+                      child: _selectedChannel == null
+                          ? const _EmptyState(
+                              title: 'Select a channel',
+                              message:
+                                  'Choose a text channel for chat or a voice channel for live audio, camera, and screen sharing.',
+                            )
+                          : _selectedChannel!.kind == ChannelKind.text
+                          ? TextChannelView(
+                              channel: _selectedChannel!,
+                              repository: widget.workspaceRepository,
+                              canSendMessages:
+                                  _serverAccess?.hasPermission(
+                                    ServerPermission.sendMessages,
+                                  ) ??
+                                  true,
+                              motionDuration: widget.preferences.motionDuration,
+                              animateMessages:
+                                  widget.preferences.messageAnimations &&
+                                  !widget.preferences.reduceMotion,
+                            )
+                          : VoiceChannelView(
+                              channel: _selectedChannel!,
+                              repository: widget.workspaceRepository,
+                              controller: _selectedVoiceController,
+                              activeChannelId: _activeVoiceChannel?.id,
+                              canJoinVoice:
+                                  _serverAccess?.hasPermission(
+                                    ServerPermission.joinVoice,
+                                  ) ??
+                                  true,
+                              canManageServer:
+                                  _serverAccess?.hasPermission(
+                                    ServerPermission.manageServer,
+                                  ) ??
+                                  false,
+                              canStreamCamera:
+                                  _serverAccess?.hasPermission(
+                                    ServerPermission.streamCamera,
+                                  ) ??
+                                  true,
+                              canShareScreen:
+                                  _serverAccess?.hasPermission(
+                                    ServerPermission.shareScreen,
+                                  ) ??
+                                  true,
+                              onJoinCall: _joinSelectedVoiceChannel,
+                              onLeaveCall: _leaveActiveVoiceChannel,
+                            ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 18),
+                SizedBox(width: 288, child: membersPanel),
               ],
             ),
           ),
@@ -1274,46 +1514,38 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   }
 }
 
-class _WorkspaceHeader extends StatelessWidget {
-  const _WorkspaceHeader({
-    required this.displayName,
+class _SidebarAccountFooter extends StatelessWidget {
+  const _SidebarAccountFooter({
+    required this.onOpenUserSettings,
     required this.onSignOut,
-    required this.onOpenSettings,
   });
 
-  final String displayName;
+  final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
-  final Future<void> Function() onOpenSettings;
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: palette.panelMuted,
-        borderRadius: BorderRadius.circular(28),
+        color: palette.panelStrong,
+        borderRadius: BorderRadius.circular(16),
         border: Border.all(color: palette.border),
       ),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 18),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
         child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Expanded(
-              child: Text(
-                'ChitChat',
-                style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
-              ),
+            IconButton(
+              onPressed: onOpenUserSettings,
+              icon: const Icon(Icons.account_circle_outlined),
+              visualDensity: VisualDensity.compact,
             ),
-            FilledButton.tonalIcon(
-              onPressed: onOpenSettings,
-              icon: const Icon(Icons.account_circle),
-              label: Text(displayName),
-            ),
-            const SizedBox(width: 10),
-            FilledButton.tonalIcon(
+            IconButton(
               onPressed: onSignOut,
               icon: const Icon(Icons.logout),
-              label: const Text('Sign out'),
+              visualDensity: VisualDensity.compact,
             ),
           ],
         ),
@@ -1554,7 +1786,7 @@ class _ServerAvatar extends StatelessWidget {
   }
 }
 
-class _ChannelSidebar extends StatelessWidget {
+class _ChannelSidebar extends StatefulWidget {
   const _ChannelSidebar({
     required this.server,
     required this.categories,
@@ -1569,8 +1801,10 @@ class _ChannelSidebar extends StatelessWidget {
     required this.onSelectChannel,
     required this.onRenameCategory,
     required this.onReorderCategories,
-    required this.onReorderChannels,
+    required this.onMoveChannel,
     required this.onOpenSettings,
+    required this.onOpenUserSettings,
+    required this.onSignOut,
   });
 
   final ServerSummary? server;
@@ -1586,28 +1820,60 @@ class _ChannelSidebar extends StatelessWidget {
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
   final Future<void> Function(ChannelCategorySummary category) onRenameCategory;
   final Future<void> Function(int oldIndex, int newIndex) onReorderCategories;
-  final Future<void> Function(String? categoryId, int oldIndex, int newIndex)
-  onReorderChannels;
+  final Future<void> Function(
+    ChannelSummary channel,
+    String? targetCategoryId,
+    int targetIndex,
+  )
+  onMoveChannel;
   final Future<void> Function() onOpenSettings;
+  final Future<void> Function() onOpenUserSettings;
+  final Future<void> Function() onSignOut;
+
+  @override
+  State<_ChannelSidebar> createState() => _ChannelSidebarState();
+}
+
+class _ChannelSidebarState extends State<_ChannelSidebar> {
+  String? _draggingChannelId;
+
+  void _handleChannelDragStarted(String channelId) {
+    if (_draggingChannelId == channelId) {
+      return;
+    }
+    setState(() {
+      _draggingChannelId = channelId;
+    });
+  }
+
+  void _handleChannelDragFinished() {
+    if (_draggingChannelId == null) {
+      return;
+    }
+    setState(() {
+      _draggingChannelId = null;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    final selectedServer = server;
-    final serverAccess = access;
+    final selectedServer = widget.server;
+    final serverAccess = widget.access;
     final palette = Theme.of(context).extension<AppThemePalette>()!;
     final canManageChannels =
         serverAccess?.hasPermission(ServerPermission.manageChannels) ?? false;
+    final showDropSlots = canManageChannels && _draggingChannelId != null;
     final isOwner =
         selectedServer?.ownerId ==
         Supabase.instance.client.auth.currentUser?.id;
     final canOpenSettings =
-        (!loadingAccess && isOwner) ||
+        (!widget.loadingAccess && isOwner) ||
         (serverAccess?.hasPermission(ServerPermission.inviteMembers) ??
             false) ||
         (serverAccess?.hasPermission(ServerPermission.manageServer) ?? false) ||
         (serverAccess?.hasPermission(ServerPermission.manageRoles) ?? false) ||
         (serverAccess?.hasPermission(ServerPermission.manageChannels) ?? false);
-    final uncategorizedChannels = channels
+    final uncategorizedChannels = widget.channels
         .where((channel) => channel.categoryId == null)
         .toList();
 
@@ -1617,127 +1883,195 @@ class _ChannelSidebar extends StatelessWidget {
         borderRadius: BorderRadius.circular(26),
         border: Border.all(color: palette.border),
       ),
-      child: selectedServer == null
-          ? const _EmptyState(
-              title: 'No server selected',
-              message: 'Create a server or join one with an invite code.',
-            )
-          : Padding(
-              padding: const EdgeInsets.all(18),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    selectedServer.name,
-                    style: const TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: FilledButton.tonalIcon(
-                      onPressed: canOpenSettings ? onOpenSettings : null,
-                      icon: loadingAccess
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.settings),
-                      label: const Text('Server settings'),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  if (error != null) Text(error!),
-                  if (loading)
-                    const Expanded(
-                      child: Center(child: CircularProgressIndicator()),
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: selectedServer == null
+                  ? const _EmptyState(
+                      title: 'No server selected',
+                      message:
+                          'Create a server or join one with an invite code.',
                     )
-                  else ...[
-                    Expanded(
-                      child: channels.isEmpty && categories.isEmpty
-                          ? const Center(
-                              child: Text('This server has no channels yet.'),
-                            )
-                          : ListView(
-                              children: [
-                                if (uncategorizedChannels.isNotEmpty) ...[
-                                  const _CategoryHeader(title: 'Channels'),
-                                  const SizedBox(height: 8),
-                                  _ChannelList(
-                                    categoryId: null,
-                                    channels: uncategorizedChannels,
-                                    selectedChannelId: selectedChannelId,
-                                    activeVoiceChannelId: activeVoiceChannelId,
-                                    activeVoiceParticipants:
-                                        activeVoiceParticipants,
-                                    canManageChannels: canManageChannels,
-                                    onSelectChannel: onSelectChannel,
-                                    onReorderChannels: onReorderChannels,
-                                  ),
-                                  const SizedBox(height: 14),
-                                ],
-                                if (categories.isNotEmpty)
-                                  ReorderableListView.builder(
-                                    shrinkWrap: true,
-                                    physics:
-                                        const NeverScrollableScrollPhysics(),
-                                    buildDefaultDragHandles: false,
-                                    itemCount: categories.length,
-                                    onReorder: (oldIndex, newIndex) {
-                                      unawaited(
-                                        onReorderCategories(oldIndex, newIndex),
-                                      );
-                                    },
-                                    itemBuilder: (context, index) {
-                                      final category = categories[index];
-                                      final categoryChannels = channels
-                                          .where(
-                                            (channel) =>
-                                                channel.categoryId ==
-                                                category.id,
-                                          )
-                                          .toList();
-                                      return Padding(
-                                        key: ValueKey<String>(category.id),
-                                        padding: const EdgeInsets.only(
-                                          bottom: 14,
-                                        ),
-                                        child: _CategorySection(
-                                          category: category,
-                                          channels: categoryChannels,
-                                          selectedChannelId: selectedChannelId,
-                                          activeVoiceChannelId:
-                                              activeVoiceChannelId,
-                                          activeVoiceParticipants:
-                                              activeVoiceParticipants,
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          selectedServer.name,
+                          style: const TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: FilledButton.tonalIcon(
+                            onPressed: canOpenSettings
+                                ? widget.onOpenSettings
+                                : null,
+                            icon: widget.loadingAccess
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.settings),
+                            label: const Text('Server settings'),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        if (widget.error != null) Text(widget.error!),
+                        if (widget.loading)
+                          const Expanded(
+                            child: Center(child: CircularProgressIndicator()),
+                          )
+                        else ...[
+                          Expanded(
+                            child:
+                                widget.channels.isEmpty &&
+                                    widget.categories.isEmpty
+                                ? const Center(
+                                    child: Text(
+                                      'This server has no channels yet.',
+                                    ),
+                                  )
+                                : ListView(
+                                    children: [
+                                      if (uncategorizedChannels.isNotEmpty ||
+                                          canManageChannels) ...[
+                                        _ChannelGroupDropTarget(
+                                          categoryId: null,
                                           canManageChannels: canManageChannels,
-                                          onRenameCategory: () =>
-                                              onRenameCategory(category),
-                                          onSelectChannel: onSelectChannel,
-                                          onReorderChannels: onReorderChannels,
-                                          reorderHandle: canManageChannels
-                                              ? ReorderableDragStartListener(
-                                                  index: index,
-                                                  child: const Icon(
-                                                    Icons.drag_indicator,
-                                                    size: 18,
-                                                  ),
-                                                )
-                                              : null,
+                                          onMoveChannel: widget.onMoveChannel,
+                                          targetIndex:
+                                              uncategorizedChannels.length,
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              const _CategoryHeader(
+                                                title: 'Channels',
+                                              ),
+                                              const SizedBox(height: 8),
+                                              _ChannelList(
+                                                categoryId: null,
+                                                channels: uncategorizedChannels,
+                                                selectedChannelId:
+                                                    widget.selectedChannelId,
+                                                activeVoiceChannelId:
+                                                    widget.activeVoiceChannelId,
+                                                activeVoiceParticipants: widget
+                                                    .activeVoiceParticipants,
+                                                canManageChannels:
+                                                    canManageChannels,
+                                                showDropSlots: showDropSlots,
+                                                onSelectChannel:
+                                                    widget.onSelectChannel,
+                                                onMoveChannel:
+                                                    widget.onMoveChannel,
+                                                onChannelDragStarted:
+                                                    _handleChannelDragStarted,
+                                                onChannelDragFinished:
+                                                    _handleChannelDragFinished,
+                                              ),
+                                            ],
+                                          ),
                                         ),
-                                      );
-                                    },
+                                        const SizedBox(height: 14),
+                                      ],
+                                      if (widget.categories.isNotEmpty)
+                                        ReorderableListView.builder(
+                                          shrinkWrap: true,
+                                          physics:
+                                              const NeverScrollableScrollPhysics(),
+                                          buildDefaultDragHandles: false,
+                                          itemCount: widget.categories.length,
+                                          onReorder: (oldIndex, newIndex) {
+                                            unawaited(
+                                              widget.onReorderCategories(
+                                                oldIndex,
+                                                newIndex,
+                                              ),
+                                            );
+                                          },
+                                          itemBuilder: (context, index) {
+                                            final category =
+                                                widget.categories[index];
+                                            final categoryChannels = widget
+                                                .channels
+                                                .where(
+                                                  (channel) =>
+                                                      channel.categoryId ==
+                                                      category.id,
+                                                )
+                                                .toList();
+                                            return Padding(
+                                              key: ValueKey<String>(
+                                                category.id,
+                                              ),
+                                              padding: const EdgeInsets.only(
+                                                bottom: 14,
+                                              ),
+                                              child: _CategorySection(
+                                                category: category,
+                                                channels: categoryChannels,
+                                                selectedChannelId:
+                                                    widget.selectedChannelId,
+                                                activeVoiceChannelId:
+                                                    widget.activeVoiceChannelId,
+                                                activeVoiceParticipants: widget
+                                                    .activeVoiceParticipants,
+                                                canManageChannels:
+                                                    canManageChannels,
+                                                showDropSlots: showDropSlots,
+                                                onRenameCategory: () => widget
+                                                    .onRenameCategory(category),
+                                                onSelectChannel:
+                                                    widget.onSelectChannel,
+                                                onMoveChannel:
+                                                    widget.onMoveChannel,
+                                                onChannelDragStarted:
+                                                    _handleChannelDragStarted,
+                                                onChannelDragFinished:
+                                                    _handleChannelDragFinished,
+                                                reorderHandle: canManageChannels
+                                                    ? ReorderableDragStartListener(
+                                                        index: index,
+                                                        child: const Icon(
+                                                          Icons.drag_indicator,
+                                                          size: 18,
+                                                        ),
+                                                      )
+                                                    : null,
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                    ],
                                   ),
-                              ],
-                            ),
+                          ),
+                        ],
+                      ],
                     ),
-                  ],
-                ],
+            ),
+            const SizedBox(height: 14),
+            const Divider(height: 1),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerRight,
+              child: _SidebarAccountFooter(
+                onOpenUserSettings: widget.onOpenUserSettings,
+                onSignOut: widget.onSignOut,
               ),
             ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -1750,9 +2084,12 @@ class _CategorySection extends StatelessWidget {
     required this.activeVoiceChannelId,
     required this.activeVoiceParticipants,
     required this.canManageChannels,
+    required this.showDropSlots,
     required this.onRenameCategory,
     required this.onSelectChannel,
-    required this.onReorderChannels,
+    required this.onMoveChannel,
+    required this.onChannelDragStarted,
+    required this.onChannelDragFinished,
     this.reorderHandle,
   });
 
@@ -1762,10 +2099,17 @@ class _CategorySection extends StatelessWidget {
   final String? activeVoiceChannelId;
   final List<VoiceParticipant> activeVoiceParticipants;
   final bool canManageChannels;
+  final bool showDropSlots;
   final VoidCallback onRenameCategory;
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
-  final Future<void> Function(String? categoryId, int oldIndex, int newIndex)
-  onReorderChannels;
+  final Future<void> Function(
+    ChannelSummary channel,
+    String? targetCategoryId,
+    int targetIndex,
+  )
+  onMoveChannel;
+  final ValueChanged<String> onChannelDragStarted;
+  final VoidCallback onChannelDragFinished;
   final Widget? reorderHandle;
 
   @override
@@ -1776,7 +2120,6 @@ class _CategorySection extends StatelessWidget {
         IconButton(
           onPressed: onRenameCategory,
           icon: const Icon(Icons.edit_outlined, size: 18),
-          tooltip: 'Rename category',
         ),
       );
     }
@@ -1784,28 +2127,37 @@ class _CategorySection extends StatelessWidget {
       headerActions.add(reorderHandle!);
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _CategoryHeader(
-          title: category.name,
-          trailing: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: headerActions,
+    return _ChannelGroupDropTarget(
+      categoryId: category.id,
+      canManageChannels: canManageChannels,
+      onMoveChannel: onMoveChannel,
+      targetIndex: channels.length,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _CategoryHeader(
+            title: category.name,
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: headerActions,
+            ),
           ),
-        ),
-        const SizedBox(height: 8),
-        _ChannelList(
-          categoryId: category.id,
-          channels: channels,
-          selectedChannelId: selectedChannelId,
-          activeVoiceChannelId: activeVoiceChannelId,
-          activeVoiceParticipants: activeVoiceParticipants,
-          canManageChannels: canManageChannels,
-          onSelectChannel: onSelectChannel,
-          onReorderChannels: onReorderChannels,
-        ),
-      ],
+          const SizedBox(height: 8),
+          _ChannelList(
+            categoryId: category.id,
+            channels: channels,
+            selectedChannelId: selectedChannelId,
+            activeVoiceChannelId: activeVoiceChannelId,
+            activeVoiceParticipants: activeVoiceParticipants,
+            canManageChannels: canManageChannels,
+            showDropSlots: showDropSlots,
+            onSelectChannel: onSelectChannel,
+            onMoveChannel: onMoveChannel,
+            onChannelDragStarted: onChannelDragStarted,
+            onChannelDragFinished: onChannelDragFinished,
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1836,6 +2188,61 @@ class _CategoryHeader extends StatelessWidget {
   }
 }
 
+class _ChannelGroupDropTarget extends StatelessWidget {
+  const _ChannelGroupDropTarget({
+    required this.categoryId,
+    required this.canManageChannels,
+    required this.onMoveChannel,
+    required this.targetIndex,
+    required this.child,
+  });
+
+  final String? categoryId;
+  final bool canManageChannels;
+  final Future<void> Function(
+    ChannelSummary channel,
+    String? targetCategoryId,
+    int targetIndex,
+  )
+  onMoveChannel;
+  final int targetIndex;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return DragTarget<ChannelSummary>(
+      onWillAcceptWithDetails: !canManageChannels
+          ? null
+          : (details) => details.data.categoryId != categoryId,
+      onAcceptWithDetails: !canManageChannels
+          ? null
+          : (details) {
+              unawaited(onMoveChannel(details.data, categoryId, targetIndex));
+            },
+      builder: (context, candidateData, rejectedData) {
+        final hovering = candidateData.isNotEmpty;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: hovering
+                ? palette.panelAccent.withAlpha(140)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: hovering ? palette.borderStrong : Colors.transparent,
+              width: hovering ? 1.4 : 1,
+            ),
+          ),
+          child: child,
+        );
+      },
+    );
+  }
+}
+
 class _ChannelList extends StatelessWidget {
   const _ChannelList({
     required this.categoryId,
@@ -1844,8 +2251,11 @@ class _ChannelList extends StatelessWidget {
     required this.activeVoiceChannelId,
     required this.activeVoiceParticipants,
     required this.canManageChannels,
+    required this.showDropSlots,
     required this.onSelectChannel,
-    required this.onReorderChannels,
+    required this.onMoveChannel,
+    required this.onChannelDragStarted,
+    required this.onChannelDragFinished,
   });
 
   final String? categoryId;
@@ -1854,61 +2264,92 @@ class _ChannelList extends StatelessWidget {
   final String? activeVoiceChannelId;
   final List<VoiceParticipant> activeVoiceParticipants;
   final bool canManageChannels;
+  final bool showDropSlots;
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
-  final Future<void> Function(String? categoryId, int oldIndex, int newIndex)
-  onReorderChannels;
+  final Future<void> Function(
+    ChannelSummary channel,
+    String? targetCategoryId,
+    int targetIndex,
+  )
+  onMoveChannel;
+  final ValueChanged<String> onChannelDragStarted;
+  final VoidCallback onChannelDragFinished;
 
   @override
   Widget build(BuildContext context) {
     if (channels.isEmpty) {
-      return Text(
-        'No channels here yet.',
-        style: Theme.of(context).textTheme.bodySmall,
+      return ConstrainedBox(
+        constraints: BoxConstraints(
+          minHeight: categoryId == null && canManageChannels ? 104 : 56,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Align(
+            alignment: categoryId == null && canManageChannels
+                ? Alignment.center
+                : Alignment.centerLeft,
+            child: Text(
+              canManageChannels
+                  ? 'No channels here yet. Drop one here to move it.'
+                  : 'No channels here yet.',
+              style: Theme.of(context).textTheme.bodySmall,
+              textAlign: categoryId == null && canManageChannels
+                  ? TextAlign.center
+                  : TextAlign.start,
+            ),
+          ),
+        ),
       );
     }
 
-    return ReorderableListView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      buildDefaultDragHandles: false,
-      itemCount: channels.length,
-      onReorder: canManageChannels
-          ? (oldIndex, newIndex) {
-              unawaited(onReorderChannels(categoryId, oldIndex, newIndex));
-            }
-          : (oldIndex, newIndex) {},
-      itemBuilder: (context, index) {
-        final channel = channels[index];
-        return Padding(
-          key: ValueKey<String>(channel.id),
-          padding: const EdgeInsets.only(bottom: 8),
-          child: _ChannelTile(
-            channel: channel,
-            selected: channel.id == selectedChannelId,
-            activeVoiceChannelId: activeVoiceChannelId,
-            activeVoiceParticipants: activeVoiceParticipants,
-            onTap: () => onSelectChannel(channel),
-            trailing: canManageChannels
-                ? ReorderableDragStartListener(
-                    index: index,
-                    child: const Icon(Icons.drag_indicator, size: 18),
-                  )
-                : null,
+    return Column(
+      children: [
+        for (var index = 0; index < channels.length; index++) ...[
+          _ChannelDropSlot(
+            categoryId: categoryId,
+            targetIndex: index,
+            canManageChannels: canManageChannels,
+            visible: showDropSlots,
+            onMoveChannel: onMoveChannel,
           ),
-        );
-      },
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: _ChannelTile(
+              key: ValueKey<String>(channels[index].id),
+              channel: channels[index],
+              selected: channels[index].id == selectedChannelId,
+              activeVoiceChannelId: activeVoiceChannelId,
+              activeVoiceParticipants: activeVoiceParticipants,
+              onTap: () => onSelectChannel(channels[index]),
+              draggable: canManageChannels,
+              onDragStarted: () => onChannelDragStarted(channels[index].id),
+              onDragFinished: onChannelDragFinished,
+            ),
+          ),
+        ],
+        _ChannelDropSlot(
+          categoryId: categoryId,
+          targetIndex: channels.length,
+          canManageChannels: canManageChannels,
+          visible: showDropSlots,
+          onMoveChannel: onMoveChannel,
+        ),
+      ],
     );
   }
 }
 
 class _ChannelTile extends StatelessWidget {
   const _ChannelTile({
+    super.key,
     required this.channel,
     required this.selected,
     required this.activeVoiceChannelId,
     required this.activeVoiceParticipants,
     required this.onTap,
-    this.trailing,
+    required this.onDragStarted,
+    required this.onDragFinished,
+    this.draggable = false,
   });
 
   final ChannelSummary channel;
@@ -1916,7 +2357,9 @@ class _ChannelTile extends StatelessWidget {
   final String? activeVoiceChannelId;
   final List<VoiceParticipant> activeVoiceParticipants;
   final VoidCallback onTap;
-  final Widget? trailing;
+  final VoidCallback onDragStarted;
+  final VoidCallback onDragFinished;
+  final bool draggable;
 
   @override
   Widget build(BuildContext context) {
@@ -1934,15 +2377,12 @@ class _ChannelTile extends StatelessWidget {
         ),
       ),
     ];
-    if (trailing != null) {
-      rowChildren.add(trailing!);
-    }
     final showVoiceParticipants =
         channel.kind == ChannelKind.voice &&
         activeVoiceChannelId == channel.id &&
         activeVoiceParticipants.isNotEmpty;
 
-    return InkWell(
+    final tileBody = InkWell(
       onTap: onTap,
       mouseCursor: SystemMouseCursors.click,
       borderRadius: BorderRadius.circular(18),
@@ -1963,26 +2403,16 @@ class _ChannelTile extends StatelessWidget {
           children: [
             Row(children: rowChildren),
             if (showVoiceParticipants) ...[
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
               Padding(
                 padding: const EdgeInsets.only(left: 28),
-                child: Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: activeVoiceParticipants
                       .map(
-                        (participant) => Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: palette.panel,
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(color: palette.border),
-                          ),
+                        (participant) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
                           child: Row(
-                            mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
                                 participant.isMuted
@@ -1992,14 +2422,31 @@ class _ChannelTile extends StatelessWidget {
                                     : participant.shareKind == ShareKind.camera
                                     ? Icons.videocam
                                     : Icons.mic,
-                                size: 14,
+                                size: 13,
+                                color: participant.isSpeaking
+                                    ? Theme.of(context).colorScheme.secondary
+                                    : Theme.of(context).colorScheme.onSurface,
                               ),
                               const SizedBox(width: 6),
-                              Text(
-                                participant.isSelf
-                                    ? '${participant.displayName} (you)'
-                                    : participant.displayName,
-                                style: Theme.of(context).textTheme.bodySmall,
+                              Expanded(
+                                child: Text(
+                                  participant.isSelf
+                                      ? '${participant.displayName} (you)'
+                                      : participant.displayName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: participant.isSpeaking
+                                            ? Theme.of(
+                                                context,
+                                              ).colorScheme.secondary
+                                            : null,
+                                        fontWeight: participant.isSpeaking
+                                            ? FontWeight.w700
+                                            : FontWeight.w500,
+                                      ),
+                                ),
                               ),
                               if (participant.isSpeaking) ...[
                                 const SizedBox(width: 6),
@@ -2023,7 +2470,449 @@ class _ChannelTile extends StatelessWidget {
         ),
       ),
     );
+
+    if (!draggable) {
+      return tileBody;
+    }
+
+    return Draggable<ChannelSummary>(
+      data: channel,
+      ignoringFeedbackPointer: true,
+      onDragStarted: onDragStarted,
+      onDragCompleted: onDragFinished,
+      onDraggableCanceled: (velocity, offset) => onDragFinished(),
+      onDragEnd: (_) => onDragFinished(),
+      feedbackOffset: const Offset(28, -26),
+      feedback: Material(
+        color: Colors.transparent,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 220),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: palette.panelStrong.withAlpha(235),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: palette.borderStrong),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  channel.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      childWhenDragging: Opacity(opacity: 0.48, child: tileBody),
+      child: tileBody,
+    );
   }
+}
+
+class _ChannelDropSlot extends StatelessWidget {
+  const _ChannelDropSlot({
+    required this.categoryId,
+    required this.targetIndex,
+    required this.canManageChannels,
+    required this.visible,
+    required this.onMoveChannel,
+  });
+
+  final String? categoryId;
+  final int targetIndex;
+  final bool canManageChannels;
+  final bool visible;
+  final Future<void> Function(
+    ChannelSummary channel,
+    String? targetCategoryId,
+    int targetIndex,
+  )
+  onMoveChannel;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return DragTarget<ChannelSummary>(
+      onWillAcceptWithDetails: !canManageChannels ? null : (details) => true,
+      onAcceptWithDetails: !canManageChannels
+          ? null
+          : (details) {
+              unawaited(onMoveChannel(details.data, categoryId, targetIndex));
+            },
+      builder: (context, candidateData, rejectedData) {
+        final hovering = candidateData.isNotEmpty;
+        final showIndicator = visible || hovering;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.easeOut,
+          margin: showIndicator
+              ? const EdgeInsets.symmetric(vertical: 2)
+              : EdgeInsets.zero,
+          padding: showIndicator
+              ? const EdgeInsets.symmetric(horizontal: 8)
+              : EdgeInsets.zero,
+          height: showIndicator ? (hovering ? 28 : 18) : 0,
+          alignment: Alignment.center,
+          child: !showIndicator
+              ? const SizedBox.shrink()
+              : Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
+                      curve: Curves.easeOut,
+                      height: hovering ? 16 : 10,
+                      decoration: BoxDecoration(
+                        color: hovering
+                            ? palette.panelAccent.withAlpha(120)
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
+                      curve: Curves.easeOut,
+                      height: hovering ? 5 : 2,
+                      decoration: BoxDecoration(
+                        color: hovering
+                            ? palette.borderStrong
+                            : palette.border.withAlpha(120),
+                        borderRadius: BorderRadius.circular(999),
+                        boxShadow: hovering
+                            ? [
+                                BoxShadow(
+                                  color: palette.borderStrong.withAlpha(90),
+                                  blurRadius: 10,
+                                  spreadRadius: 1,
+                                ),
+                              ]
+                            : const [],
+                      ),
+                    ),
+                  ],
+                ),
+        );
+      },
+    );
+  }
+}
+
+class _ServerMembersPanel extends StatelessWidget {
+  const _ServerMembersPanel({
+    required this.server,
+    required this.roles,
+    required this.members,
+    required this.onlineMemberIds,
+    required this.loading,
+    required this.error,
+    required this.currentUserId,
+  });
+
+  final ServerSummary? server;
+  final List<ServerRole> roles;
+  final List<ServerMember> members;
+  final Set<String> onlineMemberIds;
+  final bool loading;
+  final String? error;
+  final String currentUserId;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    if (server == null) {
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          color: palette.panelMuted,
+          borderRadius: BorderRadius.circular(26),
+          border: Border.all(color: palette.border),
+        ),
+        child: const _EmptyState(
+          title: 'No members yet',
+          message: 'Select a server to view its member roster.',
+        ),
+      );
+    }
+
+    final groupedMembers = _groupMembersByRole();
+    final onlineCount = members
+        .where((member) => onlineMemberIds.contains(member.userId))
+        .length;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: palette.panelMuted,
+        borderRadius: BorderRadius.circular(26),
+        border: Border.all(color: palette.border),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Members',
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '$onlineCount online • ${members.length} total',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 16),
+            if (error != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(error!),
+              ),
+            if (loading)
+              const Expanded(child: Center(child: CircularProgressIndicator()))
+            else if (members.isEmpty)
+              const Expanded(
+                child: Center(
+                  child: Text('No members found in this server yet.'),
+                ),
+              )
+            else
+              Expanded(
+                child: ListView(
+                  children: groupedMembers
+                      .map(
+                        (group) => Padding(
+                          padding: const EdgeInsets.only(bottom: 18),
+                          child: _ServerMemberRoleSection(
+                            group: group,
+                            onlineMemberIds: onlineMemberIds,
+                            currentUserId: currentUserId,
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<_ServerMemberRoleGroup> _groupMembersByRole() {
+    final roleOrder = {
+      for (var index = 0; index < roles.length; index++) roles[index].id: index,
+    };
+    final roleById = {for (final role in roles) role.id: role};
+    final membersByRoleName = <String, List<ServerMember>>{};
+    final roleNameOrder = <String, int>{};
+
+    for (final member in members) {
+      final primaryRole = _primaryRoleForMember(member, roleById, roleOrder);
+      final roleName = primaryRole?.name ?? 'No role';
+      membersByRoleName
+          .putIfAbsent(roleName, () => <ServerMember>[])
+          .add(member);
+      roleNameOrder.putIfAbsent(
+        roleName,
+        () => primaryRole == null
+            ? 1 << 20
+            : _roleSortScore(primaryRole, roleOrder),
+      );
+    }
+
+    final groups = membersByRoleName.entries
+        .map(
+          (entry) => _ServerMemberRoleGroup(
+            roleName: entry.key,
+            members: entry.value
+              ..sort((left, right) {
+                final leftOnline = onlineMemberIds.contains(left.userId);
+                final rightOnline = onlineMemberIds.contains(right.userId);
+                if (leftOnline != rightOnline) {
+                  return leftOnline ? -1 : 1;
+                }
+                return left.displayName.toLowerCase().compareTo(
+                  right.displayName.toLowerCase(),
+                );
+              }),
+            order: roleNameOrder[entry.key] ?? 1 << 20,
+          ),
+        )
+        .toList();
+
+    groups.sort((left, right) {
+      final orderComparison = left.order.compareTo(right.order);
+      if (orderComparison != 0) {
+        return orderComparison;
+      }
+      return left.roleName.toLowerCase().compareTo(
+        right.roleName.toLowerCase(),
+      );
+    });
+    return groups;
+  }
+
+  ServerRole? _primaryRoleForMember(
+    ServerMember member,
+    Map<String, ServerRole> roleById,
+    Map<String, int> roleOrder,
+  ) {
+    final assignedRoles = member.roleIds
+        .map((roleId) => roleById[roleId])
+        .whereType<ServerRole>()
+        .toList();
+    if (assignedRoles.isEmpty) {
+      return null;
+    }
+    assignedRoles.sort(
+      (left, right) => _roleSortScore(
+        left,
+        roleOrder,
+      ).compareTo(_roleSortScore(right, roleOrder)),
+    );
+    return assignedRoles.first;
+  }
+
+  int _roleSortScore(ServerRole role, Map<String, int> roleOrder) {
+    final normalizedName = role.name.toLowerCase();
+    if (normalizedName == 'owner') {
+      return -3000;
+    }
+    if (normalizedName == 'admin') {
+      return -2000;
+    }
+    if (normalizedName == 'member') {
+      return 9000;
+    }
+    final index = roleOrder[role.id] ?? 0;
+    return role.isSystem ? 1000 + index : index;
+  }
+}
+
+class _ServerMemberRoleSection extends StatelessWidget {
+  const _ServerMemberRoleSection({
+    required this.group,
+    required this.onlineMemberIds,
+    required this.currentUserId,
+  });
+
+  final _ServerMemberRoleGroup group;
+  final Set<String> onlineMemberIds;
+  final String currentUserId;
+
+  @override
+  Widget build(BuildContext context) {
+    final onlineMembers = group.members
+        .where((member) => onlineMemberIds.contains(member.userId))
+        .toList();
+    final offlineMembers = group.members
+        .where((member) => !onlineMemberIds.contains(member.userId))
+        .toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '${group.roleName.toUpperCase()} • ${group.members.length}',
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+            letterSpacing: 1.0,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (onlineMembers.isNotEmpty) ...[
+          Text('Online', style: Theme.of(context).textTheme.bodySmall),
+          const SizedBox(height: 6),
+          ...onlineMembers.map(
+            (member) => _ServerMemberRow(
+              member: member,
+              online: true,
+              isCurrentUser: member.userId == currentUserId,
+            ),
+          ),
+        ],
+        if (onlineMembers.isNotEmpty && offlineMembers.isNotEmpty)
+          const SizedBox(height: 10),
+        if (offlineMembers.isNotEmpty) ...[
+          Text('Offline', style: Theme.of(context).textTheme.bodySmall),
+          const SizedBox(height: 6),
+          ...offlineMembers.map(
+            (member) => _ServerMemberRow(
+              member: member,
+              online: false,
+              isCurrentUser: member.userId == currentUserId,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _ServerMemberRow extends StatelessWidget {
+  const _ServerMemberRow({
+    required this.member,
+    required this.online,
+    required this.isCurrentUser,
+  });
+
+  final ServerMember member;
+  final bool online;
+  final bool isCurrentUser;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final indicatorColor = online
+        ? Theme.of(context).colorScheme.secondary
+        : palette.borderStrong.withAlpha(150);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: indicatorColor,
+              shape: BoxShape.circle,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              isCurrentUser
+                  ? '${member.displayName} (you)'
+                  : member.displayName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                fontWeight: online ? FontWeight.w600 : FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ServerMemberRoleGroup {
+  const _ServerMemberRoleGroup({
+    required this.roleName,
+    required this.members,
+    required this.order,
+  });
+
+  final String roleName;
+  final List<ServerMember> members;
+  final int order;
 }
 
 class TextChannelView extends StatefulWidget {
@@ -2318,6 +3207,10 @@ class _LegacyVoiceChannelView extends StatelessWidget {
           value: 'volume_150',
           child: Text('Volume 150%'),
         ),
+        const PopupMenuItem<String>(
+          value: 'volume_200',
+          child: Text('Volume 200%'),
+        ),
         if (canManageServer && !participant.isSelf) ...[
           const PopupMenuDivider(),
           const PopupMenuItem<String>(
@@ -2367,6 +3260,8 @@ class _LegacyVoiceChannelView extends StatelessWidget {
         await voiceController.setParticipantVolume(participant.clientId, 1);
       case 'volume_150':
         await voiceController.setParticipantVolume(participant.clientId, 1.5);
+      case 'volume_200':
+        await voiceController.setParticipantVolume(participant.clientId, 2);
       case 'kick':
         await repository.removeMemberFromServer(
           serverId: channel.serverId,
@@ -2756,6 +3651,10 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
           value: 'volume_150',
           child: Text('Volume 150%'),
         ),
+        const PopupMenuItem<String>(
+          value: 'volume_200',
+          child: Text('Volume 200%'),
+        ),
         if (widget.canManageServer && !participant.isSelf) ...[
           const PopupMenuDivider(),
           const PopupMenuItem<String>(
@@ -2805,6 +3704,8 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
         await voiceController.setParticipantVolume(participant.clientId, 1);
       case 'volume_150':
         await voiceController.setParticipantVolume(participant.clientId, 1.5);
+      case 'volume_200':
+        await voiceController.setParticipantVolume(participant.clientId, 2);
       case 'kick':
         await widget.repository.removeMemberFromServer(
           serverId: widget.channel.serverId,
@@ -3451,10 +4352,10 @@ class _ParticipantStageTile extends StatelessWidget {
                             ),
                             child: Slider(
                               min: 0,
-                              max: 1.5,
-                              divisions: 6,
+                              max: 2.0,
+                              divisions: 8,
                               value: participant.volume!
-                                  .clamp(0.0, 1.5)
+                                  .clamp(0.0, 2.0)
                                   .toDouble(),
                               onChanged: onVolumeChanged,
                             ),

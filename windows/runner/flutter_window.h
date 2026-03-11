@@ -7,6 +7,7 @@
 #include <flutter/flutter_view_controller.h>
 
 #include <memory>
+#include <string>
 
 #include "win32_window.h"
 
@@ -14,6 +15,7 @@
 class FlutterWindow : public Win32Window {
  public:
   static constexpr ULONG_PTR kDeepLinkCopyDataId = 0x43435432;
+  static constexpr UINT kTrayIconMessage = WM_APP + 1;
 
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project);
@@ -28,6 +30,12 @@ class FlutterWindow : public Win32Window {
 
  private:
   void ForwardDeepLink(const std::string& deep_link);
+  void RestoreFromTray();
+  bool HideToTray();
+  void ExitApplication();
+  void ShowTrayContextMenu(POINT cursor_position);
+  bool AddTrayIcon();
+  void RemoveTrayIcon();
 
   // The project to run.
   flutter::DartProject project_;
@@ -36,6 +44,9 @@ class FlutterWindow : public Win32Window {
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       native_window_channel_;
+  bool tray_icon_visible_ = false;
+  bool allow_window_close_ = false;
+  UINT taskbar_created_message_ = 0;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

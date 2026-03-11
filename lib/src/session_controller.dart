@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
 import 'desktop_capture_bridge.dart';
+import 'app_preferences.dart';
 import 'models.dart';
 import 'repositories.dart';
 import 'ui_sound_effects.dart';
@@ -28,13 +30,62 @@ class ScreenShareService {
   }
 
   Future<MediaStream> openMicrophone() {
-    return navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    return openConfiguredMicrophone();
   }
 
   Future<MediaStream> openCameraVideo() {
+    return openConfiguredCamera();
+  }
+
+  Future<void> applyAudioOutputDevice(String? deviceId) async {
+    if (deviceId == null || deviceId.isEmpty) {
+      return;
+    }
+
+    try {
+      await Helper.selectAudioOutput(deviceId);
+    } on Object {
+      // Device routing should not break the application when unsupported.
+    }
+  }
+
+  Future<void> applyVoiceProcessingPreference(bool enabled) async {
+    try {
+      await NativeAudioManagement.setIsVoiceProcessingBypassed(!enabled);
+    } on Object {
+      // Voice-processing APIs are not available on every desktop build.
+    }
+  }
+
+  Future<MediaStream> openConfiguredMicrophone({
+    String? deviceId,
+    bool noiseCancellation = true,
+  }) async {
+    if (deviceId != null && deviceId.isNotEmpty) {
+      try {
+        await Helper.selectAudioInput(deviceId);
+      } on Object {
+        // Constraint-based device selection below is the fallback path.
+      }
+    }
+    await applyVoiceProcessingPreference(noiseCancellation);
+
+    return navigator.mediaDevices.getUserMedia({
+      'audio': {
+        if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+        'echoCancellation': noiseCancellation,
+        'noiseSuppression': noiseCancellation,
+        'autoGainControl': false,
+      },
+      'video': false,
+    });
+  }
+
+  Future<MediaStream> openConfiguredCamera({String? deviceId}) {
     return navigator.mediaDevices.getUserMedia({
       'audio': false,
       'video': {
+        if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
         'mandatory': {'minWidth': 960, 'minHeight': 540, 'minFrameRate': 15},
       },
     });
@@ -89,11 +140,22 @@ class VoiceRemotePeer {
   bool get hasMedia => renderer.srcObject != null;
 }
 
+class _AudioEnergySample {
+  const _AudioEnergySample({
+    required this.totalAudioEnergy,
+    required this.totalSamplesDuration,
+  });
+
+  final double totalAudioEnergy;
+  final double totalSamplesDuration;
+}
+
 class VoiceChannelSessionController extends ChangeNotifier {
   VoiceChannelSessionController({
     required this.channel,
     required this.client,
     required this.authService,
+    required this.preferences,
     required this.screenShareService,
     required this.soundEffects,
   }) : clientId = const Uuid().v4();
@@ -101,6 +163,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
   final ChannelSummary channel;
   final SupabaseClient client;
   final AuthService authService;
+  final AppPreferences preferences;
   final ScreenShareService screenShareService;
   final UiSoundEffects soundEffects;
   final String clientId;
@@ -116,6 +179,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
   RealtimeChannel? _baseInboxChannel;
   RealtimeChannel? _cameraInboxChannel;
   RealtimeChannel? _screenInboxChannel;
+  RTCPeerConnection? _localSpeakingMonitorSender;
+  RTCPeerConnection? _localSpeakingMonitorReceiver;
   MediaStream? _microphoneStream;
   MediaStream? _videoSourceStream;
   MediaStream? _localCompositeStream;
@@ -133,10 +198,13 @@ class VoiceChannelSessionController extends ChangeNotifier {
   final Map<String, double> _participantVolumes = <String, double>{};
   final Map<String, bool> _speakingStates = <String, bool>{};
   final Map<String, DateTime> _lastSpeakingAt = <String, DateTime>{};
+  final Map<String, _AudioEnergySample> _lastAudioSamples =
+      <String, _AudioEnergySample>{};
 
-  static const Duration _speakingPollInterval = Duration(milliseconds: 240);
-  static const Duration _speakingHoldDuration = Duration(milliseconds: 650);
-  static const double _speakingThreshold = 0.035;
+  static const Duration _speakingPollInterval = Duration(milliseconds: 120);
+  static const Duration _speakingHoldDuration = Duration(milliseconds: 520);
+  double get _speakingThreshold =>
+      0.065 / preferences.inputSensitivity.clamp(0.5, 2.0);
 
   bool get joined => _joined;
   bool get busy => _busy;
@@ -176,7 +244,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     try {
       await initialize();
-      final microphoneFuture = screenShareService.openMicrophone();
+      final microphoneFuture = screenShareService.openConfiguredMicrophone(
+        deviceId: preferences.preferredAudioInputId,
+        noiseCancellation: preferences.noiseCancellation,
+      );
       final presenceChannelFuture = _subscribeRealtimeChannel(
         topic: _presenceTopic(),
         scope: null,
@@ -199,6 +270,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       );
 
       _microphoneStream = await microphoneFuture;
+      await _ensureLocalSpeakingMonitor();
       await _rebuildLocalCompositeStream();
       final subscribedChannels = await Future.wait<RealtimeChannel>([
         presenceChannelFuture,
@@ -216,7 +288,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _status = 'Connected to voice channel.';
       await _syncParticipants();
       _startSpeakingMonitor();
-      await soundEffects.play(UiSoundEffect.joinCall);
+      await soundEffects.play(
+        UiSoundEffect.joinCall,
+        enabled: preferences.playSounds,
+      );
     } catch (error) {
       await leave();
       _status = 'Unable to join voice channel: $error';
@@ -227,12 +302,14 @@ class VoiceChannelSessionController extends ChangeNotifier {
   }
 
   Future<void> leave() async {
+    final wasJoined = _joined;
     _joined = false;
     _participants = const <VoiceParticipant>[];
     _status = 'Disconnected from voice channel.';
     _stopSpeakingMonitor();
     _speakingStates.clear();
     _lastSpeakingAt.clear();
+    _lastAudioSamples.clear();
 
     for (final peer in _peerStates.values) {
       await _disposePeer(peer);
@@ -272,6 +349,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     _videoSourceStream = null;
     _localCompositeStream = null;
     _microphoneStream = null;
+    await _disposeLocalSpeakingMonitor();
     for (final stream in streamsToDispose.values) {
       await screenShareService.stopStream(stream);
     }
@@ -280,7 +358,12 @@ class VoiceChannelSessionController extends ChangeNotifier {
     _muted = false;
     _deafened = false;
     _participantVolumes.clear();
-    await soundEffects.play(UiSoundEffect.leaveCall);
+    if (wasJoined) {
+      await soundEffects.play(
+        UiSoundEffect.leaveCall,
+        enabled: preferences.playSounds,
+      );
+    }
     notifyListeners();
   }
 
@@ -295,7 +378,9 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     try {
       await screenShareService.stopStream(_videoSourceStream);
-      _videoSourceStream = await screenShareService.openCameraVideo();
+      _videoSourceStream = await screenShareService.openConfiguredCamera(
+        deviceId: preferences.preferredVideoInputId,
+      );
       _shareKind = ShareKind.camera;
       localRenderer.srcObject = _videoSourceStream;
       await _rebuildLocalCompositeStream();
@@ -416,7 +501,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
     _speakingStates[clientId] = false;
     unawaited(
-      soundEffects.play(nextMuted ? UiSoundEffect.mute : UiSoundEffect.unmute),
+      soundEffects.play(
+        nextMuted ? UiSoundEffect.mute : UiSoundEffect.unmute,
+        enabled: preferences.playSounds,
+      ),
     );
   }
 
@@ -428,6 +516,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
     await soundEffects.play(
       _deafened ? UiSoundEffect.deafen : UiSoundEffect.undeafen,
+      enabled: preferences.playSounds,
     );
     notifyListeners();
   }
@@ -436,7 +525,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     String participantClientId,
     double volume,
   ) async {
-    final normalized = volume.clamp(0.0, 1.5).toDouble();
+    final normalized = volume.clamp(0.0, 2.0).toDouble();
     _participantVolumes[participantClientId] = normalized;
     final peer = _peerStates[participantClientId];
     if (peer != null) {
@@ -915,6 +1004,72 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
   }
 
+  Future<void> _ensureLocalSpeakingMonitor() async {
+    final microphoneStream = _microphoneStream;
+    final track = microphoneStream?.getAudioTracks().firstOrNull;
+    if (track == null) {
+      await _disposeLocalSpeakingMonitor();
+      return;
+    }
+    if (_localSpeakingMonitorSender != null &&
+        _localSpeakingMonitorReceiver != null) {
+      return;
+    }
+
+    await _disposeLocalSpeakingMonitor();
+
+    final sender = await createPeerConnection(<String, dynamic>{});
+    final receiver = await createPeerConnection(<String, dynamic>{});
+    await receiver.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+    );
+
+    sender.onIceCandidate = (candidate) {
+      if (candidate.candidate == null) {
+        return;
+      }
+      unawaited(receiver.addCandidate(candidate));
+    };
+    receiver.onIceCandidate = (candidate) {
+      if (candidate.candidate == null) {
+        return;
+      }
+      unawaited(sender.addCandidate(candidate));
+    };
+
+    await sender.addTrack(track, microphoneStream!);
+    final offer = await sender.createOffer(<String, dynamic>{
+      'offerToReceiveAudio': 1,
+      'offerToReceiveVideo': 0,
+    });
+    await sender.setLocalDescription(offer);
+    await receiver.setRemoteDescription(offer);
+    final answer = await receiver.createAnswer(<String, dynamic>{
+      'offerToReceiveAudio': 1,
+      'offerToReceiveVideo': 0,
+    });
+    await receiver.setLocalDescription(answer);
+    await sender.setRemoteDescription(answer);
+
+    _localSpeakingMonitorSender = sender;
+    _localSpeakingMonitorReceiver = receiver;
+  }
+
+  Future<void> _disposeLocalSpeakingMonitor() async {
+    final connections = [
+      _localSpeakingMonitorSender,
+      _localSpeakingMonitorReceiver,
+    ].whereType<RTCPeerConnection>().toList();
+    _localSpeakingMonitorSender = null;
+    _localSpeakingMonitorReceiver = null;
+    _lastAudioSamples.remove(clientId);
+    for (final connection in connections) {
+      await connection.close();
+      await connection.dispose();
+    }
+  }
+
   Future<void> _reconnectAllPeers({required bool forceOfferAll}) async {
     final currentPeers = _peerStates.values.toList();
     for (final peer in currentPeers) {
@@ -957,6 +1112,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   void _startSpeakingMonitor() {
     _speakingPollTimer?.cancel();
+    unawaited(_pollSpeakingStates());
     _speakingPollTimer = Timer.periodic(_speakingPollInterval, (_) {
       unawaited(_pollSpeakingStates());
     });
@@ -1039,23 +1195,28 @@ class VoiceChannelSessionController extends ChangeNotifier {
       return 0;
     }
 
-    final connection = _peerStates.values
-        .map((peer) => peer.connection)
-        .whereType<RTCPeerConnection>()
-        .firstOrNull;
+    final connection =
+        _localSpeakingMonitorReceiver ??
+        _peerStates.values
+            .map((peer) => peer.connection)
+            .whereType<RTCPeerConnection>()
+            .firstOrNull;
     if (connection == null) {
       return null;
     }
 
     try {
-      final senders = await connection.getSenders();
-      final audioSender = senders
-          .where((sender) => sender.track?.kind == 'audio')
+      final receivers = await connection.getReceivers();
+      final audioReceiver = receivers
+          .where((receiver) => receiver.track?.kind == 'audio')
           .firstOrNull;
-      if (audioSender == null) {
+      if (audioReceiver == null) {
         return null;
       }
-      return _extractAudioLevel(await audioSender.getStats());
+      return _extractAudioLevel(
+        await audioReceiver.getStats(),
+        participantClientId: clientId,
+      );
     } catch (_) {
       return null;
     }
@@ -1075,13 +1236,20 @@ class VoiceChannelSessionController extends ChangeNotifier {
       if (audioReceiver == null) {
         return null;
       }
-      return _extractAudioLevel(await audioReceiver.getStats());
+      return _extractAudioLevel(
+        await audioReceiver.getStats(),
+        participantClientId: peer.participant.clientId,
+      );
     } catch (_) {
       return null;
     }
   }
 
-  double? _extractAudioLevel(List<StatsReport> stats) {
+  double? _extractAudioLevel(
+    List<StatsReport> stats, {
+    required String participantClientId,
+  }) {
+    _AudioEnergySample? currentSample;
     for (final report in stats) {
       final values = report.values;
       final mediaKind =
@@ -1096,7 +1264,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
         values['audioLevel'] ?? values['audio_level'],
       );
       if (audioLevel != null) {
-        return audioLevel;
+        return audioLevel.clamp(0.0, 1.0);
       }
 
       final voiceActivity =
@@ -1104,8 +1272,48 @@ class VoiceChannelSessionController extends ChangeNotifier {
       if (voiceActivity == true) {
         return 1;
       }
+
+      final totalAudioEnergy = _parseStatDouble(
+        values['totalAudioEnergy'] ?? values['total_audio_energy'],
+      );
+      final totalSamplesDuration = _parseStatDouble(
+        values['totalSamplesDuration'] ??
+            values['total_samples_duration'] ??
+            values['totalAudioDuration'] ??
+            values['total_audio_duration'],
+      );
+      if (totalAudioEnergy != null && totalSamplesDuration != null) {
+        currentSample = _AudioEnergySample(
+          totalAudioEnergy: totalAudioEnergy,
+          totalSamplesDuration: totalSamplesDuration,
+        );
+      }
     }
-    return null;
+
+    if (currentSample == null) {
+      return null;
+    }
+
+    final previousSample = _lastAudioSamples[participantClientId];
+    _lastAudioSamples[participantClientId] = currentSample;
+    if (previousSample == null) {
+      return null;
+    }
+
+    final deltaEnergy = math.max(
+      0.0,
+      currentSample.totalAudioEnergy - previousSample.totalAudioEnergy,
+    );
+    final deltaDuration = math.max(
+      0.0,
+      currentSample.totalSamplesDuration - previousSample.totalSamplesDuration,
+    );
+    if (deltaDuration <= 0) {
+      return null;
+    }
+
+    final derivedLevel = math.sqrt(deltaEnergy / deltaDuration);
+    return derivedLevel.clamp(0.0, 1.0);
   }
 
   double? _parseStatDouble(Object? value) {

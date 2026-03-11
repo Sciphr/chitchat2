@@ -20,6 +20,9 @@ class AppBootstrap {
     defaultValue: '',
   );
 
+  static String get _persistSessionKey =>
+      'sb-${Uri.parse(supabaseUrl).host.split('.').first}-auth-token';
+
   static Future<AppBootstrap> initialize() async {
     if (supabaseUrl.isEmpty || supabaseAnonKey.isEmpty) {
       return const AppBootstrap(
@@ -31,7 +34,17 @@ class AppBootstrap {
     }
 
     try {
-      await Supabase.initialize(url: supabaseUrl, anonKey: supabaseAnonKey);
+      await Supabase.initialize(
+        url: supabaseUrl,
+        anonKey: supabaseAnonKey,
+        authOptions: FlutterAuthClientOptions(
+          autoRefreshToken: true,
+          detectSessionInUri: true,
+          localStorage: SharedPreferencesLocalStorage(
+            persistSessionKey: _persistSessionKey,
+          ),
+        ),
+      );
       return const AppBootstrap(
         isConfigured: true,
         hasInitializationError: false,

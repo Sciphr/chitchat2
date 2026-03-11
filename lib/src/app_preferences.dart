@@ -9,12 +9,22 @@ class AppPreferences extends ChangeNotifier {
   bool _playSounds = true;
   bool _messageAnimations = true;
   bool _reduceMotion = false;
+  String? _preferredAudioInputId;
+  String? _preferredAudioOutputId;
+  String? _preferredVideoInputId;
+  bool _noiseCancellation = true;
+  double _inputSensitivity = 1.0;
 
   AppThemeScheme get themeScheme => _themeScheme;
   bool get desktopNotifications => _desktopNotifications;
   bool get playSounds => _playSounds;
   bool get messageAnimations => _messageAnimations;
   bool get reduceMotion => _reduceMotion;
+  String? get preferredAudioInputId => _preferredAudioInputId;
+  String? get preferredAudioOutputId => _preferredAudioOutputId;
+  String? get preferredVideoInputId => _preferredVideoInputId;
+  bool get noiseCancellation => _noiseCancellation;
+  double get inputSensitivity => _inputSensitivity;
 
   Duration get motionDuration =>
       _reduceMotion ? Duration.zero : const Duration(milliseconds: 280);
@@ -24,6 +34,11 @@ class AppPreferences extends ChangeNotifier {
   static const _soundsKey = 'prefs.play_sounds';
   static const _messageAnimationsKey = 'prefs.message_animations';
   static const _reduceMotionKey = 'prefs.reduce_motion';
+  static const _audioInputKey = 'prefs.audio_input_id';
+  static const _audioOutputKey = 'prefs.audio_output_id';
+  static const _videoInputKey = 'prefs.video_input_id';
+  static const _noiseCancellationKey = 'prefs.noise_cancellation';
+  static const _inputSensitivityKey = 'prefs.input_sensitivity';
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -36,6 +51,14 @@ class AppPreferences extends ChangeNotifier {
     _playSounds = prefs.getBool(_soundsKey) ?? true;
     _messageAnimations = prefs.getBool(_messageAnimationsKey) ?? true;
     _reduceMotion = prefs.getBool(_reduceMotionKey) ?? false;
+    _preferredAudioInputId = prefs.getString(_audioInputKey);
+    _preferredAudioOutputId = prefs.getString(_audioOutputKey);
+    _preferredVideoInputId = prefs.getString(_videoInputKey);
+    _noiseCancellation = prefs.getBool(_noiseCancellationKey) ?? true;
+    _inputSensitivity = (prefs.getDouble(_inputSensitivityKey) ?? 1.0).clamp(
+      0.5,
+      2.0,
+    );
     notifyListeners();
   }
 
@@ -72,6 +95,53 @@ class AppPreferences extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_reduceMotionKey, value);
+  }
+
+  Future<void> setPreferredAudioInputId(String? value) async {
+    _preferredAudioInputId = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null || value.isEmpty) {
+      await prefs.remove(_audioInputKey);
+    } else {
+      await prefs.setString(_audioInputKey, value);
+    }
+  }
+
+  Future<void> setPreferredAudioOutputId(String? value) async {
+    _preferredAudioOutputId = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null || value.isEmpty) {
+      await prefs.remove(_audioOutputKey);
+    } else {
+      await prefs.setString(_audioOutputKey, value);
+    }
+  }
+
+  Future<void> setPreferredVideoInputId(String? value) async {
+    _preferredVideoInputId = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null || value.isEmpty) {
+      await prefs.remove(_videoInputKey);
+    } else {
+      await prefs.setString(_videoInputKey, value);
+    }
+  }
+
+  Future<void> setNoiseCancellation(bool value) async {
+    _noiseCancellation = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_noiseCancellationKey, value);
+  }
+
+  Future<void> setInputSensitivity(double value) async {
+    _inputSensitivity = value.clamp(0.5, 2.0);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_inputSensitivityKey, _inputSensitivity);
   }
 }
 
