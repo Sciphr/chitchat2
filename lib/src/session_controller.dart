@@ -528,6 +528,11 @@ class VoiceChannelSessionController extends ChangeNotifier {
     final presenceChannel = _presenceChannel;
     _presenceChannel = null;
     if (presenceChannel != null) {
+      try {
+        await presenceChannel.untrack();
+      } on Object {
+        // Best-effort cleanup. The channel may already be closing.
+      }
       await client.removeChannel(presenceChannel);
     }
   }

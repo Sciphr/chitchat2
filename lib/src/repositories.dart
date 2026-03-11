@@ -1,4 +1,8 @@
 import 'package:flutter/foundation.dart';
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_bootstrap.dart';
@@ -139,6 +143,8 @@ class WorkspaceRepository {
 
   final SupabaseClient client;
   final AuthService authService;
+
+  bool get hasGiphyApiKey => AppBootstrap.giphyApiKey.trim().isNotEmpty;
 
   Future<void> ensureCurrentProfile() async {
     await client.from('user_profiles').upsert({
@@ -697,6 +703,7 @@ class WorkspaceRepository {
   Future<void> sendChannelMessage({
     required String channelId,
     required String body,
+    ChannelMessage? replyToMessage,
   }) async {
     final cleanBody = body.trim();
     if (cleanBody.isEmpty) {
@@ -708,6 +715,241 @@ class WorkspaceRepository {
       'sender_id': authService.userId,
       'sender_display_name': authService.displayName,
       'body': cleanBody,
+      'reply_to_message_id': replyToMessage?.id,
+      'reply_to_body': replyToMessage == null ? null : _replyPreview(replyToMessage.body),
+      'reply_to_sender_display_name': replyToMessage?.senderDisplayName,
     });
+  }
+
+  Future<void> deleteChannelMessage(String messageId) async {
+    await client.rpc(
+      'delete_channel_message',
+      params: <String, dynamic>{'message_id_input': messageId},
+    );
+  }
+
+  Future<void> toggleChannelMessageReaction({
+    required String messageId,
+    required String emoji,
+  }) async {
+    await client.rpc(
+      'toggle_channel_message_reaction',
+      params: <String, dynamic>{
+        'message_id_input': messageId,
+        'emoji_input': emoji.trim(),
+      },
+    );
+  }
+
+  Future<String> createOrGetDirectConversation({
+    required String otherUserId,
+  }) async {
+    final response = await client.rpc(
+      'create_or_get_direct_conversation',
+      params: <String, dynamic>{'other_user_id_input': otherUserId},
+    );
+    if (response is String && response.isNotEmpty) {
+      return response;
+    }
+    throw StateError('Unable to create a direct conversation.');
+  }
+
+  Future<List<DirectConversationSummary>> fetchDirectConversationSummaries() async {
+    final response = await client.rpc('list_direct_conversations');
+    if (response is! List) {
+      return const <DirectConversationSummary>[];
+    }
+    return response
+        .map((row) => DirectConversationSummary.fromMap(Map<String, dynamic>.from(row as Map)))
+        .toList()
+      ..sort((left, right) {
+        final rightTime = right.lastMessageAt;
+        final leftTime = left.lastMessageAt;
+        if (leftTime == null && rightTime == null) {
+          return left.otherDisplayName.toLowerCase().compareTo(
+            right.otherDisplayName.toLowerCase(),
+          );
+        }
+        if (leftTime == null) {
+          return 1;
+        }
+        if (rightTime == null) {
+          return -1;
+        }
+        return rightTime.compareTo(leftTime);
+      });
+  }
+
+  Stream<List<DirectConversationSummary>> watchDirectConversationSummaries() {
+    late final StreamController<List<DirectConversationSummary>> controller;
+    StreamSubscription<List<Map<String, dynamic>>>? conversationsSub;
+    StreamSubscription<List<Map<String, dynamic>>>? membershipsSub;
+    StreamSubscription<List<Map<String, dynamic>>>? profilesSub;
+    var active = true;
+
+    Future<void> emitLatest() async {
+      if (!active) {
+        return;
+      }
+      try {
+        controller.add(await fetchDirectConversationSummaries());
+      } catch (error, stackTrace) {
+        if (active) {
+          controller.addError(error, stackTrace);
+        }
+      }
+    }
+
+    controller = StreamController<List<DirectConversationSummary>>.broadcast(
+      onListen: () {
+        unawaited(emitLatest());
+        conversationsSub = client
+            .from('direct_conversations')
+            .stream(primaryKey: ['id'])
+            .listen((_) => unawaited(emitLatest()));
+        membershipsSub = client
+            .from('direct_conversation_members')
+            .stream(primaryKey: ['conversation_id', 'user_id'])
+            .eq('user_id', authService.userId)
+            .listen((_) => unawaited(emitLatest()));
+        profilesSub = client
+            .from('user_profiles')
+            .stream(primaryKey: ['id'])
+            .listen((_) => unawaited(emitLatest()));
+      },
+      onCancel: () async {
+        active = false;
+        await conversationsSub?.cancel();
+        await membershipsSub?.cancel();
+        await profilesSub?.cancel();
+      },
+    );
+
+    return controller.stream;
+  }
+
+  Stream<List<DirectMessage>> watchDirectMessages(String conversationId) {
+    return client
+        .from('direct_messages')
+        .stream(primaryKey: ['id'])
+        .eq('conversation_id', conversationId)
+        .order('created_at', ascending: true)
+        .map((rows) => rows.map((row) => DirectMessage.fromMap(row)).toList());
+  }
+
+  Future<void> sendDirectMessage({
+    required String conversationId,
+    required String body,
+    DirectMessage? replyToMessage,
+  }) async {
+    final cleanBody = body.trim();
+    if (cleanBody.isEmpty) {
+      return;
+    }
+
+    await client.from('direct_messages').insert({
+      'conversation_id': conversationId,
+      'sender_id': authService.userId,
+      'sender_display_name': authService.displayName,
+      'body': cleanBody,
+      'reply_to_message_id': replyToMessage?.id,
+      'reply_to_body': replyToMessage == null ? null : _replyPreview(replyToMessage.body),
+      'reply_to_sender_display_name': replyToMessage?.senderDisplayName,
+    });
+  }
+
+  Future<void> markDirectConversationRead(String conversationId) async {
+    await client
+        .from('direct_conversation_members')
+        .update({'last_read_at': DateTime.now().toUtc().toIso8601String()})
+        .eq('conversation_id', conversationId)
+        .eq('user_id', authService.userId);
+  }
+
+  Future<void> deleteDirectMessage(String messageId) async {
+    await client.rpc(
+      'delete_direct_message',
+      params: <String, dynamic>{'message_id_input': messageId},
+    );
+  }
+
+  Future<void> toggleDirectMessageReaction({
+    required String messageId,
+    required String emoji,
+  }) async {
+    await client.rpc(
+      'toggle_direct_message_reaction',
+      params: <String, dynamic>{
+        'message_id_input': messageId,
+        'emoji_input': emoji.trim(),
+      },
+    );
+  }
+
+  Future<List<GiphyGifResult>> searchGifs({
+    String query = '',
+    int limit = 24,
+  }) async {
+    final apiKey = AppBootstrap.giphyApiKey.trim();
+    if (apiKey.isEmpty) {
+      return const <GiphyGifResult>[];
+    }
+
+    final normalizedQuery = query.trim();
+    final uri = normalizedQuery.isEmpty
+        ? Uri.https(
+            'api.giphy.com',
+            '/v1/gifs/trending',
+            <String, String>{
+              'api_key': apiKey,
+              'limit': '$limit',
+              'rating': 'pg-13',
+            },
+          )
+        : Uri.https(
+            'api.giphy.com',
+            '/v1/gifs/search',
+            <String, String>{
+              'api_key': apiKey,
+              'q': normalizedQuery,
+              'limit': '$limit',
+              'rating': 'pg-13',
+              'lang': 'en',
+            },
+          );
+
+    final response = await http.get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        'Giphy search failed with status ${response.statusCode}.',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map) {
+      return const <GiphyGifResult>[];
+    }
+    final data = decoded['data'];
+    if (data is! List) {
+      return const <GiphyGifResult>[];
+    }
+
+    return data
+        .whereType<Map>()
+        .map(
+          (item) => GiphyGifResult.fromMap(Map<String, dynamic>.from(item)),
+        )
+        .where(
+          (gif) => gif.previewUrl.isNotEmpty && gif.gifUrl.isNotEmpty,
+        )
+        .toList(growable: false);
+  }
+
+  String _replyPreview(String body) {
+    final normalized = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized.length <= 140) {
+      return normalized;
+    }
+    return '${normalized.substring(0, 137)}...';
   }
 }

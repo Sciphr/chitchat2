@@ -33,6 +33,10 @@ class AppBootstrap {
     'LIVEKIT_TOKEN_FUNCTION_NAME',
     defaultValue: 'livekit-token',
   );
+  static const String giphyApiKey = String.fromEnvironment(
+    'GIPHY_API_KEY',
+    defaultValue: '',
+  );
   static const String webrtcIceServersJson = String.fromEnvironment(
     'WEBRTC_ICE_SERVERS_JSON',
     defaultValue: '',
