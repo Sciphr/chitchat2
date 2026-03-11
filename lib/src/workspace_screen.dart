@@ -12,7 +12,6 @@ import 'repositories.dart';
 import 'session_controller.dart';
 import 'server_settings_dialog.dart';
 import 'ui_sound_effects.dart';
-import 'update_service.dart';
 import 'user_settings_dialog.dart';
 
 class WorkspaceScreen extends StatefulWidget {
@@ -21,13 +20,11 @@ class WorkspaceScreen extends StatefulWidget {
     required this.authService,
     required this.workspaceRepository,
     required this.preferences,
-    required this.updateController,
   });
 
   final AuthService authService;
   final WorkspaceRepository workspaceRepository;
   final AppPreferences preferences;
-  final AppUpdateController updateController;
 
   @override
   State<WorkspaceScreen> createState() => _WorkspaceScreenState();
@@ -208,6 +205,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
 
     final client = Supabase.instance.client;
+    await client.realtime.setAuth(client.auth.currentSession?.accessToken);
     final completer = Completer<void>();
     final realtimeChannel = client.channel(
       _serverPresenceTopic(server.id),
@@ -310,7 +308,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     if (message.contains('unauthorized') ||
         message.contains('permission') ||
         message.contains('read from this channel')) {
-      return null;
+      return 'Member presence is blocked by Realtime authorization. Apply the latest Supabase migrations.';
     }
     return 'Member presence unavailable right now.';
   }
@@ -1309,52 +1307,6 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     setState(() {});
   }
 
-  Future<void> _handleUpdateButtonPressed() async {
-    final messenger = ScaffoldMessenger.of(context);
-    final updateController = widget.updateController;
-
-    UpdateActionResult result;
-    if (updateController.hasUpdate) {
-      result = await updateController.installUpdate();
-    } else {
-      result = await updateController.checkForUpdates();
-    }
-
-    if (!mounted) {
-      return;
-    }
-
-    switch (result) {
-      case UpdateActionResult.disabled:
-        messenger.showSnackBar(
-          const SnackBar(content: Text('Updates are not enabled for this build.')),
-        );
-      case UpdateActionResult.noUpdate:
-        if (updateController.errorMessage != null) {
-          messenger.showSnackBar(
-            SnackBar(content: Text(updateController.errorMessage!)),
-          );
-        } else {
-          messenger.showSnackBar(
-            const SnackBar(content: Text('You already have the latest version.')),
-          );
-        }
-      case UpdateActionResult.updateAvailable:
-        final latestVersion = updateController.latestVersion ?? 'a newer version';
-        messenger.showSnackBar(
-          SnackBar(content: Text('Update $latestVersion is available. Click update again to install.')),
-        );
-      case UpdateActionResult.installing:
-        messenger.showSnackBar(
-          const SnackBar(content: Text('Update check already in progress.')),
-        );
-      case UpdateActionResult.startedInstaller:
-        messenger.showSnackBar(
-          const SnackBar(content: Text('Installer launched. Follow the update prompt to continue.')),
-        );
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final selectedServer = _selectedServer;
@@ -1378,9 +1330,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
             onMoveChannel: _moveChannel,
             onOpenSettings: _openServerSettings,
             onOpenUserSettings: _openUserSettings,
-            onCheckForUpdates: _handleUpdateButtonPressed,
             onSignOut: widget.authService.signOut,
-            updateController: widget.updateController,
           )
         : AnimatedBuilder(
             animation: activeVoiceController,
@@ -1401,9 +1351,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               onMoveChannel: _moveChannel,
               onOpenSettings: _openServerSettings,
               onOpenUserSettings: _openUserSettings,
-              onCheckForUpdates: _handleUpdateButtonPressed,
               onSignOut: widget.authService.signOut,
-              updateController: widget.updateController,
             ),
           );
     final membersPanel = _ServerMembersPanel(
@@ -1664,78 +1612,39 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 class _SidebarAccountFooter extends StatelessWidget {
   const _SidebarAccountFooter({
     required this.onOpenUserSettings,
-    required this.onCheckForUpdates,
     required this.onSignOut,
-    required this.updateController,
   });
 
   final Future<void> Function() onOpenUserSettings;
-  final Future<void> Function() onCheckForUpdates;
   final Future<void> Function() onSignOut;
-  final AppUpdateController updateController;
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
-    return AnimatedBuilder(
-      animation: updateController,
-      builder: (context, _) {
-        final showBadge = updateController.hasUpdate;
-        return DecoratedBox(
-          decoration: BoxDecoration(
-            color: palette.panelStrong,
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: palette.border),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  onPressed: updateController.busy ? null : onCheckForUpdates,
-                  visualDensity: VisualDensity.compact,
-                  icon: updateController.busy
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : Stack(
-                          clipBehavior: Clip.none,
-                          children: [
-                            const Icon(Icons.system_update_alt),
-                            if (showBadge)
-                              Positioned(
-                                right: -2,
-                                top: -2,
-                                child: Container(
-                                  width: 8,
-                                  height: 8,
-                                  decoration: BoxDecoration(
-                                    color: Theme.of(context).colorScheme.secondary,
-                                    shape: BoxShape.circle,
-                                  ),
-                                ),
-                              ),
-                          ],
-                        ),
-                ),
-                IconButton(
-                  onPressed: onOpenUserSettings,
-                  icon: const Icon(Icons.account_circle_outlined),
-                  visualDensity: VisualDensity.compact,
-                ),
-                IconButton(
-                  onPressed: onSignOut,
-                  icon: const Icon(Icons.logout),
-                  visualDensity: VisualDensity.compact,
-                ),
-              ],
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: palette.panelStrong,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: palette.border),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              onPressed: onOpenUserSettings,
+              icon: const Icon(Icons.account_circle_outlined),
+              visualDensity: VisualDensity.compact,
             ),
-          ),
-        );
-      },
+            IconButton(
+              onPressed: onSignOut,
+              icon: const Icon(Icons.logout),
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -1990,9 +1899,7 @@ class _ChannelSidebar extends StatefulWidget {
     required this.onMoveChannel,
     required this.onOpenSettings,
     required this.onOpenUserSettings,
-    required this.onCheckForUpdates,
     required this.onSignOut,
-    required this.updateController,
   });
 
   final ServerSummary? server;
@@ -2016,9 +1923,7 @@ class _ChannelSidebar extends StatefulWidget {
   onMoveChannel;
   final Future<void> Function() onOpenSettings;
   final Future<void> Function() onOpenUserSettings;
-  final Future<void> Function() onCheckForUpdates;
   final Future<void> Function() onSignOut;
-  final AppUpdateController updateController;
 
   @override
   State<_ChannelSidebar> createState() => _ChannelSidebarState();
@@ -2256,9 +2161,7 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
               alignment: Alignment.centerRight,
               child: _SidebarAccountFooter(
                 onOpenUserSettings: widget.onOpenUserSettings,
-                onCheckForUpdates: widget.onCheckForUpdates,
                 onSignOut: widget.onSignOut,
-                updateController: widget.updateController,
               ),
             ),
           ],

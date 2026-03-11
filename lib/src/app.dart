@@ -132,13 +132,13 @@ class _ChatAppState extends State<ChatApp> {
             }
             return _DesktopWindowFrame(
               appVersion: _updateController.currentVersion,
+              updateController: _updateController,
               child: content,
             );
           },
           home: _AppShell(
             bootstrap: widget.bootstrap,
             preferences: _preferences,
-            updateController: _updateController,
           ),
         );
       },
@@ -147,15 +147,10 @@ class _ChatAppState extends State<ChatApp> {
 }
 
 class _AppShell extends StatelessWidget {
-  const _AppShell({
-    required this.bootstrap,
-    required this.preferences,
-    required this.updateController,
-  });
+  const _AppShell({required this.bootstrap, required this.preferences});
 
   final AppBootstrap bootstrap;
   final AppPreferences preferences;
-  final AppUpdateController updateController;
 
   @override
   Widget build(BuildContext context) {
@@ -184,7 +179,6 @@ class _AppShell extends StatelessWidget {
           authService: authService,
           workspaceRepository: workspaceRepository,
           preferences: preferences,
-          updateController: updateController,
         );
       },
     );
@@ -540,9 +534,14 @@ class _SignInScreenState extends State<SignInScreen> {
 }
 
 class _DesktopWindowFrame extends StatelessWidget {
-  const _DesktopWindowFrame({required this.child, this.appVersion});
+  const _DesktopWindowFrame({
+    required this.child,
+    required this.updateController,
+    this.appVersion,
+  });
 
   final Widget child;
+  final AppUpdateController updateController;
   final String? appVersion;
 
   @override
@@ -553,7 +552,10 @@ class _DesktopWindowFrame extends StatelessWidget {
       width: 1,
       child: Column(
         children: [
-          _DesktopTitleBar(appVersion: appVersion),
+          _DesktopTitleBar(
+            appVersion: appVersion,
+            updateController: updateController,
+          ),
           Expanded(child: child),
         ],
       ),
@@ -562,8 +564,9 @@ class _DesktopWindowFrame extends StatelessWidget {
 }
 
 class _DesktopTitleBar extends StatelessWidget {
-  const _DesktopTitleBar({this.appVersion});
+  const _DesktopTitleBar({required this.updateController, this.appVersion});
 
+  final AppUpdateController updateController;
   final String? appVersion;
 
   @override
@@ -605,10 +608,153 @@ class _DesktopTitleBar extends StatelessWidget {
                 ),
               ),
             ),
+            _DesktopUpdateButton(updateController: updateController),
             const _DesktopWindowButtons(),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _DesktopUpdateButton extends StatelessWidget {
+  const _DesktopUpdateButton({required this.updateController});
+
+  final AppUpdateController updateController;
+
+  Future<void> _handlePressed(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+
+    UpdateActionResult result;
+    if (updateController.hasUpdate) {
+      result = await updateController.installUpdate();
+    } else {
+      result = await updateController.checkForUpdates();
+    }
+
+    if (!context.mounted) {
+      return;
+    }
+
+    switch (result) {
+      case UpdateActionResult.disabled:
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text('Updates are not enabled for this build.'),
+          ),
+        );
+      case UpdateActionResult.noUpdate:
+        if (updateController.errorMessage != null) {
+          messenger.showSnackBar(
+            SnackBar(content: Text(updateController.errorMessage!)),
+          );
+        } else {
+          messenger.showSnackBar(
+            const SnackBar(
+              content: Text('You already have the latest version.'),
+            ),
+          );
+        }
+      case UpdateActionResult.updateAvailable:
+        final latestVersion =
+            updateController.latestVersion ?? 'a newer version';
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text(
+              'Update $latestVersion is available. Click update again to install.',
+            ),
+          ),
+        );
+      case UpdateActionResult.installing:
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Update check already in progress.')),
+        );
+      case UpdateActionResult.startedInstaller:
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Installer launched. Follow the update prompt to continue.',
+            ),
+          ),
+        );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!updateController.enabled) {
+      return const SizedBox.shrink();
+    }
+
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return AnimatedBuilder(
+      animation: updateController,
+      builder: (context, _) {
+        final tooltip = updateController.busy
+            ? updateController.installing
+                  ? 'Installing update'
+                  : 'Checking for updates'
+            : updateController.hasUpdate
+            ? 'Install update'
+            : 'Check for updates';
+
+        return Padding(
+          padding: const EdgeInsets.only(right: 2),
+          child: Semantics(
+            button: true,
+            enabled: !updateController.busy,
+            label: tooltip,
+            child: IconButton(
+              onPressed: updateController.busy
+                  ? null
+                  : () => _handlePressed(context),
+              visualDensity: VisualDensity.standard,
+              style: ButtonStyle(
+                minimumSize: const WidgetStatePropertyAll(Size(46, 46)),
+                maximumSize: const WidgetStatePropertyAll(Size(46, 46)),
+                padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+                shape: const WidgetStatePropertyAll(
+                  RoundedRectangleBorder(),
+                ),
+                backgroundColor: WidgetStateProperty.resolveWith((states) {
+                  if (states.contains(WidgetState.pressed)) {
+                    return palette.panelAccent;
+                  }
+                  if (states.contains(WidgetState.hovered)) {
+                    return palette.panelStrong;
+                  }
+                  return Colors.transparent;
+                }),
+              ),
+              icon: updateController.busy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        const Icon(Icons.sync, size: 18),
+                        if (updateController.hasUpdate)
+                          Positioned(
+                            right: -2,
+                            top: -2,
+                            child: Container(
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: Theme.of(context).colorScheme.secondary,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

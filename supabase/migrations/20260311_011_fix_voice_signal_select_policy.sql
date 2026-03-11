@@ -6,13 +6,13 @@ for select
 to authenticated
 using (
   realtime.messages.extension in ('broadcast', 'presence')
-  and public.voice_topic_kind(realtime.topic()) in ('presence', 'base', 'camera', 'screen')
+  and public.voice_topic_kind((select realtime.topic())) in ('presence', 'base', 'camera', 'screen')
   and public.has_channel_permission(
-    public.voice_channel_id_from_topic(realtime.topic()),
+    public.voice_channel_id_from_topic((select realtime.topic())),
     'view_channel'
   )
   and public.has_channel_permission(
-    public.voice_channel_id_from_topic(realtime.topic()),
+    public.voice_channel_id_from_topic((select realtime.topic())),
     'join_voice'
   )
 );

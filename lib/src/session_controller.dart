@@ -179,8 +179,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
   RealtimeChannel? _baseInboxChannel;
   RealtimeChannel? _cameraInboxChannel;
   RealtimeChannel? _screenInboxChannel;
-  RTCPeerConnection? _localSpeakingMonitorSender;
-  RTCPeerConnection? _localSpeakingMonitorReceiver;
   MediaStream? _microphoneStream;
   MediaStream? _videoSourceStream;
   MediaStream? _localCompositeStream;
@@ -270,7 +268,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
       );
 
       _microphoneStream = await microphoneFuture;
-      await _ensureLocalSpeakingMonitor();
       await _rebuildLocalCompositeStream();
       final subscribedChannels = await Future.wait<RealtimeChannel>([
         presenceChannelFuture,
@@ -349,7 +346,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
     _videoSourceStream = null;
     _localCompositeStream = null;
     _microphoneStream = null;
-    await _disposeLocalSpeakingMonitor();
     for (final stream in streamsToDispose.values) {
       await screenShareService.stopStream(stream);
     }
@@ -510,9 +506,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   Future<void> toggleDeafen() async {
     _deafened = !_deafened;
-    final volume = _deafened ? 0.0 : 1.0;
     for (final peer in _peerStates.values) {
-      await peer.renderer.setVolume(volume);
+      await _applyPeerRendererVolume(peer);
     }
     await soundEffects.play(
       _deafened ? UiSoundEffect.deafen : UiSoundEffect.undeafen,
@@ -529,7 +524,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     _participantVolumes[participantClientId] = normalized;
     final peer = _peerStates[participantClientId];
     if (peer != null) {
-      await peer.renderer.setVolume(_deafened ? 0.0 : normalized);
+      await _applyPeerRendererVolume(peer);
     }
     notifyListeners();
   }
@@ -539,6 +534,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     required _VoiceSignalScope? scope,
     required bool listenPresence,
   }) async {
+    await client.realtime.setAuth(client.auth.currentSession?.accessToken);
     final completer = Completer<void>();
     final realtimeChannel = client.channel(
       topic,
@@ -703,9 +699,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
     await renderer.initialize();
     final peer = VoiceRemotePeer(participant: participant, renderer: renderer);
     _peerStates[participant.clientId] = peer;
-    await renderer.setVolume(
-      _deafened ? 0.0 : participantVolume(participant.clientId),
-    );
     return peer;
   }
 
@@ -769,7 +762,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
         return;
       }
       unawaited(
-        _sendSignal(
+        _sendSignalSafely(
           _VoiceSignalEnvelope.iceCandidate(
             channelId: channel.id,
             sessionId: sessionId,
@@ -782,17 +775,13 @@ class VoiceChannelSessionController extends ChangeNotifier {
             scope: peer._signalScope,
             candidate: candidate,
           ),
+          context: 'ice candidate',
         ),
       );
     };
 
     connection.onTrack = (event) {
-      if (event.streams.isEmpty) {
-        return;
-      }
-      peer.remoteStream = event.streams.first;
-      peer.renderer.srcObject = event.streams.first;
-      notifyListeners();
+      unawaited(_attachRemoteTrack(peer, event));
     };
 
     connection.onConnectionState = (state) {
@@ -961,6 +950,43 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
   }
 
+  Future<void> _attachRemoteTrack(
+    VoiceRemotePeer peer,
+    RTCTrackEvent event,
+  ) async {
+    MediaStream? stream = event.streams.firstOrNull;
+    if (stream == null) {
+      final track = event.track;
+      stream =
+          peer.remoteStream ??
+          await createLocalMediaStream(
+            'remote-${channel.id}-${peer.participant.clientId}',
+          );
+      final alreadyAttached = stream.getTracks().any(
+        (existingTrack) => existingTrack.id == track.id,
+      );
+      if (!alreadyAttached) {
+        await stream.addTrack(track);
+      }
+    }
+
+    peer.remoteStream = stream;
+    if (!identical(peer.renderer.srcObject, stream)) {
+      peer.renderer.srcObject = stream;
+    }
+    await _applyPeerRendererVolume(peer);
+    notifyListeners();
+  }
+
+  Future<void> _applyPeerRendererVolume(VoiceRemotePeer peer) async {
+    if (peer.renderer.srcObject == null) {
+      return;
+    }
+    await peer.renderer.setVolume(
+      _deafened ? 0.0 : participantVolume(peer.participant.clientId),
+    );
+  }
+
   Future<void> _rebuildLocalCompositeStream() async {
     final previousComposite = _localCompositeStream;
     final microphoneStream = _microphoneStream;
@@ -1001,72 +1027,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
     if (previousComposite != null &&
         previousComposite.id != microphoneStream.id) {
       await previousComposite.dispose();
-    }
-  }
-
-  Future<void> _ensureLocalSpeakingMonitor() async {
-    final microphoneStream = _microphoneStream;
-    final track = microphoneStream?.getAudioTracks().firstOrNull;
-    if (track == null) {
-      await _disposeLocalSpeakingMonitor();
-      return;
-    }
-    if (_localSpeakingMonitorSender != null &&
-        _localSpeakingMonitorReceiver != null) {
-      return;
-    }
-
-    await _disposeLocalSpeakingMonitor();
-
-    final sender = await createPeerConnection(<String, dynamic>{});
-    final receiver = await createPeerConnection(<String, dynamic>{});
-    await receiver.addTransceiver(
-      kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
-      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
-    );
-
-    sender.onIceCandidate = (candidate) {
-      if (candidate.candidate == null) {
-        return;
-      }
-      unawaited(receiver.addCandidate(candidate));
-    };
-    receiver.onIceCandidate = (candidate) {
-      if (candidate.candidate == null) {
-        return;
-      }
-      unawaited(sender.addCandidate(candidate));
-    };
-
-    await sender.addTrack(track, microphoneStream!);
-    final offer = await sender.createOffer(<String, dynamic>{
-      'offerToReceiveAudio': 1,
-      'offerToReceiveVideo': 0,
-    });
-    await sender.setLocalDescription(offer);
-    await receiver.setRemoteDescription(offer);
-    final answer = await receiver.createAnswer(<String, dynamic>{
-      'offerToReceiveAudio': 1,
-      'offerToReceiveVideo': 0,
-    });
-    await receiver.setLocalDescription(answer);
-    await sender.setRemoteDescription(answer);
-
-    _localSpeakingMonitorSender = sender;
-    _localSpeakingMonitorReceiver = receiver;
-  }
-
-  Future<void> _disposeLocalSpeakingMonitor() async {
-    final connections = [
-      _localSpeakingMonitorSender,
-      _localSpeakingMonitorReceiver,
-    ].whereType<RTCPeerConnection>().toList();
-    _localSpeakingMonitorSender = null;
-    _localSpeakingMonitorReceiver = null;
-    _lastAudioSamples.remove(clientId);
-    for (final connection in connections) {
-      await connection.close();
-      await connection.dispose();
     }
   }
 
@@ -1129,9 +1089,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
 
     final now = DateTime.now();
-    final levelsByParticipant = <String, double?>{
-      clientId: await _readLocalAudioLevel(),
-    };
+    final levelsByParticipant = <String, double?>{clientId: null};
     for (final peer in _peerStates.values) {
       levelsByParticipant[peer.participant.clientId] =
           await _readRemoteAudioLevel(peer);
@@ -1188,38 +1146,6 @@ class VoiceChannelSessionController extends ChangeNotifier {
       );
     }
     notifyListeners();
-  }
-
-  Future<double?> _readLocalAudioLevel() async {
-    if (_muted) {
-      return 0;
-    }
-
-    final connection =
-        _localSpeakingMonitorReceiver ??
-        _peerStates.values
-            .map((peer) => peer.connection)
-            .whereType<RTCPeerConnection>()
-            .firstOrNull;
-    if (connection == null) {
-      return null;
-    }
-
-    try {
-      final receivers = await connection.getReceivers();
-      final audioReceiver = receivers
-          .where((receiver) => receiver.track?.kind == 'audio')
-          .firstOrNull;
-      if (audioReceiver == null) {
-        return null;
-      }
-      return _extractAudioLevel(
-        await audioReceiver.getStats(),
-        participantClientId: clientId,
-      );
-    } catch (_) {
-      return null;
-    }
   }
 
   Future<double?> _readRemoteAudioLevel(VoiceRemotePeer peer) async {
@@ -1345,22 +1271,56 @@ class VoiceChannelSessionController extends ChangeNotifier {
     return realtimeChannel;
   }
 
+  Future<void> _sendSignalSafely(
+    _VoiceSignalEnvelope envelope, {
+    required String context,
+  }) async {
+    try {
+      await _sendSignal(envelope);
+    } catch (error) {
+      if (_disposed || !_joined) {
+        return;
+      }
+      debugPrint('Ignoring voice signal failure during $context: $error');
+    }
+  }
+
   Future<void> _sendSignal(_VoiceSignalEnvelope envelope) async {
     final sendScope = envelope.type == _VoiceSignalType.offer
         ? envelope.scope
         : _VoiceSignalScope.base;
-    final realtimeChannel = await _ensureOutboundChannel(
-      sendScope,
-      envelope.targetUserId,
-    );
+    final topic = _signalTopic(sendScope, envelope.targetUserId);
 
-    final response = await realtimeChannel.sendBroadcastMessage(
-      event: 'webrtc-signal',
-      payload: envelope.toJson(),
-    );
+    Future<void> sendOnce() async {
+      final realtimeChannel = await _ensureOutboundChannel(
+        sendScope,
+        envelope.targetUserId,
+      );
+      final response = await realtimeChannel.sendBroadcastMessage(
+        event: 'webrtc-signal',
+        payload: envelope.toJson(),
+      );
+      if (response != ChannelResponse.ok) {
+        throw StateError('Broadcast send failed with response: $response');
+      }
+    }
 
-    if (response != ChannelResponse.ok) {
-      throw StateError('Broadcast send failed with response: $response');
+    try {
+      await sendOnce();
+    } on StateError catch (error) {
+      final message = error.toString().toLowerCase();
+      final recoverable =
+          message.contains('realtime channel closed') ||
+          message.contains('timed out') ||
+          message.contains('channel error');
+      if (!recoverable || _disposed || !_joined) {
+        rethrow;
+      }
+      final staleChannel = _outboundChannels.remove(topic);
+      if (staleChannel != null) {
+        await client.removeChannel(staleChannel);
+      }
+      await sendOnce();
     }
   }
 
