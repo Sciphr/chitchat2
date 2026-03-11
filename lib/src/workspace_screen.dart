@@ -173,6 +173,19 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               unawaited(_loadServerRoster(server));
             }
           },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'user_profiles',
+          callback: (payload) {
+            if (_selectedServer?.id != server.id) {
+              return;
+            }
+            if (_shouldRefreshRosterForProfileChange(payload)) {
+              unawaited(_loadServerRoster(server));
+            }
+          },
         );
 
     realtimeChannel.subscribe((status, [error]) {
@@ -711,9 +724,29 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       await _previewVoiceController?.refreshLocalParticipantProfile();
     }
     await _trackServerPresence();
+    final selectedServer = _selectedServer;
+    if (selectedServer != null) {
+      await _loadServerRoster(selectedServer);
+    }
     if (mounted) {
       setState(() {});
     }
+  }
+
+  bool _shouldRefreshRosterForProfileChange(Object payload) {
+    final dynamicPayload = payload as dynamic;
+    final newRecord = dynamicPayload.newRecord;
+    final oldRecord = dynamicPayload.oldRecord;
+    String? userId;
+    if (newRecord is Map && newRecord['id'] is String) {
+      userId = newRecord['id'] as String;
+    } else if (oldRecord is Map && oldRecord['id'] is String) {
+      userId = oldRecord['id'] as String;
+    }
+    if (userId == null || userId.isEmpty) {
+      return false;
+    }
+    return _serverMembers.any((member) => member.userId == userId);
   }
 
   Future<void> _loadServerRoster(ServerSummary server) async {

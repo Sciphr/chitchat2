@@ -141,6 +141,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
   bool _joined = false;
   bool _busy = false;
   bool _disposed = false;
+  bool _detachingRoom = false;
   bool _muted = false;
   bool _deafened = false;
   ShareKind _shareKind = ShareKind.audio;
@@ -167,6 +168,12 @@ class VoiceChannelSessionController extends ChangeNotifier {
     return peers;
   }
 
+  void _safeNotifyListeners() {
+    if (!_disposed) {
+      notifyListeners();
+    }
+  }
+
   Future<void> initialize() async {
     if (_initialized) {
       return;
@@ -181,13 +188,13 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
     if (AppBootstrap.liveKitUrl.trim().isEmpty) {
       _status = 'LiveKit URL is missing. Set LIVEKIT_URL in dart defines.';
-      notifyListeners();
+      _safeNotifyListeners();
       return;
     }
 
     _busy = true;
     _status = 'Joining voice channel...';
-    notifyListeners();
+    _safeNotifyListeners();
 
     try {
       await initialize();
@@ -224,7 +231,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _status = 'Unable to join voice channel: $error';
     } finally {
       _busy = false;
-      notifyListeners();
+      _safeNotifyListeners();
     }
   }
 
@@ -250,7 +257,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
         enabled: preferences.playSounds,
       );
     }
-    notifyListeners();
+    _safeNotifyListeners();
   }
 
   Future<void> startCameraShare() async {
@@ -260,7 +267,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     _busy = true;
     _status = 'Starting camera...';
-    notifyListeners();
+    _safeNotifyListeners();
 
     try {
       final room = _room;
@@ -282,7 +289,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _status = 'Unable to start camera: $error';
     } finally {
       _busy = false;
-      notifyListeners();
+      _safeNotifyListeners();
     }
   }
 
@@ -299,7 +306,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     _busy = true;
     _status = 'Starting screen share...';
-    notifyListeners();
+    _safeNotifyListeners();
 
     try {
       final room = _room;
@@ -329,7 +336,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _status = 'Unable to start screen share: $error';
     } finally {
       _busy = false;
-      notifyListeners();
+      _safeNotifyListeners();
     }
   }
 
@@ -340,7 +347,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     _busy = true;
     _status = 'Stopping visual share...';
-    notifyListeners();
+    _safeNotifyListeners();
 
     try {
       final localParticipant = _room?.localParticipant;
@@ -356,7 +363,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _status = 'Voice-only mode active.';
     } finally {
       _busy = false;
-      notifyListeners();
+      _safeNotifyListeners();
     }
   }
 
@@ -396,7 +403,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     final nextMuted = !_muted;
     _muted = nextMuted;
-    notifyListeners();
+    _safeNotifyListeners();
 
     try {
       await localParticipant.setMicrophoneEnabled(
@@ -428,7 +435,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _deafened ? UiSoundEffect.deafen : UiSoundEffect.undeafen,
       enabled: preferences.playSounds,
     );
-    notifyListeners();
+    _safeNotifyListeners();
   }
 
   Future<void> setParticipantVolume(
@@ -441,16 +448,17 @@ class VoiceChannelSessionController extends ChangeNotifier {
     if (peer != null) {
       await _applyPeerRendererVolume(peer);
     }
-    notifyListeners();
+    _safeNotifyListeners();
   }
 
   Future<void> close() async {
     if (_disposed) {
       return;
     }
-    _disposed = true;
     await leave();
+    _disposed = true;
     await localRenderer.dispose();
+    super.dispose();
   }
 
   Future<void> refreshLocalParticipantProfile() async {
@@ -461,7 +469,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       await _trackPresence();
       await _syncRoomState();
     } else {
-      notifyListeners();
+      _safeNotifyListeners();
     }
   }
 
@@ -562,24 +570,36 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   Future<void> _attachRoom(lk.Room room) async {
     _roomChangeHandler = () {
+      if (_disposed || _detachingRoom) {
+        return;
+      }
       unawaited(_syncRoomState());
     };
     room.addListener(_roomChangeHandler!);
     _roomListener = room.createListener()
       ..on<lk.RoomConnectedEvent>((_) {
+        if (_disposed || _detachingRoom) {
+          return;
+        }
         _status = 'Connected to voice channel.';
         unawaited(_syncRoomState());
       })
       ..on<lk.RoomReconnectingEvent>((_) {
+        if (_disposed || _detachingRoom) {
+          return;
+        }
         _status = 'Reconnecting voice channel...';
-        notifyListeners();
+        _safeNotifyListeners();
       })
       ..on<lk.RoomReconnectedEvent>((_) {
+        if (_disposed || _detachingRoom) {
+          return;
+        }
         _status = 'Voice channel reconnected.';
         unawaited(_syncRoomState());
       })
       ..on<lk.RoomDisconnectedEvent>((event) {
-        if (_disposed) {
+        if (_disposed || _detachingRoom) {
           return;
         }
         _status = event.reason == null
@@ -617,24 +637,31 @@ class VoiceChannelSessionController extends ChangeNotifier {
     _room = null;
     _roomListener = null;
     _roomChangeHandler = null;
+    _detachingRoom = true;
 
     if (room != null && roomChangeHandler != null) {
       room.removeListener(roomChangeHandler);
     }
-    await roomListener?.dispose();
     if (room != null) {
       await room.disconnect();
+    }
+    await roomListener?.dispose();
+    if (room != null) {
       await room.dispose();
     }
+    _detachingRoom = false;
   }
 
   Future<void> _syncRoomState() async {
+    if (_disposed || _detachingRoom) {
+      return;
+    }
     final room = _room;
     if (room == null) {
       _participants = const <VoiceParticipant>[];
       await _disposeRemotePeers();
       localRenderer.srcObject = null;
-      notifyListeners();
+      _safeNotifyListeners();
       return;
     }
 
@@ -688,7 +715,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       ),
     );
     _participants = nextParticipants;
-    notifyListeners();
+    _safeNotifyListeners();
   }
 
   Future<void> _syncLocalPreview() async {

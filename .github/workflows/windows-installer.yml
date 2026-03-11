@@ -37,14 +37,18 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_TOKEN_FUNCTION_NAME: ${{ vars.LIVEKIT_TOKEN_FUNCTION_NAME }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SUPABASE_URL) -or [string]::IsNullOrWhiteSpace($env:SUPABASE_ANON_KEY)) {
-            throw "Missing GitHub secrets: SUPABASE_URL and/or SUPABASE_ANON_KEY."
+          if ([string]::IsNullOrWhiteSpace($env:SUPABASE_URL) -or [string]::IsNullOrWhiteSpace($env:SUPABASE_ANON_KEY) -or [string]::IsNullOrWhiteSpace($env:LIVEKIT_URL)) {
+            throw "Missing GitHub secrets: SUPABASE_URL, SUPABASE_ANON_KEY, and/or LIVEKIT_URL."
           }
 
           $defines = @{
             SUPABASE_URL = $env:SUPABASE_URL
             SUPABASE_ANON_KEY = $env:SUPABASE_ANON_KEY
+            LIVEKIT_URL = $env:LIVEKIT_URL
+            LIVEKIT_TOKEN_FUNCTION_NAME = if ([string]::IsNullOrWhiteSpace($env:LIVEKIT_TOKEN_FUNCTION_NAME)) { "livekit-token" } else { $env:LIVEKIT_TOKEN_FUNCTION_NAME }
           } | ConvertTo-Json
 
           Set-Content -Path config/dart_defines.ci.json -Value $defines -Encoding utf8
