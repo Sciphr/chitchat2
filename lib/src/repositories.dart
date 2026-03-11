@@ -697,7 +697,12 @@ class WorkspaceRepository {
         .stream(primaryKey: ['id'])
         .eq('channel_id', channelId)
         .order('created_at', ascending: true)
-        .map((rows) => rows.map((row) => ChannelMessage.fromMap(row)).toList());
+        .map(
+          (rows) => rows
+              .map((row) => ChannelMessage.fromMap(row))
+              .where((message) => !message.deleted)
+              .toList(),
+        );
   }
 
   Future<void> sendChannelMessage({

@@ -246,8 +246,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
     _presenceParticipants = const <VoiceParticipant>[];
     _status = 'Disconnected from voice channel.';
 
-    await _detachRoom();
     await _closePresenceChannel();
+    await _detachRoom();
     await _disposeRemotePeers();
 
     localRenderer.srcObject = null;
@@ -551,7 +551,16 @@ class VoiceChannelSessionController extends ChangeNotifier {
   String _presenceTopic() => 'voice:presence:${channel.id}';
 
   Future<void> _trackPresence() async {
-    await _presenceChannel?.track({
+    final presenceChannel = _presenceChannel;
+    if (presenceChannel == null) {
+      return;
+    }
+    try {
+      await presenceChannel.untrack();
+    } on Object {
+      // Replacing presence should not fail if nothing is currently tracked.
+    }
+    await presenceChannel.track({
       'user_id': authService.userId,
       'display_name': authService.displayName,
       'muted': _muted,
@@ -666,11 +675,17 @@ class VoiceChannelSessionController extends ChangeNotifier {
       ..on<lk.ParticipantEvent>((_) {
         unawaited(_syncRoomState());
       })
+      ..on<lk.ParticipantDisconnectedEvent>((event) {
+        unawaited(_handleParticipantDisconnected(event.participant));
+      })
       ..on<lk.TrackSubscribedEvent>((_) {
         unawaited(_syncRoomState());
       })
-      ..on<lk.TrackUnsubscribedEvent>((_) {
-        unawaited(_syncRoomState());
+      ..on<lk.TrackUnsubscribedEvent>((event) {
+        unawaited(_handleTrackRemoved(event.participant, event.publication));
+      })
+      ..on<lk.TrackUnpublishedEvent>((event) {
+        unawaited(_handleTrackRemoved(event.participant, event.publication));
       })
       ..on<lk.TrackMutedEvent>((_) {
         unawaited(_syncRoomState());
@@ -860,16 +875,14 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   ShareKind _shareKindForParticipant(lk.Participant participant) {
     final hasScreen =
-        participant.getTrackPublicationBySource(lk.TrackSource.screenShareVideo)
-            ?.track !=
+        _activeVisualPublication(participant, lk.TrackSource.screenShareVideo) !=
         null;
     if (hasScreen) {
       return ShareKind.screen;
     }
 
     final hasCamera =
-        participant.getTrackPublicationBySource(lk.TrackSource.camera)?.track !=
-        null;
+        _activeVisualPublication(participant, lk.TrackSource.camera) != null;
     if (hasCamera) {
       return ShareKind.camera;
     }
@@ -892,15 +905,56 @@ class VoiceChannelSessionController extends ChangeNotifier {
     if (participant == null) {
       return null;
     }
-    return participant
-            .getTrackPublicationBySource(lk.TrackSource.screenShareVideo)
-            ?.track ??
-        participant.getTrackPublicationBySource(lk.TrackSource.camera)?.track;
+    return _activeVisualPublication(
+          participant,
+          lk.TrackSource.screenShareVideo,
+        )?.track ??
+        _activeVisualPublication(participant, lk.TrackSource.camera)?.track;
   }
 
   lk.LocalVideoTrack? _preferredVideoTrack(lk.LocalParticipant? participant) {
     final track = _preferredVisualTrack(participant);
     return track is lk.LocalVideoTrack ? track : null;
+  }
+
+  lk.TrackPublication<lk.Track>? _activeVisualPublication(
+    lk.Participant participant,
+    lk.TrackSource source,
+  ) {
+    final publication = participant.getTrackPublicationBySource(source);
+    if (publication == null || publication.track == null || publication.muted) {
+      return null;
+    }
+    return publication;
+  }
+
+  Future<void> _handleParticipantDisconnected(
+    lk.RemoteParticipant participant,
+  ) async {
+    final peer = _peerStates.remove(
+      participant.sid.isNotEmpty ? participant.sid : participant.identity,
+    );
+    if (peer != null) {
+      await _disposePeer(peer);
+    }
+    await _syncRoomState();
+  }
+
+  Future<void> _handleTrackRemoved(
+    lk.RemoteParticipant participant,
+    lk.TrackPublication<lk.Track> publication,
+  ) async {
+    if (publication.source == lk.TrackSource.camera ||
+        publication.source == lk.TrackSource.screenShareVideo) {
+      final peer = _peerStates[
+          participant.sid.isNotEmpty ? participant.sid : participant.identity];
+      if (peer != null) {
+        peer.remoteStream = null;
+        peer.hasVisual = false;
+        peer.renderer.srcObject = null;
+      }
+    }
+    await _syncRoomState();
   }
 
   Map<String, dynamic>? _decodeParticipantMetadata(String? metadata) {
