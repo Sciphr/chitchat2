@@ -1338,36 +1338,20 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   }
 
   Future<void> _promptCreateServer() async {
-    final controller = TextEditingController();
-    final result = await showDialog<String>(
+    final result = await showDialog<_CreateServerDialogResult>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Create server'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(labelText: 'Server name'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(controller.text),
-            child: const Text('Create'),
-          ),
-        ],
-      ),
+      builder: (context) => const _CreateServerDialog(),
     );
-    controller.dispose();
-
-    if (result == null || result.trim().isEmpty) {
+    if (result == null || result.name.trim().isEmpty) {
       return;
     }
 
     try {
-      final server = await widget.workspaceRepository.createServer(result);
+      final server = await widget.workspaceRepository.createServer(
+        result.name,
+        description: result.description,
+        isPublic: result.isPublic,
+      );
       await _loadServers();
       await _selectServer(server);
     } catch (error) {
@@ -1389,6 +1373,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         content: TextField(
           controller: controller,
           autofocus: true,
+          textInputAction: TextInputAction.done,
+          onSubmitted: (_) => Navigator.of(context).pop(controller.text),
           decoration: const InputDecoration(labelText: 'Invite code'),
         ),
         actions: [
@@ -1422,6 +1408,33 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
+  Future<void> _openServerDiscovery() async {
+    final serverId = await showDialog<String>(
+      context: context,
+      builder: (context) => _ServerDiscoveryDialog(
+        repository: widget.workspaceRepository,
+        avatarUrlForPath: widget.workspaceRepository.publicServerAvatarUrl,
+      ),
+    );
+    if (serverId == null || !mounted) {
+      return;
+    }
+    await _loadServers();
+    if (!mounted) {
+      return;
+    }
+    ServerSummary? targetServer;
+    for (final server in _servers) {
+      if (server.id == serverId) {
+        targetServer = server;
+        break;
+      }
+    }
+    if (targetServer != null) {
+      await _selectServer(targetServer);
     }
   }
 
@@ -1868,9 +1881,25 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         shouldRefresh != true) {
       return;
     }
-    await _loadServerAccess(selectedServer);
-    await _loadChannels(selectedServer.id);
-    await _loadServerRoster(selectedServer);
+    await _loadServers();
+    if (!mounted) {
+      return;
+    }
+    ServerSummary? refreshedServer = selectedServer;
+    for (final server in _servers) {
+      if (server.id == selectedServer.id) {
+        refreshedServer = server;
+        break;
+      }
+    }
+    if (refreshedServer != null) {
+      setState(() {
+        _selectedServer = refreshedServer;
+      });
+    }
+    await _loadServerAccess(refreshedServer ?? selectedServer);
+    await _loadChannels((refreshedServer ?? selectedServer).id);
+    await _loadServerRoster(refreshedServer ?? selectedServer);
   }
 
   Future<void> _openUserSettings() async {
@@ -1959,8 +1988,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               .map((participant) => participant.userId)
               .toSet();
           for (final liveParticipant in activePresenceParticipants) {
-            if (liveParticipant.isSelf &&
-                !mergedUserIds.contains(liveParticipant.userId)) {
+            if (!mergedUserIds.contains(liveParticipant.userId)) {
               mergedParticipants.add(liveParticipant);
             }
           }
@@ -2158,6 +2186,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                         onSelectDirectMessages: _openDirectMessagesHome,
                         onCreateServer: _promptCreateServer,
                         onJoinServer: _promptJoinServer,
+                        onDiscoverServers: _openServerDiscovery,
                         onRefresh: _loadServers,
                         currentUserId: widget.authService.userId,
                         onLeaveServer: _leaveServer,
@@ -2766,6 +2795,7 @@ class _ServerRail extends StatelessWidget {
     required this.onSelectDirectMessages,
     required this.onCreateServer,
     required this.onJoinServer,
+    required this.onDiscoverServers,
     required this.onRefresh,
     required this.currentUserId,
     required this.onLeaveServer,
@@ -2783,6 +2813,7 @@ class _ServerRail extends StatelessWidget {
   final Future<void> Function({String? conversationId}) onSelectDirectMessages;
   final Future<void> Function() onCreateServer;
   final Future<void> Function() onJoinServer;
+  final Future<void> Function() onDiscoverServers;
   final Future<void> Function({bool selectFirstServer}) onRefresh;
   final String currentUserId;
   final Future<void> Function(ServerSummary server) onLeaveServer;
@@ -2836,6 +2867,10 @@ class _ServerRail extends StatelessWidget {
           IconButton(
             onPressed: onJoinServer,
             icon: const Icon(Icons.group_add),
+          ),
+          IconButton(
+            onPressed: onDiscoverServers,
+            icon: const Icon(Icons.travel_explore_outlined),
           ),
           IconButton(
             onPressed: () => onRefresh(selectFirstServer: false),
@@ -6925,6 +6960,377 @@ class _ScreenShareSelection {
   final DesktopCapturerSource source;
   final _ScreenShareQualityPreset preset;
   final bool captureSystemAudio;
+}
+
+class _CreateServerDialogResult {
+  const _CreateServerDialogResult({
+    required this.name,
+    required this.description,
+    required this.isPublic,
+  });
+
+  final String name;
+  final String description;
+  final bool isPublic;
+}
+
+class _CreateServerDialog extends StatefulWidget {
+  const _CreateServerDialog();
+
+  @override
+  State<_CreateServerDialog> createState() => _CreateServerDialogState();
+}
+
+class _CreateServerDialogState extends State<_CreateServerDialog> {
+  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _descriptionController = TextEditingController();
+  bool _isPublic = false;
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _descriptionController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.of(context).pop(
+      _CreateServerDialogResult(
+        name: _nameController.text,
+        description: _descriptionController.text,
+        isPublic: _isPublic,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Create server'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _nameController,
+              autofocus: true,
+              textInputAction: TextInputAction.next,
+              decoration: const InputDecoration(labelText: 'Server name'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _descriptionController,
+              minLines: 2,
+              maxLines: 3,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _submit(),
+              decoration: const InputDecoration(
+                labelText: 'Description',
+                hintText: 'What is this server for?',
+              ),
+            ),
+            const SizedBox(height: 12),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: _isPublic,
+              title: const Text('Public server'),
+              subtitle: Text(
+                _isPublic
+                    ? 'People can join immediately from discovery.'
+                    : 'People can discover it, but must request to join.',
+              ),
+              onChanged: (value) {
+                setState(() {
+                  _isPublic = value;
+                });
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _submit,
+          child: const Text('Create'),
+        ),
+      ],
+    );
+  }
+}
+
+class _ServerDiscoveryDialog extends StatefulWidget {
+  const _ServerDiscoveryDialog({
+    required this.repository,
+    required this.avatarUrlForPath,
+  });
+
+  final WorkspaceRepository repository;
+  final String? Function(String? avatarPath) avatarUrlForPath;
+
+  @override
+  State<_ServerDiscoveryDialog> createState() => _ServerDiscoveryDialogState();
+}
+
+class _ServerDiscoveryDialogState extends State<_ServerDiscoveryDialog> {
+  final TextEditingController _searchController = TextEditingController();
+  Timer? _debounce;
+  bool _loading = true;
+  String? _error;
+  List<DiscoverableServerSummary> _results =
+      const <DiscoverableServerSummary>[];
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadResults());
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadResults() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final results = await widget.repository.searchJoinableServers(
+        query: _searchController.text,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _results = results;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = error.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _handleServerAction(DiscoverableServerSummary server) async {
+    try {
+      if (server.isMember) {
+        Navigator.of(context).pop(server.id);
+        return;
+      }
+      if (server.isPublic) {
+        await widget.repository.joinPublicServer(server.id);
+        if (!mounted) {
+          return;
+        }
+        Navigator.of(context).pop(server.id);
+        return;
+      }
+      await widget.repository.requestServerJoin(server.id);
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Join request sent to ${server.name}.')),
+      );
+      await _loadResults();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return Dialog(
+      insetPadding: const EdgeInsets.all(40),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 760, maxHeight: 720),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Discover servers',
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Search servers by name or description. Public servers can be joined immediately; private servers require approval.',
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              TextField(
+                controller: _searchController,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'Search servers',
+                  prefixIcon: Icon(Icons.search),
+                ),
+                onChanged: (_) {
+                  _debounce?.cancel();
+                  _debounce = Timer(
+                    const Duration(milliseconds: 250),
+                    () => unawaited(_loadResults()),
+                  );
+                },
+                onSubmitted: (_) => unawaited(_loadResults()),
+              ),
+              const SizedBox(height: 18),
+              Expanded(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: palette.panelMuted,
+                    borderRadius: BorderRadius.circular(22),
+                    border: Border.all(color: palette.border),
+                  ),
+                  child: _loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : _error != null
+                      ? Center(child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Text(_error!, textAlign: TextAlign.center),
+                        ))
+                      : _results.isEmpty
+                      ? const Center(
+                          child: Text('No servers matched your search.'),
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.all(16),
+                          itemCount: _results.length,
+                          separatorBuilder: (context, index) =>
+                              const SizedBox(height: 12),
+                          itemBuilder: (context, index) {
+                            final server = _results[index];
+                            final actionLabel = server.isMember
+                                ? 'Open'
+                                : server.isPublic
+                                ? 'Join'
+                                : server.hasPendingRequest
+                                ? 'Requested'
+                                : 'Request';
+                            final canAct =
+                                server.isMember || !server.hasPendingRequest;
+                            return Container(
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: palette.panelStrong,
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: palette.border),
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(16),
+                                    child: SizedBox(
+                                      width: 60,
+                                      height: 60,
+                                      child: _ServerAvatar(
+                                        name: server.name,
+                                        avatarUrl: widget.avatarUrlForPath(
+                                          server.avatarPath,
+                                        ),
+                                        selected: false,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 14),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Wrap(
+                                          spacing: 8,
+                                          runSpacing: 8,
+                                          crossAxisAlignment:
+                                              WrapCrossAlignment.center,
+                                          children: [
+                                            Text(
+                                              server.name,
+                                              style: const TextStyle(
+                                                fontSize: 18,
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                            ),
+                                            Chip(
+                                              label: Text(
+                                                server.isPublic
+                                                    ? 'Public'
+                                                    : 'Private',
+                                              ),
+                                            ),
+                                            Chip(
+                                              label: Text(
+                                                '${server.memberCount} member${server.memberCount == 1 ? '' : 's'}',
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        if (server.description.trim().isNotEmpty)
+                                          Padding(
+                                            padding: const EdgeInsets.only(
+                                              top: 8,
+                                            ),
+                                            child: Text(server.description),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  FilledButton.tonal(
+                                    onPressed: canAct
+                                        ? () => _handleServerAction(server)
+                                        : null,
+                                    child: Text(actionLabel),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _FullscreenVoiceCallPage extends StatelessWidget {

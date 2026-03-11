@@ -44,6 +44,8 @@ class ServerSummary {
     required this.name,
     required this.ownerId,
     required this.inviteCode,
+    required this.description,
+    required this.isPublic,
     required this.avatarPath,
     required this.createdAt,
   });
@@ -52,6 +54,8 @@ class ServerSummary {
   final String name;
   final String ownerId;
   final String inviteCode;
+  final String description;
+  final bool isPublic;
   final String? avatarPath;
   final DateTime createdAt;
 
@@ -61,7 +65,73 @@ class ServerSummary {
       name: map['name'] as String,
       ownerId: map['owner_id'] as String,
       inviteCode: map['invite_code'] as String,
+      description: map['description'] as String? ?? '',
+      isPublic: map['is_public'] as bool? ?? false,
       avatarPath: map['avatar_path'] as String?,
+      createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
+    );
+  }
+}
+
+class DiscoverableServerSummary {
+  const DiscoverableServerSummary({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.avatarPath,
+    required this.isPublic,
+    required this.memberCount,
+    required this.isMember,
+    required this.hasPendingRequest,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final String? avatarPath;
+  final bool isPublic;
+  final int memberCount;
+  final bool isMember;
+  final bool hasPendingRequest;
+  final DateTime createdAt;
+
+  factory DiscoverableServerSummary.fromMap(Map<String, dynamic> map) {
+    return DiscoverableServerSummary(
+      id: map['id'] as String,
+      name: map['name'] as String,
+      description: map['description'] as String? ?? '',
+      avatarPath: map['avatar_path'] as String?,
+      isPublic: map['is_public'] as bool? ?? false,
+      memberCount: map['member_count'] as int? ?? 0,
+      isMember: map['is_member'] as bool? ?? false,
+      hasPendingRequest: map['has_pending_request'] as bool? ?? false,
+      createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
+    );
+  }
+}
+
+class ServerJoinRequestSummary {
+  const ServerJoinRequestSummary({
+    required this.id,
+    required this.serverId,
+    required this.userId,
+    required this.displayName,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String serverId;
+  final String userId;
+  final String displayName;
+  final DateTime createdAt;
+
+  factory ServerJoinRequestSummary.fromMap(Map<String, dynamic> map) {
+    return ServerJoinRequestSummary(
+      id: map['id'] as String,
+      serverId: map['server_id'] as String,
+      userId: map['user_id'] as String,
+      displayName: map['display_name'] as String? ?? 'Unknown',
       createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
     );
   }

@@ -32,14 +32,18 @@ class ServerSettingsDialog extends StatefulWidget {
 }
 
 class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
+  late ServerSummary _server = widget.server;
   bool _loading = true;
   bool _loadingOverrides = false;
+  bool _loadingJoinRequests = false;
   bool _saving = false;
   bool _refreshWorkspaceOnClose = false;
   String? _error;
   List<ChannelSummary> _channels = const <ChannelSummary>[];
   List<ServerRole> _roles = const <ServerRole>[];
   List<ServerMember> _members = const <ServerMember>[];
+  List<ServerJoinRequestSummary> _joinRequests =
+      const <ServerJoinRequestSummary>[];
   List<ChannelPermissionOverride> _channelOverrides =
       const <ChannelPermissionOverride>[];
   String? _selectedOverrideChannelId;
@@ -50,6 +54,12 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       widget.access.hasPermission(ServerPermission.manageChannels);
   bool get _canInviteMembers =>
       widget.access.hasPermission(ServerPermission.inviteMembers);
+  bool get _canManageServer =>
+      widget.access.hasPermission(ServerPermission.manageServer);
+  bool get _canReviewJoinRequests =>
+      widget.access.isOwner ||
+      _canInviteMembers ||
+      _canManageServer;
   bool get _canEditServerPicture => widget.access.isOwner;
 
   ChannelSummary? get _selectedOverrideChannel {
@@ -79,9 +89,9 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
 
     try {
       final results = await Future.wait<dynamic>([
-        widget.repository.fetchChannels(widget.server.id),
-        widget.repository.fetchServerRoles(widget.server.id),
-        widget.repository.fetchServerMembers(widget.server.id),
+        widget.repository.fetchChannels(_server.id),
+        widget.repository.fetchServerRoles(_server.id),
+        widget.repository.fetchServerMembers(_server.id),
       ]);
       if (!mounted) {
         return;
@@ -97,6 +107,9 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         _loading = false;
       });
       await _loadChannelOverrides();
+      if (_canReviewJoinRequests) {
+        await _loadJoinRequests();
+      }
     } catch (error) {
       if (!mounted) {
         return;
@@ -104,6 +117,30 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       setState(() {
         _error = error.toString();
         _loading = false;
+      });
+    }
+  }
+
+  Future<void> _loadJoinRequests() async {
+    setState(() {
+      _loadingJoinRequests = true;
+    });
+    try {
+      final requests = await widget.repository.fetchServerJoinRequests(_server.id);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _joinRequests = requests;
+        _loadingJoinRequests = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = error.toString();
+        _loadingJoinRequests = false;
       });
     }
   }
@@ -394,6 +431,87 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
     await _load();
   }
 
+  Future<void> _updateDiscoverySettings({
+    required bool isPublic,
+    required String description,
+  }) async {
+    setState(() {
+      _saving = true;
+    });
+    try {
+      final updatedServer = await widget.repository.updateServerDiscoverySettings(
+        serverId: _server.id,
+        isPublic: isPublic,
+        description: description,
+      );
+      _refreshWorkspaceOnClose = true;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _server = updatedServer;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Server visibility updated.')),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _reviewJoinRequest(
+    ServerJoinRequestSummary request, {
+    required bool approve,
+  }) async {
+    setState(() {
+      _saving = true;
+    });
+    try {
+      await widget.repository.decideServerJoinRequest(
+        requestId: request.id,
+        approve: approve,
+      );
+      _refreshWorkspaceOnClose = true;
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            approve
+                ? 'Approved ${request.displayName}.'
+                : 'Declined ${request.displayName}.',
+          ),
+        ),
+      );
+      await _loadJoinRequests();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Dialog(
@@ -412,7 +530,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          '${widget.server.name} settings',
+                          '${_server.name} settings',
                           style: Theme.of(context).textTheme.headlineSmall,
                         ),
                         const SizedBox(height: 6),
@@ -423,7 +541,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                             ActionChip(
                               onPressed: () => _runGeneralAction(widget.onCopyInvite),
                               avatar: const Icon(Icons.content_copy, size: 18),
-                              label: Text('Invite ${widget.server.inviteCode}'),
+                              label: Text('Invite ${_server.inviteCode}'),
                             ),
                             if (widget.access.isOwner)
                               const Chip(label: Text('Owner')),
@@ -450,15 +568,17 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                 child: _loading
                     ? const Center(child: CircularProgressIndicator())
                     : DefaultTabController(
-                        length: 4,
+                        length: _canReviewJoinRequests ? 5 : 4,
                         child: Column(
                           children: [
-                            const TabBar(
+                            TabBar(
                               tabs: [
-                                Tab(text: 'General'),
-                                Tab(text: 'Roles'),
-                                Tab(text: 'Members'),
-                                Tab(text: 'Channel Access'),
+                                const Tab(text: 'General'),
+                                const Tab(text: 'Roles'),
+                                const Tab(text: 'Members'),
+                                const Tab(text: 'Channel Access'),
+                                if (_canReviewJoinRequests)
+                                  const Tab(text: 'Join Requests'),
                               ],
                             ),
                             const SizedBox(height: 18),
@@ -466,9 +586,10 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                               child: TabBarView(
                                 children: [
                                   _GeneralTab(
-                                    server: widget.server,
+                                    server: _server,
                                     canInviteMembers: _canInviteMembers,
                                     canManageChannels: _canManageChannels,
+                                    canManageServer: _canManageServer,
                                     canEditServerPicture: _canEditServerPicture,
                                     onCopyInvite: () =>
                                         _runGeneralAction(widget.onCopyInvite),
@@ -481,6 +602,8 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                     onPickServerAvatar: () => _runGeneralAction(
                                       widget.onPickServerAvatar,
                                     ),
+                                    onUpdateDiscoverySettings:
+                                        _updateDiscoverySettings,
                                   ),
                                   _RolesTab(
                                     roles: _roles,
@@ -490,7 +613,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                     onEditRole: _editRole,
                                   ),
                                   _MembersTab(
-                                    server: widget.server,
+                                    server: _server,
                                     roles: _roles,
                                     members: _members,
                                     canManageRoles: _canManageRoles,
@@ -512,6 +635,19 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                     },
                                     onEditOverride: _editChannelOverride,
                                   ),
+                                  if (_canReviewJoinRequests)
+                                    _JoinRequestsTab(
+                                      loading: _loadingJoinRequests,
+                                      requests: _joinRequests,
+                                      onApprove: (request) => _reviewJoinRequest(
+                                        request,
+                                        approve: true,
+                                      ),
+                                      onReject: (request) => _reviewJoinRequest(
+                                        request,
+                                        approve: false,
+                                      ),
+                                    ),
                                 ],
                               ),
                             ),
@@ -532,21 +668,29 @@ class _GeneralTab extends StatelessWidget {
     required this.server,
     required this.canInviteMembers,
     required this.canManageChannels,
+    required this.canManageServer,
     required this.canEditServerPicture,
     required this.onCopyInvite,
     required this.onCreateChannel,
     required this.onCreateCategory,
     required this.onPickServerAvatar,
+    required this.onUpdateDiscoverySettings,
   });
 
   final ServerSummary server;
   final bool canInviteMembers;
   final bool canManageChannels;
+  final bool canManageServer;
   final bool canEditServerPicture;
   final Future<void> Function() onCopyInvite;
   final Future<void> Function() onCreateChannel;
   final Future<void> Function() onCreateCategory;
   final Future<void> Function() onPickServerAvatar;
+  final Future<void> Function({
+    required bool isPublic,
+    required String description,
+  })
+  onUpdateDiscoverySettings;
 
   @override
   Widget build(BuildContext context) {
@@ -578,11 +722,19 @@ class _GeneralTab extends StatelessWidget {
               const SizedBox(height: 10),
               Text('Name: ${server.name}'),
               const SizedBox(height: 6),
+              Text(
+                'Visibility: ${server.isPublic ? 'Public' : 'Private'}',
+              ),
+              const SizedBox(height: 6),
               OutlinedButton.icon(
                 onPressed: onCopyInvite,
                 icon: const Icon(Icons.content_copy, size: 18),
                 label: Text('Invite code: ${server.inviteCode}'),
               ),
+              if (server.description.trim().isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text('Description: ${server.description}'),
+              ],
               const SizedBox(height: 6),
               Text('Created: ${_formatServerDate(server.createdAt)}'),
               const SizedBox(height: 6),
@@ -612,6 +764,27 @@ class _GeneralTab extends StatelessWidget {
                 onPressed: onCopyInvite,
                 icon: const Icon(Icons.link),
                 label: const Text('Copy invite'),
+              ),
+            if (canManageServer)
+              FilledButton.tonalIcon(
+                onPressed: () async {
+                  final result = await showDialog<_ServerDiscoverySettingsResult>(
+                    context: context,
+                    builder: (context) => _ServerDiscoverySettingsDialog(
+                      initialIsPublic: server.isPublic,
+                      initialDescription: server.description,
+                    ),
+                  );
+                  if (result == null) {
+                    return;
+                  }
+                  await onUpdateDiscoverySettings(
+                    isPublic: result.isPublic,
+                    description: result.description,
+                  );
+                },
+                icon: const Icon(Icons.public_outlined),
+                label: const Text('Edit visibility'),
               ),
             if (canManageChannels)
               FilledButton.tonalIcon(
@@ -736,6 +909,179 @@ class _RolesTab extends StatelessWidget {
               );
             },
           ),
+        ),
+      ],
+    );
+  }
+}
+
+class _JoinRequestsTab extends StatelessWidget {
+  const _JoinRequestsTab({
+    required this.loading,
+    required this.requests,
+    required this.onApprove,
+    required this.onReject,
+  });
+
+  final bool loading;
+  final List<ServerJoinRequestSummary> requests;
+  final Future<void> Function(ServerJoinRequestSummary request) onApprove;
+  final Future<void> Function(ServerJoinRequestSummary request) onReject;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    if (loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (requests.isEmpty) {
+      return const Center(
+        child: Text('No pending join requests right now.'),
+      );
+    }
+    return ListView.separated(
+      itemCount: requests.length,
+      separatorBuilder: (context, index) => const SizedBox(height: 12),
+      itemBuilder: (context, index) {
+        final request = requests[index];
+        return Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: palette.panelStrong,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: palette.border),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      request.displayName,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text('Requested ${_formatServerDate(request.createdAt)}'),
+                    const SizedBox(height: 4),
+                    SelectableText(request.userId),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              FilledButton.tonal(
+                onPressed: () => onReject(request),
+                child: const Text('Decline'),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: () => onApprove(request),
+                child: const Text('Approve'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _ServerDiscoverySettingsResult {
+  const _ServerDiscoverySettingsResult({
+    required this.isPublic,
+    required this.description,
+  });
+
+  final bool isPublic;
+  final String description;
+}
+
+class _ServerDiscoverySettingsDialog extends StatefulWidget {
+  const _ServerDiscoverySettingsDialog({
+    required this.initialIsPublic,
+    required this.initialDescription,
+  });
+
+  final bool initialIsPublic;
+  final String initialDescription;
+
+  @override
+  State<_ServerDiscoverySettingsDialog> createState() =>
+      _ServerDiscoverySettingsDialogState();
+}
+
+class _ServerDiscoverySettingsDialogState
+    extends State<_ServerDiscoverySettingsDialog> {
+  late bool _isPublic = widget.initialIsPublic;
+  late final TextEditingController _descriptionController =
+      TextEditingController(text: widget.initialDescription);
+
+  @override
+  void dispose() {
+    _descriptionController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.of(context).pop(
+      _ServerDiscoverySettingsResult(
+        isPublic: _isPublic,
+        description: _descriptionController.text,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Server visibility'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: _isPublic,
+              title: const Text('Public server'),
+              subtitle: Text(
+                _isPublic
+                    ? 'Anyone who finds this server can join immediately.'
+                    : 'Anyone who finds this server must request to join.',
+              ),
+              onChanged: (value) {
+                setState(() {
+                  _isPublic = value;
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _descriptionController,
+              minLines: 3,
+              maxLines: 4,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _submit(),
+              decoration: const InputDecoration(
+                labelText: 'Description',
+                hintText: 'Tell people what the server is about.',
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _submit,
+          child: const Text('Save'),
         ),
       ],
     );

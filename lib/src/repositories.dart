@@ -143,6 +143,8 @@ class WorkspaceRepository {
 
   final SupabaseClient client;
   final AuthService authService;
+  static const String _serverSummarySelect =
+      'id, name, owner_id, invite_code, description, is_public, avatar_path, created_at';
 
   bool get hasGiphyApiKey => AppBootstrap.giphyApiKey.trim().isNotEmpty;
 
@@ -173,9 +175,7 @@ class WorkspaceRepository {
     final serverRows =
         await client
                 .from('servers')
-                .select(
-                  'id, name, owner_id, invite_code, avatar_path, created_at',
-                )
+                .select(_serverSummarySelect)
                 .inFilter('id', serverIds)
                 .order('created_at', ascending: true)
             as List<dynamic>;
@@ -185,7 +185,11 @@ class WorkspaceRepository {
         .toList();
   }
 
-  Future<ServerSummary> createServer(String name) async {
+  Future<ServerSummary> createServer(
+    String name, {
+    String description = '',
+    bool isPublic = false,
+  }) async {
     final cleanName = name.trim();
     if (cleanName.isEmpty) {
       throw StateError('Server name is required.');
@@ -193,8 +197,13 @@ class WorkspaceRepository {
 
     final row = await client
         .from('servers')
-        .insert({'name': cleanName, 'owner_id': authService.userId})
-        .select('id, name, owner_id, invite_code, avatar_path, created_at')
+        .insert({
+          'name': cleanName,
+          'owner_id': authService.userId,
+          'description': description.trim(),
+          'is_public': isPublic,
+        })
+        .select(_serverSummarySelect)
         .single();
 
     return ServerSummary.fromMap(row);
@@ -259,6 +268,88 @@ class WorkspaceRepository {
     return ServerSummary.fromMap(Map<String, dynamic>.from(row as Map));
   }
 
+  Future<List<DiscoverableServerSummary>> searchJoinableServers({
+    String query = '',
+  }) async {
+    final response = await client.rpc(
+      'list_joinable_servers',
+      params: <String, dynamic>{'search_query_input': query.trim()},
+    );
+    if (response is! List) {
+      return const <DiscoverableServerSummary>[];
+    }
+    return response
+        .map(
+          (row) => DiscoverableServerSummary.fromMap(
+            Map<String, dynamic>.from(row as Map),
+          ),
+        )
+        .toList();
+  }
+
+  Future<ServerSummary> joinPublicServer(String serverId) async {
+    final row = await client.rpc(
+      'join_public_server',
+      params: <String, dynamic>{'server_id_input': serverId},
+    );
+    return ServerSummary.fromMap(Map<String, dynamic>.from(row as Map));
+  }
+
+  Future<void> requestServerJoin(String serverId) async {
+    await client.rpc(
+      'request_server_join',
+      params: <String, dynamic>{'server_id_input': serverId},
+    );
+  }
+
+  Future<ServerSummary> updateServerDiscoverySettings({
+    required String serverId,
+    required bool isPublic,
+    required String description,
+  }) async {
+    final row = await client.rpc(
+      'update_server_discovery_settings',
+      params: <String, dynamic>{
+        'server_id_input': serverId,
+        'is_public_input': isPublic,
+        'description_input': description.trim(),
+      },
+    );
+    return ServerSummary.fromMap(Map<String, dynamic>.from(row as Map));
+  }
+
+  Future<List<ServerJoinRequestSummary>> fetchServerJoinRequests(
+    String serverId,
+  ) async {
+    final response = await client.rpc(
+      'list_server_join_requests',
+      params: <String, dynamic>{'server_id_input': serverId},
+    );
+    if (response is! List) {
+      return const <ServerJoinRequestSummary>[];
+    }
+    return response
+        .map(
+          (row) => ServerJoinRequestSummary.fromMap(
+            Map<String, dynamic>.from(row as Map),
+          ),
+        )
+        .toList();
+  }
+
+  Future<void> decideServerJoinRequest({
+    required String requestId,
+    required bool approve,
+  }) async {
+    await client.rpc(
+      'decide_server_join_request',
+      params: <String, dynamic>{
+        'request_id_input': requestId,
+        'approve_input': approve,
+      },
+    );
+  }
+
   String? publicServerAvatarUrl(String? avatarPath) {
     if (avatarPath == null || avatarPath.isEmpty) {
       return null;
@@ -318,7 +409,7 @@ class WorkspaceRepository {
         .from('servers')
         .update({'avatar_path': path})
         .eq('id', serverId)
-        .select('id, name, owner_id, invite_code, avatar_path, created_at')
+        .select(_serverSummarySelect)
         .single();
 
     return ServerSummary.fromMap(row);

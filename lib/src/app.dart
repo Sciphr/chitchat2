@@ -428,6 +428,7 @@ class _SignInScreenState extends State<SignInScreen> {
                             TextField(
                               controller: _emailController,
                               keyboardType: TextInputType.emailAddress,
+                              textInputAction: TextInputAction.next,
                               decoration: const InputDecoration(
                                 labelText: 'Email',
                               ),
@@ -436,6 +437,14 @@ class _SignInScreenState extends State<SignInScreen> {
                             TextField(
                               controller: _passwordController,
                               obscureText: true,
+                              textInputAction: _createAccount
+                                  ? TextInputAction.next
+                                  : TextInputAction.done,
+                              onSubmitted: (_) {
+                                if (!_createAccount && !_submitting) {
+                                  unawaited(_submit());
+                                }
+                              },
                               decoration: const InputDecoration(
                                 labelText: 'Password',
                               ),
@@ -444,6 +453,12 @@ class _SignInScreenState extends State<SignInScreen> {
                               const SizedBox(height: 14),
                               TextField(
                                 controller: _displayNameController,
+                                textInputAction: TextInputAction.done,
+                                onSubmitted: (_) {
+                                  if (!_submitting) {
+                                    unawaited(_submit());
+                                  }
+                                },
                                 decoration: const InputDecoration(
                                   labelText: 'Display name',
                                 ),
