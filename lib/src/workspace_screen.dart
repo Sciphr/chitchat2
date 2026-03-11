@@ -54,6 +54,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   VoiceChannelSessionController? _activeVoiceController;
   VoiceChannelSessionController? _previewVoiceController;
   RealtimeChannel? _serverPresenceChannel;
+  RealtimeChannel? _serverRosterChannel;
   bool _displayNamePromptShown = false;
 
   @override
@@ -71,6 +72,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     if (!identical(_previewVoiceController, _activeVoiceController)) {
       unawaited(_previewVoiceController?.close());
     }
+    unawaited(_closeServerRosterChannel());
     unawaited(_closeServerPresenceChannel(resetUi: false));
     unawaited(_soundEffects.dispose());
     super.dispose();
@@ -103,6 +105,96 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
     if (presenceChannel != null) {
       await Supabase.instance.client.removeChannel(presenceChannel);
+    }
+  }
+
+  Future<void> _closeServerRosterChannel() async {
+    final rosterChannel = _serverRosterChannel;
+    _serverRosterChannel = null;
+    if (rosterChannel != null) {
+      await Supabase.instance.client.removeChannel(rosterChannel);
+    }
+  }
+
+  Future<void> _subscribeServerRoster(ServerSummary server) async {
+    await _closeServerRosterChannel();
+    if (!mounted || _selectedServer?.id != server.id) {
+      return;
+    }
+
+    final client = Supabase.instance.client;
+    final completer = Completer<void>();
+    final realtimeChannel = client
+        .channel('server-roster:${server.id}')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'server_members',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'server_id',
+            value: server.id,
+          ),
+          callback: (_) {
+            if (_selectedServer?.id == server.id) {
+              unawaited(_loadServerRoster(server));
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'server_member_roles',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'server_id',
+            value: server.id,
+          ),
+          callback: (_) {
+            if (_selectedServer?.id == server.id) {
+              unawaited(_loadServerRoster(server));
+            }
+          },
+        );
+
+    realtimeChannel.subscribe((status, [error]) {
+      if (completer.isCompleted) {
+        return;
+      }
+      switch (status) {
+        case RealtimeSubscribeStatus.subscribed:
+          completer.complete();
+        case RealtimeSubscribeStatus.channelError:
+          completer.completeError(
+            StateError(
+              'Realtime roster error${error == null ? '' : ': $error'}',
+            ),
+          );
+        case RealtimeSubscribeStatus.closed:
+          completer.completeError(
+            StateError('Realtime roster channel closed.'),
+          );
+        case RealtimeSubscribeStatus.timedOut:
+          completer.completeError(
+            StateError('Realtime roster channel timed out.'),
+          );
+      }
+    });
+
+    try {
+      await completer.future;
+      if (!mounted || _selectedServer?.id != server.id) {
+        await client.removeChannel(realtimeChannel);
+        return;
+      }
+      _serverRosterChannel = realtimeChannel;
+    } catch (error) {
+      await client.removeChannel(realtimeChannel);
+      if (_selectedServer?.id == server.id) {
+        debugPrint(
+          'Server roster subscription failed for ${server.id}: $error',
+        );
+      }
     }
   }
 
@@ -596,6 +688,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
 
     await _selectChannel(null);
+    await _closeServerRosterChannel();
     await _closeServerPresenceChannel();
     _selectedServer = server;
     _categories = const <ChannelCategorySummary>[];
@@ -613,6 +706,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         _loadChannels(server.id, selectFirst: true),
         _loadServerAccess(server),
         _loadServerRoster(server),
+        _subscribeServerRoster(server),
         _subscribeServerPresence(server),
       ]);
     }
