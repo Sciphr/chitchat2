@@ -1,5 +1,8 @@
 {
   "SUPABASE_URL": "https://YOUR-PROJECT.supabase.co",
   "SUPABASE_ANON_KEY": "YOUR-ANON-KEY",
-  "APP_UPDATE_REPOSITORY": "Sciphr/chitchat2"
+  "APP_UPDATE_REPOSITORY": "Sciphr/chitchat2",
+  "LIVEKIT_URL": "wss://chitchat-7xz5lyg6.livekit.cloud",
+  "LIVEKIT_TOKEN_FUNCTION_NAME": "livekit-token",
+  "WEBRTC_ICE_SERVERS_JSON": "[{\"urls\":[\"stun:stun.l.google.com:19302\"]},{\"urls\":[\"turn:YOUR-TURN-HOST:3478?transport=udp\",\"turn:YOUR-TURN-HOST:3478?transport=tcp\"],\"username\":\"YOUR-TURN-USERNAME\",\"credential\":\"YOUR-TURN-PASSWORD\"}]"
 }

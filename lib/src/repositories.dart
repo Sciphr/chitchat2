@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'app_bootstrap.dart';
 import 'desktop_integration.dart';
 import 'models.dart';
 
@@ -257,6 +258,35 @@ class WorkspaceRepository {
       return null;
     }
     return client.storage.from('server-assets').getPublicUrl(avatarPath);
+  }
+
+  Future<String> fetchLiveKitToken({
+    required String channelId,
+  }) async {
+    final response = await client.functions.invoke(
+      AppBootstrap.liveKitTokenFunctionName,
+      body: <String, dynamic>{
+        'channelId': channelId,
+      },
+    );
+
+    if (response.status >= 400) {
+      throw StateError(
+        'Unable to fetch LiveKit token (${response.status}): ${response.data}',
+      );
+    }
+
+    final data = response.data;
+    final payload = data is Map<String, dynamic>
+        ? data
+        : data is Map
+        ? Map<String, dynamic>.from(data)
+        : null;
+    final token = payload?['token'] as String?;
+    if (token == null || token.isEmpty) {
+      throw StateError('LiveKit token response was missing a token.');
+    }
+    return token;
   }
 
   Future<ServerSummary> uploadServerAvatar({

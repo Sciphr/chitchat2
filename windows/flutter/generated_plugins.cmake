@@ -6,7 +6,9 @@ list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   audioplayers_windows
   bitsdojo_window_windows
+  connectivity_plus
   flutter_webrtc
+  livekit_client
   url_launcher_windows
 )
 
