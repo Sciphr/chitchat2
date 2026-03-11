@@ -922,9 +922,19 @@ class VoiceChannelSessionController extends ChangeNotifier {
     VoiceRemotePeer peer,
     _VoiceSignalEnvelope envelope,
   ) async {
-    if (peer.connection == null ||
-        envelope.candidate == null ||
-        peer.sessionId != envelope.sessionId) {
+    final candidate = envelope.candidate;
+    if (candidate == null) {
+      return;
+    }
+
+    if (peer.sessionId != null && peer.sessionId != envelope.sessionId) {
+      return;
+    }
+
+    if (peer.connection == null) {
+      _queuedCandidatesByPeer
+          .putIfAbsent(peer.participant.clientId, () => <RTCIceCandidate>[])
+          .add(candidate);
       return;
     }
 
@@ -932,11 +942,11 @@ class VoiceChannelSessionController extends ChangeNotifier {
     if (remoteDescription == null) {
       _queuedCandidatesByPeer
           .putIfAbsent(peer.participant.clientId, () => <RTCIceCandidate>[])
-          .add(envelope.candidate!);
+          .add(candidate);
       return;
     }
 
-    await peer.connection!.addCandidate(envelope.candidate!);
+    await peer.connection!.addCandidate(candidate);
   }
 
   Future<void> _flushQueuedCandidates(VoiceRemotePeer peer) async {

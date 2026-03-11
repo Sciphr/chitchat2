@@ -47,6 +47,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   List<ServerRole> _serverRoles = const <ServerRole>[];
   List<ServerMember> _serverMembers = const <ServerMember>[];
   Set<String> _onlineMemberIds = const <String>{};
+  Map<String, List<VoiceParticipant>> _voiceParticipantsByChannel =
+      const <String, List<VoiceParticipant>>{};
   ServerSummary? _selectedServer;
   ChannelSummary? _selectedChannel;
   ServerAccess? _serverAccess;
@@ -55,6 +57,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   VoiceChannelSessionController? _previewVoiceController;
   RealtimeChannel? _serverPresenceChannel;
   RealtimeChannel? _serverRosterChannel;
+  final Map<String, RealtimeChannel> _voicePresenceChannels =
+      <String, RealtimeChannel>{};
   bool _displayNamePromptShown = false;
 
   @override
@@ -74,6 +78,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
     unawaited(_closeServerRosterChannel());
     unawaited(_closeServerPresenceChannel(resetUi: false));
+    unawaited(_closeVoicePresenceChannels(resetUi: false));
     unawaited(_soundEffects.dispose());
     super.dispose();
   }
@@ -113,6 +118,19 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     _serverRosterChannel = null;
     if (rosterChannel != null) {
       await Supabase.instance.client.removeChannel(rosterChannel);
+    }
+  }
+
+  Future<void> _closeVoicePresenceChannels({bool resetUi = true}) async {
+    final channels = _voicePresenceChannels.values.toList();
+    _voicePresenceChannels.clear();
+    if (resetUi && mounted) {
+      setState(() {
+        _voiceParticipantsByChannel = const <String, List<VoiceParticipant>>{};
+      });
+    }
+    for (final channel in channels) {
+      await Supabase.instance.client.removeChannel(channel);
     }
   }
 
@@ -303,6 +321,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
   String _serverPresenceTopic(String serverId) => 'server:presence:$serverId';
 
+  String _voicePresenceTopic(String channelId) => 'voice:presence:$channelId';
+
   String? _formatServerPresenceError(Object error) {
     final message = error.toString().toLowerCase();
     if (message.contains('unauthorized') ||
@@ -311,6 +331,173 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       return 'Member presence is blocked by Realtime authorization. Apply the latest Supabase migrations.';
     }
     return 'Member presence unavailable right now.';
+  }
+
+  Future<void> _syncVoicePresenceSubscriptions(
+    String serverId,
+    List<ChannelSummary> channels,
+  ) async {
+    final voiceChannels = channels
+        .where((channel) => channel.kind == ChannelKind.voice)
+        .toList();
+    final desiredChannelIds = voiceChannels
+        .map((channel) => channel.id)
+        .toSet();
+
+    final staleChannelIds = _voicePresenceChannels.keys
+        .where((channelId) => !desiredChannelIds.contains(channelId))
+        .toList();
+    for (final channelId in staleChannelIds) {
+      final realtimeChannel = _voicePresenceChannels.remove(channelId);
+      if (realtimeChannel != null) {
+        await Supabase.instance.client.removeChannel(realtimeChannel);
+      }
+    }
+    if (staleChannelIds.isNotEmpty && mounted) {
+      setState(() {
+        _voiceParticipantsByChannel = Map<String, List<VoiceParticipant>>.from(
+          _voiceParticipantsByChannel,
+        )..removeWhere((channelId, _) => !desiredChannelIds.contains(channelId));
+      });
+    }
+
+    final channelsToSubscribe = voiceChannels
+        .where((channel) => !_voicePresenceChannels.containsKey(channel.id))
+        .toList();
+    if (channelsToSubscribe.isEmpty) {
+      return;
+    }
+
+    await Future.wait<void>(
+      channelsToSubscribe.map(
+        (channel) => _subscribeVoicePresenceChannel(serverId, channel),
+      ),
+    );
+  }
+
+  Future<void> _subscribeVoicePresenceChannel(
+    String serverId,
+    ChannelSummary channel,
+  ) async {
+    if (!mounted ||
+        _selectedServer?.id != serverId ||
+        _voicePresenceChannels.containsKey(channel.id)) {
+      return;
+    }
+
+    final client = Supabase.instance.client;
+    await client.realtime.setAuth(client.auth.currentSession?.accessToken);
+    final completer = Completer<void>();
+    final realtimeChannel = client.channel(
+      _voicePresenceTopic(channel.id),
+      opts: RealtimeChannelConfig(
+        ack: true,
+        enabled: true,
+        key: widget.authService.userId,
+        private: true,
+      ),
+    );
+
+    realtimeChannel
+      ..onPresenceSync((_) => _syncVoicePresence(channel.id, realtimeChannel))
+      ..onPresenceJoin((_) => _syncVoicePresence(channel.id, realtimeChannel))
+      ..onPresenceLeave((_) => _syncVoicePresence(channel.id, realtimeChannel));
+
+    realtimeChannel.subscribe((status, [error]) {
+      if (completer.isCompleted) {
+        return;
+      }
+      switch (status) {
+        case RealtimeSubscribeStatus.subscribed:
+          completer.complete();
+        case RealtimeSubscribeStatus.channelError:
+          completer.completeError(
+            StateError(
+              'Voice presence error for ${channel.id}'
+              '${error == null ? '' : ': $error'}',
+            ),
+          );
+        case RealtimeSubscribeStatus.closed:
+          completer.completeError(
+            StateError('Voice presence channel closed for ${channel.id}.'),
+          );
+        case RealtimeSubscribeStatus.timedOut:
+          completer.completeError(
+            StateError('Voice presence channel timed out for ${channel.id}.'),
+          );
+      }
+    });
+
+    try {
+      await completer.future;
+      if (!mounted ||
+          _selectedServer?.id != serverId ||
+          !_channels.any((item) => item.id == channel.id)) {
+        await client.removeChannel(realtimeChannel);
+        return;
+      }
+      _voicePresenceChannels[channel.id] = realtimeChannel;
+      _syncVoicePresence(channel.id, realtimeChannel);
+    } catch (error) {
+      await client.removeChannel(realtimeChannel);
+      if (_selectedServer?.id == serverId) {
+        debugPrint(
+          'Voice presence subscription failed for ${channel.id}: $error',
+        );
+      }
+    }
+  }
+
+  void _syncVoicePresence(String channelId, RealtimeChannel realtimeChannel) {
+    if (!mounted || _selectedServer == null) {
+      return;
+    }
+
+    final participants = <VoiceParticipant>[];
+    for (final state in realtimeChannel.presenceState()) {
+      for (final presence in state.presences) {
+        final payload = presence.payload;
+        final userId = payload['user_id'] as String?;
+        if (userId == null || userId.isEmpty) {
+          continue;
+        }
+        final shareName =
+            payload['share_kind'] as String? ?? ShareKind.audio.name;
+        participants.add(
+          VoiceParticipant(
+            clientId: state.key,
+            userId: userId,
+            displayName: payload['display_name'] as String? ?? 'Anonymous',
+            isSelf: false,
+            isMuted: payload['muted'] as bool? ?? false,
+            shareKind: _shareKindFromName(shareName),
+          ),
+        );
+      }
+    }
+
+    participants.sort(
+      (left, right) => left.displayName.toLowerCase().compareTo(
+        right.displayName.toLowerCase(),
+      ),
+    );
+
+    setState(() {
+      _voiceParticipantsByChannel = Map<String, List<VoiceParticipant>>.from(
+        _voiceParticipantsByChannel,
+      )..[channelId] = participants;
+    });
+  }
+
+  ShareKind _shareKindFromName(String value) {
+    switch (value) {
+      case 'camera':
+        return ShareKind.camera;
+      case 'screen':
+        return ShareKind.screen;
+      default:
+        return ShareKind.audio;
+    }
   }
 
   ChannelCategorySummary _copyCategoryWithPosition(
@@ -665,6 +852,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         _channels = channels;
         _loadingChannels = false;
       });
+      await _syncVoicePresenceSubscriptions(serverId, channels);
 
       if (selectFirst && channels.isNotEmpty) {
         await _selectChannel(channels.first);
@@ -691,11 +879,13 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     await _selectChannel(null);
     await _closeServerRosterChannel();
     await _closeServerPresenceChannel();
+    await _closeVoicePresenceChannels();
     _selectedServer = server;
     _categories = const <ChannelCategorySummary>[];
     _channels = const <ChannelSummary>[];
     _serverRoles = const <ServerRole>[];
     _serverMembers = const <ServerMember>[];
+    _voiceParticipantsByChannel = const <String, List<VoiceParticipant>>{};
     _serverAccess = null;
     _memberRosterError = null;
     _loadingMemberRoster = server != null;
@@ -1312,6 +1502,12 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     final selectedServer = _selectedServer;
     final palette = Theme.of(context).extension<AppThemePalette>()!;
     final activeVoiceController = _activeVoiceController;
+    final voiceParticipantsByChannel =
+        Map<String, List<VoiceParticipant>>.from(_voiceParticipantsByChannel);
+    if (activeVoiceController != null && _activeVoiceChannel != null) {
+      voiceParticipantsByChannel[_activeVoiceChannel!.id] =
+          activeVoiceController.participants;
+    }
     final sidebar = activeVoiceController == null
         ? _ChannelSidebar(
             server: selectedServer,
@@ -1322,8 +1518,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
             error: _channelError,
             access: _serverAccess,
             selectedChannelId: _selectedChannel?.id,
-            activeVoiceChannelId: _activeVoiceChannel?.id,
-            activeVoiceParticipants: const <VoiceParticipant>[],
+            voiceParticipantsByChannel: voiceParticipantsByChannel,
             onSelectChannel: _selectChannel,
             onRenameCategory: _promptRenameCategory,
             onReorderCategories: _reorderCategories,
@@ -1343,8 +1538,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               error: _channelError,
               access: _serverAccess,
               selectedChannelId: _selectedChannel?.id,
-              activeVoiceChannelId: _activeVoiceChannel?.id,
-              activeVoiceParticipants: activeVoiceController.participants,
+              voiceParticipantsByChannel: voiceParticipantsByChannel,
               onSelectChannel: _selectChannel,
               onRenameCategory: _promptRenameCategory,
               onReorderCategories: _reorderCategories,
@@ -1891,8 +2085,7 @@ class _ChannelSidebar extends StatefulWidget {
     required this.error,
     required this.access,
     required this.selectedChannelId,
-    required this.activeVoiceChannelId,
-    required this.activeVoiceParticipants,
+    required this.voiceParticipantsByChannel,
     required this.onSelectChannel,
     required this.onRenameCategory,
     required this.onReorderCategories,
@@ -1910,8 +2103,7 @@ class _ChannelSidebar extends StatefulWidget {
   final String? error;
   final ServerAccess? access;
   final String? selectedChannelId;
-  final String? activeVoiceChannelId;
-  final List<VoiceParticipant> activeVoiceParticipants;
+  final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
   final Future<void> Function(ChannelCategorySummary category) onRenameCategory;
   final Future<void> Function(int oldIndex, int newIndex) onReorderCategories;
@@ -2058,10 +2250,9 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                                 channels: uncategorizedChannels,
                                                 selectedChannelId:
                                                     widget.selectedChannelId,
-                                                activeVoiceChannelId:
-                                                    widget.activeVoiceChannelId,
-                                                activeVoiceParticipants: widget
-                                                    .activeVoiceParticipants,
+                                                voiceParticipantsByChannel:
+                                                    widget
+                                                        .voiceParticipantsByChannel,
                                                 canManageChannels:
                                                     canManageChannels,
                                                 showDropSlots: showDropSlots,
@@ -2117,10 +2308,9 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                                 channels: categoryChannels,
                                                 selectedChannelId:
                                                     widget.selectedChannelId,
-                                                activeVoiceChannelId:
-                                                    widget.activeVoiceChannelId,
-                                                activeVoiceParticipants: widget
-                                                    .activeVoiceParticipants,
+                                                voiceParticipantsByChannel:
+                                                    widget
+                                                        .voiceParticipantsByChannel,
                                                 canManageChannels:
                                                     canManageChannels,
                                                 showDropSlots: showDropSlots,
@@ -2176,8 +2366,7 @@ class _CategorySection extends StatelessWidget {
     required this.category,
     required this.channels,
     required this.selectedChannelId,
-    required this.activeVoiceChannelId,
-    required this.activeVoiceParticipants,
+    required this.voiceParticipantsByChannel,
     required this.canManageChannels,
     required this.showDropSlots,
     required this.onRenameCategory,
@@ -2191,8 +2380,7 @@ class _CategorySection extends StatelessWidget {
   final ChannelCategorySummary category;
   final List<ChannelSummary> channels;
   final String? selectedChannelId;
-  final String? activeVoiceChannelId;
-  final List<VoiceParticipant> activeVoiceParticipants;
+  final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
   final bool canManageChannels;
   final bool showDropSlots;
   final VoidCallback onRenameCategory;
@@ -2242,8 +2430,7 @@ class _CategorySection extends StatelessWidget {
             categoryId: category.id,
             channels: channels,
             selectedChannelId: selectedChannelId,
-            activeVoiceChannelId: activeVoiceChannelId,
-            activeVoiceParticipants: activeVoiceParticipants,
+            voiceParticipantsByChannel: voiceParticipantsByChannel,
             canManageChannels: canManageChannels,
             showDropSlots: showDropSlots,
             onSelectChannel: onSelectChannel,
@@ -2343,8 +2530,7 @@ class _ChannelList extends StatelessWidget {
     required this.categoryId,
     required this.channels,
     required this.selectedChannelId,
-    required this.activeVoiceChannelId,
-    required this.activeVoiceParticipants,
+    required this.voiceParticipantsByChannel,
     required this.canManageChannels,
     required this.showDropSlots,
     required this.onSelectChannel,
@@ -2356,8 +2542,7 @@ class _ChannelList extends StatelessWidget {
   final String? categoryId;
   final List<ChannelSummary> channels;
   final String? selectedChannelId;
-  final String? activeVoiceChannelId;
-  final List<VoiceParticipant> activeVoiceParticipants;
+  final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
   final bool canManageChannels;
   final bool showDropSlots;
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
@@ -2413,8 +2598,9 @@ class _ChannelList extends StatelessWidget {
               key: ValueKey<String>(channels[index].id),
               channel: channels[index],
               selected: channels[index].id == selectedChannelId,
-              activeVoiceChannelId: activeVoiceChannelId,
-              activeVoiceParticipants: activeVoiceParticipants,
+              voiceParticipants:
+                  voiceParticipantsByChannel[channels[index].id] ??
+                  const <VoiceParticipant>[],
               onTap: () => onSelectChannel(channels[index]),
               draggable: canManageChannels,
               onDragStarted: () => onChannelDragStarted(channels[index].id),
@@ -2439,8 +2625,7 @@ class _ChannelTile extends StatelessWidget {
     super.key,
     required this.channel,
     required this.selected,
-    required this.activeVoiceChannelId,
-    required this.activeVoiceParticipants,
+    required this.voiceParticipants,
     required this.onTap,
     required this.onDragStarted,
     required this.onDragFinished,
@@ -2449,8 +2634,7 @@ class _ChannelTile extends StatelessWidget {
 
   final ChannelSummary channel;
   final bool selected;
-  final String? activeVoiceChannelId;
-  final List<VoiceParticipant> activeVoiceParticipants;
+  final List<VoiceParticipant> voiceParticipants;
   final VoidCallback onTap;
   final VoidCallback onDragStarted;
   final VoidCallback onDragFinished;
@@ -2473,9 +2657,7 @@ class _ChannelTile extends StatelessWidget {
       ),
     ];
     final showVoiceParticipants =
-        channel.kind == ChannelKind.voice &&
-        activeVoiceChannelId == channel.id &&
-        activeVoiceParticipants.isNotEmpty;
+        channel.kind == ChannelKind.voice && voiceParticipants.isNotEmpty;
 
     final tileBody = InkWell(
       onTap: onTap,
@@ -2503,7 +2685,7 @@ class _ChannelTile extends StatelessWidget {
                 padding: const EdgeInsets.only(left: 28),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: activeVoiceParticipants
+                  children: voiceParticipants
                       .map(
                         (participant) => Padding(
                           padding: const EdgeInsets.only(bottom: 4),
