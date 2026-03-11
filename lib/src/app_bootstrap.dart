@@ -19,6 +19,10 @@ class AppBootstrap {
     'SUPABASE_ANON_KEY',
     defaultValue: '',
   );
+  static const String updateRepository = String.fromEnvironment(
+    'APP_UPDATE_REPOSITORY',
+    defaultValue: 'Sciphr/chitchat2',
+  );
 
   static String get _persistSessionKey =>
       'sb-${Uri.parse(supabaseUrl).host.split('.').first}-auth-token';

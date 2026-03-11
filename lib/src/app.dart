@@ -8,6 +8,7 @@ import 'app_bootstrap.dart';
 import 'app_preferences.dart';
 import 'desktop_integration.dart';
 import 'repositories.dart';
+import 'update_service.dart';
 import 'workspace_screen.dart';
 
 class ChatApp extends StatefulWidget {
@@ -21,12 +22,14 @@ class ChatApp extends StatefulWidget {
 
 class _ChatAppState extends State<ChatApp> {
   final AppPreferences _preferences = AppPreferences();
+  final AppUpdateController _updateController = AppUpdateController();
   StreamSubscription<Uri>? _desktopDeepLinkSubscription;
 
   @override
   void initState() {
     super.initState();
     _preferences.load();
+    unawaited(_updateController.initialize());
     _desktopDeepLinkSubscription = desktopDeepLinks.listen((uri) {
       unawaited(_handleDesktopDeepLink(uri));
     });
@@ -47,6 +50,7 @@ class _ChatAppState extends State<ChatApp> {
   @override
   void dispose() {
     _desktopDeepLinkSubscription?.cancel();
+    _updateController.dispose();
     super.dispose();
   }
 
@@ -56,7 +60,7 @@ class _ChatAppState extends State<ChatApp> {
       SystemMouseCursors.click,
     );
     return AnimatedBuilder(
-      animation: _preferences,
+      animation: Listenable.merge([_preferences, _updateController]),
       builder: (context, _) {
         final colorScheme = colorSchemeForTheme(_preferences.themeScheme);
         final palette = paletteForTheme(_preferences.themeScheme);
@@ -126,11 +130,15 @@ class _ChatAppState extends State<ChatApp> {
             if (!supportsCustomDesktopFrame) {
               return content;
             }
-            return _DesktopWindowFrame(child: content);
+            return _DesktopWindowFrame(
+              appVersion: _updateController.currentVersion,
+              child: content,
+            );
           },
           home: _AppShell(
             bootstrap: widget.bootstrap,
             preferences: _preferences,
+            updateController: _updateController,
           ),
         );
       },
@@ -139,10 +147,15 @@ class _ChatAppState extends State<ChatApp> {
 }
 
 class _AppShell extends StatelessWidget {
-  const _AppShell({required this.bootstrap, required this.preferences});
+  const _AppShell({
+    required this.bootstrap,
+    required this.preferences,
+    required this.updateController,
+  });
 
   final AppBootstrap bootstrap;
   final AppPreferences preferences;
+  final AppUpdateController updateController;
 
   @override
   Widget build(BuildContext context) {
@@ -171,6 +184,7 @@ class _AppShell extends StatelessWidget {
           authService: authService,
           workspaceRepository: workspaceRepository,
           preferences: preferences,
+          updateController: updateController,
         );
       },
     );
@@ -526,9 +540,10 @@ class _SignInScreenState extends State<SignInScreen> {
 }
 
 class _DesktopWindowFrame extends StatelessWidget {
-  const _DesktopWindowFrame({required this.child});
+  const _DesktopWindowFrame({required this.child, this.appVersion});
 
   final Widget child;
+  final String? appVersion;
 
   @override
   Widget build(BuildContext context) {
@@ -538,7 +553,7 @@ class _DesktopWindowFrame extends StatelessWidget {
       width: 1,
       child: Column(
         children: [
-          const _DesktopTitleBar(),
+          _DesktopTitleBar(appVersion: appVersion),
           Expanded(child: child),
         ],
       ),
@@ -547,7 +562,9 @@ class _DesktopWindowFrame extends StatelessWidget {
 }
 
 class _DesktopTitleBar extends StatelessWidget {
-  const _DesktopTitleBar();
+  const _DesktopTitleBar({this.appVersion});
+
+  final String? appVersion;
 
   @override
   Widget build(BuildContext context) {
@@ -576,7 +593,9 @@ class _DesktopTitleBar extends StatelessWidget {
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
-                    'ChitChat',
+                    appVersion == null || appVersion!.isEmpty
+                        ? 'ChitChat'
+                        : 'ChitChat v$appVersion',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: Theme.of(context).textTheme.titleMedium?.copyWith(
