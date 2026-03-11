@@ -28,6 +28,40 @@ class ScreenShareService {
     );
   }
 
+  Future<MediaStream> openConfiguredMicrophone({
+    String? deviceId,
+    bool noiseCancellation = true,
+  }) async {
+    if (deviceId != null && deviceId.isNotEmpty) {
+      try {
+        await Helper.selectAudioInput(deviceId);
+      } on Object {
+        // Constraint-based device selection below is the fallback path.
+      }
+    }
+    await applyVoiceProcessingPreference(noiseCancellation);
+
+    return navigator.mediaDevices.getUserMedia({
+      'audio': {
+        if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+        'echoCancellation': noiseCancellation,
+        'noiseSuppression': noiseCancellation,
+        'autoGainControl': false,
+      },
+      'video': false,
+    });
+  }
+
+  Future<MediaStream> openConfiguredCamera({String? deviceId}) {
+    return navigator.mediaDevices.getUserMedia({
+      'audio': false,
+      'video': {
+        if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+        'mandatory': {'minWidth': 960, 'minHeight': 540, 'minFrameRate': 15},
+      },
+    });
+  }
+
   Future<void> applyAudioOutputDevice(String? deviceId) async {
     if (deviceId == null || deviceId.isEmpty) {
       return;
