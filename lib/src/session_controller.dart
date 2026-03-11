@@ -112,6 +112,9 @@ class VoiceRemotePeer {
 }
 
 class VoiceChannelSessionController extends ChangeNotifier {
+  static const String _preferredVideoCodec = 'vp9';
+  static const String _fallbackVideoCodec = 'vp8';
+
   VoiceChannelSessionController({
     required this.channel,
     required this.client,
@@ -211,6 +214,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
           dynacast: false,
           defaultAudioCaptureOptions: _audioCaptureOptions(),
           defaultCameraCaptureOptions: _cameraCaptureOptions(),
+          defaultVideoPublishOptions: _defaultVideoPublishOptions(),
         ),
       );
       await _attachRoom(room);
@@ -319,6 +323,11 @@ class VoiceChannelSessionController extends ChangeNotifier {
       if (localParticipant == null) {
         throw StateError('LiveKit room is not connected.');
       }
+      _applyScreenSharePublishOptions(
+        width: maxWidth,
+        height: maxHeight,
+        frameRate: frameRate,
+      );
       await localParticipant.setCameraEnabled(false);
       await localParticipant.setScreenShareEnabled(
         true,
@@ -326,9 +335,11 @@ class VoiceChannelSessionController extends ChangeNotifier {
         screenShareCaptureOptions: lk.ScreenShareCaptureOptions(
           sourceId: source.id,
           maxFrameRate: frameRate.toDouble(),
-          params: maxHeight >= 1080 && maxWidth >= 1920
-              ? lk.VideoParametersPresets.screenShareH1080FPS15
-              : lk.VideoParametersPresets.h720_169,
+          params: _screenShareVideoParameters(
+            width: maxWidth,
+            height: maxHeight,
+            frameRate: frameRate,
+          ),
         ),
       );
       _shareKind = ShareKind.screen;
@@ -491,6 +502,88 @@ class VoiceChannelSessionController extends ChangeNotifier {
     maxFrameRate: 15,
     params: lk.VideoParametersPresets.h720_169,
   );
+
+  lk.VideoPublishOptions _defaultVideoPublishOptions() =>
+      _videoPublishOptionsForScreenShare(
+        width: DesktopCaptureBridge.defaultScreenShareWidth,
+        height: DesktopCaptureBridge.defaultScreenShareHeight,
+        frameRate: DesktopCaptureBridge.defaultScreenShareFrameRate.toInt(),
+      );
+
+  void _applyScreenSharePublishOptions({
+    required int width,
+    required int height,
+    required int frameRate,
+  }) {
+    final room = _room;
+    if (room == null) {
+      return;
+    }
+    room.engine.roomOptions = room.roomOptions.copyWith(
+      defaultVideoPublishOptions: _videoPublishOptionsForScreenShare(
+        width: width,
+        height: height,
+        frameRate: frameRate,
+      ),
+    );
+  }
+
+  lk.VideoPublishOptions _videoPublishOptionsForScreenShare({
+    required int width,
+    required int height,
+    required int frameRate,
+  }) {
+    final parameters = _screenShareVideoParameters(
+      width: width,
+      height: height,
+      frameRate: frameRate,
+    );
+    return lk.VideoPublishOptions(
+      videoCodec: _preferredVideoCodec,
+      screenShareEncoding: parameters.encoding,
+      degradationPreference: lk.DegradationPreference.maintainResolution,
+      backupVideoCodec: const lk.BackupVideoCodec(
+        enabled: true,
+        codec: _fallbackVideoCodec,
+      ),
+    );
+  }
+
+  lk.VideoParameters _screenShareVideoParameters({
+    required int width,
+    required int height,
+    required int frameRate,
+  }) {
+    return lk.VideoParameters(
+      dimensions: lk.VideoDimensions(width, height),
+      encoding: lk.VideoEncoding(
+        maxBitrate: _screenShareBitrate(
+          width: width,
+          height: height,
+          frameRate: frameRate,
+        ),
+        maxFramerate: frameRate,
+      ),
+    );
+  }
+
+  int _screenShareBitrate({
+    required int width,
+    required int height,
+    required int frameRate,
+  }) {
+    final pixels = width * height;
+    final baseBitrate = switch (pixels) {
+      <= 1280 * 720 => 2500 * 1000,
+      <= 1920 * 1080 => 4000 * 1000,
+      <= 2560 * 1440 => 6000 * 1000,
+      _ => 8000 * 1000,
+    };
+    if (frameRate <= 30) {
+      return baseBitrate;
+    }
+    return baseBitrate * 2;
+  }
 
   Future<void> _subscribePresenceChannel() async {
     await _closePresenceChannel();

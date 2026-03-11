@@ -6762,7 +6762,7 @@ class _ScreenSourcePickerDialogState extends State<ScreenSourcePickerDialog> {
               ),
               const SizedBox(height: 12),
               const Text(
-                'Desktop capture sources are loaded natively through flutter_webrtc and rendered in this custom grid.',
+                'Desktop capture sources are loaded natively through flutter_webrtc. The selected resolution and frame rate are now published as chosen, using VP9 with fallback for compatibility.',
               ),
               const SizedBox(height: 18),
               Text('Resolution', style: Theme.of(context).textTheme.labelLarge),
