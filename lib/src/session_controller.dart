@@ -203,8 +203,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
       final token = await _fetchLiveKitToken();
       final room = lk.Room(
         roomOptions: lk.RoomOptions(
-          adaptiveStream: true,
-          dynacast: true,
+          adaptiveStream: false,
+          dynacast: false,
           defaultAudioCaptureOptions: _audioCaptureOptions(),
           defaultCameraCaptureOptions: _cameraCaptureOptions(),
         ),
@@ -505,6 +505,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
     realtimeChannel.subscribe((status, [error]) {
       if (_disposed || completer.isCompleted) {
         return;
+      }
+      if (status == RealtimeSubscribeStatus.subscribed &&
+          identical(_presenceChannel, realtimeChannel)) {
+        unawaited(_trackPresence());
       }
       switch (status) {
         case RealtimeSubscribeStatus.subscribed:

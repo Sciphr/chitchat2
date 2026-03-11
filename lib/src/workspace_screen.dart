@@ -120,6 +120,11 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       });
     }
     if (presenceChannel != null) {
+      try {
+        await presenceChannel.untrack();
+      } on Object {
+        // Best-effort cleanup while the channel is shutting down.
+      }
       await Supabase.instance.client.removeChannel(presenceChannel);
     }
   }
@@ -219,6 +224,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     realtimeChannel.subscribe((status, [error]) {
       if (completer.isCompleted) {
         return;
+      }
+      if (status == RealtimeSubscribeStatus.subscribed &&
+          identical(_serverPresenceChannel, realtimeChannel)) {
+        unawaited(_trackServerPresence());
       }
       switch (status) {
         case RealtimeSubscribeStatus.subscribed:
@@ -1917,8 +1926,45 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         final voiceParticipantsByChannel =
             Map<String, List<VoiceParticipant>>.from(_voiceParticipantsByChannel);
         if (activeVoiceController != null && _activeVoiceChannel != null) {
-          voiceParticipantsByChannel[_activeVoiceChannel!.id] =
-              activeVoiceController.participants;
+          final activeChannelId = _activeVoiceChannel!.id;
+          final presenceParticipants =
+              voiceParticipantsByChannel[activeChannelId] ??
+              const <VoiceParticipant>[];
+          final liveParticipantsByUserId = {
+            for (final participant in activeVoiceController.participants)
+              participant.userId: participant,
+          };
+          final mergedParticipants = presenceParticipants
+              .map((participant) {
+                final liveParticipant =
+                    liveParticipantsByUserId[participant.userId];
+                if (liveParticipant == null) {
+                  return participant;
+                }
+                return participant.copyWith(
+                  clientId: liveParticipant.clientId,
+                  displayName: liveParticipant.displayName,
+                  isSelf: liveParticipant.isSelf,
+                  isMuted: liveParticipant.isMuted,
+                  shareKind: liveParticipant.shareKind,
+                  isSpeaking: liveParticipant.isSpeaking,
+                );
+              })
+              .toList(growable: true);
+          final mergedUserIds = mergedParticipants
+              .map((participant) => participant.userId)
+              .toSet();
+          for (final liveParticipant in activeVoiceController.participants) {
+            if (!mergedUserIds.contains(liveParticipant.userId)) {
+              mergedParticipants.add(liveParticipant);
+            }
+          }
+          mergedParticipants.sort(
+            (left, right) => left.displayName.toLowerCase().compareTo(
+              right.displayName.toLowerCase(),
+            ),
+          );
+          voiceParticipantsByChannel[activeChannelId] = mergedParticipants;
         }
 
         final sidebar = _showDirectMessages
