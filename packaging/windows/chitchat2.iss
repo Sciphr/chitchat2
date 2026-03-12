@@ -37,8 +37,10 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
 CloseApplications=yes
-ForceCloseApplications=yes
 RestartApplications=yes
+; Force-closing is requested by the updater via installer CLI flags so this
+; stays compatible with Inno Setup builds that do not recognize a matching
+; [Setup] directive.
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
