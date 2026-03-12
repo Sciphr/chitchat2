@@ -17,6 +17,8 @@ class AppPreferences extends ChangeNotifier {
   bool _noiseCancellation = true;
   double _inputSensitivity = 1.0;
   Map<String, DateTime> _channelLastReadAtById = const <String, DateTime>{};
+  Map<String, double> _speakerVolumeByUserId = const <String, double>{};
+  Map<String, double> _screenShareVolumeByUserId = const <String, double>{};
 
   AppThemeScheme get themeScheme => _themeScheme;
   bool get desktopNotifications => _desktopNotifications;
@@ -30,6 +32,10 @@ class AppPreferences extends ChangeNotifier {
   String? get preferredVideoInputId => _preferredVideoInputId;
   bool get noiseCancellation => _noiseCancellation;
   double get inputSensitivity => _inputSensitivity;
+  double speakerVolumeForUser(String userId) =>
+      _speakerVolumeByUserId[userId] ?? 1.0;
+  double screenShareVolumeForUser(String userId) =>
+      _screenShareVolumeByUserId[userId] ?? 1.0;
 
   Duration get motionDuration =>
       _reduceMotion ? Duration.zero : const Duration(milliseconds: 280);
@@ -47,6 +53,8 @@ class AppPreferences extends ChangeNotifier {
   static const _noiseCancellationKey = 'prefs.noise_cancellation';
   static const _inputSensitivityKey = 'prefs.input_sensitivity';
   static const _channelLastReadAtKey = 'prefs.channel_last_read_at';
+  static const _speakerVolumeKey = 'prefs.speaker_volume_by_user';
+  static const _screenShareVolumeKey = 'prefs.screen_share_volume_by_user';
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -71,6 +79,10 @@ class AppPreferences extends ChangeNotifier {
     );
     final rawChannelReadAt = prefs.getString(_channelLastReadAtKey);
     _channelLastReadAtById = _decodeChannelLastReadAt(rawChannelReadAt);
+    final rawSpeakerVolumes = prefs.getString(_speakerVolumeKey);
+    _speakerVolumeByUserId = _decodeVolumeMap(rawSpeakerVolumes);
+    final rawScreenShareVolumes = prefs.getString(_screenShareVolumeKey);
+    _screenShareVolumeByUserId = _decodeVolumeMap(rawScreenShareVolumes);
     notifyListeners();
   }
 
@@ -170,6 +182,41 @@ class AppPreferences extends ChangeNotifier {
     await prefs.setDouble(_inputSensitivityKey, _inputSensitivity);
   }
 
+  Future<void> setSpeakerVolumeForUser(String userId, double value) async {
+    final normalizedUserId = userId.trim();
+    if (normalizedUserId.isEmpty) {
+      return;
+    }
+
+    final normalizedVolume = value.clamp(0.0, 2.0).toDouble();
+    _speakerVolumeByUserId = Map<String, double>.from(_speakerVolumeByUserId)
+      ..[normalizedUserId] = normalizedVolume;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _speakerVolumeKey,
+      _encodeVolumeMap(_speakerVolumeByUserId),
+    );
+  }
+
+  Future<void> setScreenShareVolumeForUser(String userId, double value) async {
+    final normalizedUserId = userId.trim();
+    if (normalizedUserId.isEmpty) {
+      return;
+    }
+
+    final normalizedVolume = value.clamp(0.0, 2.0).toDouble();
+    _screenShareVolumeByUserId = Map<String, double>.from(
+      _screenShareVolumeByUserId,
+    )..[normalizedUserId] = normalizedVolume;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _screenShareVolumeKey,
+      _encodeVolumeMap(_screenShareVolumeByUserId),
+    );
+  }
+
   DateTime? channelLastReadAt(String channelId) =>
       _channelLastReadAtById[channelId];
 
@@ -210,6 +257,31 @@ class AppPreferences extends ChangeNotifier {
   String _encodeChannelLastReadAt(Map<String, DateTime> values) {
     return values.entries
         .map((entry) => '${entry.key}=${entry.value.toUtc().toIso8601String()}')
+        .join('|');
+  }
+
+  Map<String, double> _decodeVolumeMap(String? raw) {
+    if (raw == null || raw.isEmpty) {
+      return const <String, double>{};
+    }
+    final values = <String, double>{};
+    for (final entry in raw.split('|')) {
+      final separator = entry.indexOf('=');
+      if (separator <= 0 || separator >= entry.length - 1) {
+        continue;
+      }
+      final userId = entry.substring(0, separator);
+      final volume = double.tryParse(entry.substring(separator + 1));
+      if (volume != null) {
+        values[userId] = volume.clamp(0.0, 2.0).toDouble();
+      }
+    }
+    return values;
+  }
+
+  String _encodeVolumeMap(Map<String, double> values) {
+    return values.entries
+        .map((entry) => '${entry.key}=${entry.value.clamp(0.0, 2.0)}')
         .join('|');
   }
 }

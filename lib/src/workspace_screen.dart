@@ -1224,6 +1224,17 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
   }
 
+  void _mergeServerIntoList(ServerSummary server) {
+    final nextServers =
+        _servers.where((existing) => existing.id != server.id).followedBy(
+            <ServerSummary>[server],
+          ).toList()
+          ..sort((left, right) => left.createdAt.compareTo(right.createdAt));
+    setState(() {
+      _servers = nextServers;
+    });
+  }
+
   Future<void> _initializeWorkspace() async {
     try {
       await widget.workspaceRepository.ensureCurrentProfile();
@@ -1691,6 +1702,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         result,
       );
       await _loadServers();
+      if (mounted && !_servers.any((item) => item.id == server.id)) {
+        _mergeServerIntoList(server);
+      }
       await _selectServer(server);
     } catch (error) {
       if (!mounted) {
@@ -1701,27 +1715,33 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   }
 
   Future<void> _openServerDiscovery() async {
-    final serverId = await showDialog<String>(
+    final result = await showDialog<_ServerDiscoveryResult>(
       context: context,
       builder: (context) => _ServerDiscoveryDialog(
         repository: widget.workspaceRepository,
         avatarUrlForPath: widget.workspaceRepository.publicServerAvatarUrl,
       ),
     );
-    if (serverId == null || !mounted) {
+    if (result == null || !mounted) {
       return;
     }
     await _loadServers();
     if (!mounted) {
       return;
     }
+    final joinedServer = result.joinedServer;
+    if (joinedServer != null &&
+        !_servers.any((item) => item.id == joinedServer.id)) {
+      _mergeServerIntoList(joinedServer);
+    }
     ServerSummary? targetServer;
     for (final server in _servers) {
-      if (server.id == serverId) {
+      if (server.id == result.serverId) {
         targetServer = server;
         break;
       }
     }
+    targetServer ??= joinedServer;
     if (targetServer != null) {
       await _selectServer(targetServer);
     }
@@ -2120,6 +2140,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         bytes: file.bytes!,
         fileExtension: file.extension ?? 'png',
       );
+      _mergeServerIntoList(updatedServer);
       await _loadServers();
       if (!mounted) {
         return;
@@ -2416,11 +2437,16 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
         final content = _showDirectMessages
             ? selectedDirectConversation == null
-                  ? const _EmptyState(
-                      title: 'Direct messages',
-                      message:
-                          'Pick a conversation or start one from a member, message, or voice participant.',
-                    )
+                  ? _selectedDirectConversationId == null
+                        ? const _EmptyState(
+                            title: 'Direct messages',
+                            message:
+                                'Pick a conversation or start one from a member, message, or voice participant.',
+                          )
+                        : const _EmptyState(
+                            title: 'Opening direct message',
+                            message: 'Loading conversation...',
+                          )
                   : DirectMessageView(
                       key: ValueKey<String>(
                         selectedDirectConversation.conversationId,
@@ -3203,24 +3229,11 @@ class _ActiveVoiceDock extends StatelessWidget {
                         const Icon(Icons.graphic_eq),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'In voice: ${channel.name}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              Text(
-                                controller.status,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: Theme.of(context).textTheme.bodySmall,
-                              ),
-                            ],
+                          child: Text(
+                            channel.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontWeight: FontWeight.w700),
                           ),
                         ),
                         const SizedBox(width: 8),
@@ -3252,14 +3265,14 @@ class _ActiveVoiceDock extends StatelessWidget {
                       onPressed: controller.busy || !canStreamCamera
                           ? null
                           : () async {
-                              if (controller.shareKind == ShareKind.camera) {
-                                await controller.stopVisualShare();
+                              if (controller.isCameraSharing) {
+                                await controller.stopCameraShare();
                                 return;
                               }
                               await controller.startCameraShare();
                             },
                       icon: Icon(
-                        controller.shareKind == ShareKind.camera
+                        controller.isCameraSharing
                             ? Icons.videocam_off
                             : Icons.videocam,
                       ),
@@ -3271,8 +3284,8 @@ class _ActiveVoiceDock extends StatelessWidget {
                               !WebRTC.platformIsDesktop
                           ? null
                           : () async {
-                              if (controller.shareKind == ShareKind.screen) {
-                                await controller.stopVisualShare();
+                              if (controller.isScreenSharing) {
+                                await controller.stopScreenShare();
                                 return;
                               }
                               final selection =
@@ -3295,7 +3308,7 @@ class _ActiveVoiceDock extends StatelessWidget {
                               }
                             },
                       icon: Icon(
-                        controller.shareKind == ShareKind.screen
+                        controller.isScreenSharing
                             ? Icons.stop_screen_share
                             : Icons.screen_share,
                       ),
@@ -3929,6 +3942,11 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                                     widget.channelUnreadCounts,
                                                 voiceParticipantsByChannel: widget
                                                     .voiceParticipantsByChannel,
+                                                activeVoiceChannelId: widget
+                                                    .activeVoiceChannel
+                                                    ?.id,
+                                                activeVoiceController: widget
+                                                    .activeVoiceController,
                                                 onStartDirectMessage:
                                                     widget.onStartDirectMessage,
                                                 canManageChannels:
@@ -3990,6 +4008,11 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                                     widget.channelUnreadCounts,
                                                 voiceParticipantsByChannel: widget
                                                     .voiceParticipantsByChannel,
+                                                activeVoiceChannelId: widget
+                                                    .activeVoiceChannel
+                                                    ?.id,
+                                                activeVoiceController: widget
+                                                    .activeVoiceController,
                                                 onStartDirectMessage:
                                                     widget.onStartDirectMessage,
                                                 canManageChannels:
@@ -4060,6 +4083,8 @@ class _CategorySection extends StatelessWidget {
     required this.selectedChannelId,
     required this.channelUnreadCounts,
     required this.voiceParticipantsByChannel,
+    required this.activeVoiceChannelId,
+    required this.activeVoiceController,
     required this.onStartDirectMessage,
     required this.canManageChannels,
     required this.showDropSlots,
@@ -4076,6 +4101,8 @@ class _CategorySection extends StatelessWidget {
   final String? selectedChannelId;
   final Map<String, int> channelUnreadCounts;
   final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
+  final String? activeVoiceChannelId;
+  final VoiceChannelSessionController? activeVoiceController;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4132,6 +4159,8 @@ class _CategorySection extends StatelessWidget {
             selectedChannelId: selectedChannelId,
             channelUnreadCounts: channelUnreadCounts,
             voiceParticipantsByChannel: voiceParticipantsByChannel,
+            activeVoiceChannelId: activeVoiceChannelId,
+            activeVoiceController: activeVoiceController,
             onStartDirectMessage: onStartDirectMessage,
             canManageChannels: canManageChannels,
             showDropSlots: showDropSlots,
@@ -4234,6 +4263,8 @@ class _ChannelList extends StatelessWidget {
     required this.selectedChannelId,
     required this.channelUnreadCounts,
     required this.voiceParticipantsByChannel,
+    required this.activeVoiceChannelId,
+    required this.activeVoiceController,
     required this.onStartDirectMessage,
     required this.canManageChannels,
     required this.showDropSlots,
@@ -4248,6 +4279,8 @@ class _ChannelList extends StatelessWidget {
   final String? selectedChannelId;
   final Map<String, int> channelUnreadCounts;
   final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
+  final String? activeVoiceChannelId;
+  final VoiceChannelSessionController? activeVoiceController;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4312,6 +4345,9 @@ class _ChannelList extends StatelessWidget {
               voiceParticipants:
                   voiceParticipantsByChannel[channels[index].id] ??
                   const <VoiceParticipant>[],
+              activeVoiceController: activeVoiceController,
+              showVoiceVolumeControls:
+                  channels[index].id == activeVoiceChannelId,
               onStartDirectMessage: onStartDirectMessage,
               onTap: () => onSelectChannel(channels[index]),
               draggable: canManageChannels,
@@ -4339,6 +4375,8 @@ class _ChannelTile extends StatelessWidget {
     required this.selected,
     required this.unreadCount,
     required this.voiceParticipants,
+    required this.activeVoiceController,
+    required this.showVoiceVolumeControls,
     required this.onStartDirectMessage,
     required this.onTap,
     required this.onDragStarted,
@@ -4350,6 +4388,8 @@ class _ChannelTile extends StatelessWidget {
   final bool selected;
   final int unreadCount;
   final List<VoiceParticipant> voiceParticipants;
+  final VoiceChannelSessionController? activeVoiceController;
+  final bool showVoiceVolumeControls;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4419,6 +4459,9 @@ class _ChannelTile extends StatelessWidget {
                                         context,
                                         details.globalPosition,
                                         participant,
+                                        activeVoiceController,
+                                        showVoiceVolumeControls:
+                                            showVoiceVolumeControls,
                                       ),
                                     );
                                   },
@@ -4541,7 +4584,15 @@ class _ChannelTile extends StatelessWidget {
     BuildContext context,
     Offset position,
     VoiceParticipant participant,
-  ) async {
+    VoiceChannelSessionController? activeVoiceController, {
+    required bool showVoiceVolumeControls,
+  }) async {
+    final voiceController = activeVoiceController;
+    final canChangeVolume =
+        showVoiceVolumeControls &&
+        voiceController != null &&
+        voiceController.joined &&
+        !participant.isSelf;
     final selection = await showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
@@ -4550,15 +4601,95 @@ class _ChannelTile extends StatelessWidget {
         position.dx,
         position.dy,
       ),
-      items: const [
-        PopupMenuItem<String>(value: 'dm', child: Text('Send direct message')),
+      items: [
+        const PopupMenuItem<String>(
+          value: 'dm',
+          child: Text('Send direct message'),
+        ),
+        if (canChangeVolume) ...[
+          PopupMenuItem<String>(
+            value:
+                voiceController.isParticipantMutedLocally(participant.clientId)
+                ? 'unmute_local'
+                : 'mute_local',
+            child: Text(
+              voiceController.isParticipantMutedLocally(participant.clientId)
+                  ? 'Unmute locally'
+                  : 'Mute locally',
+            ),
+          ),
+          const PopupMenuDivider(),
+          const PopupMenuItem<String>(
+            value: 'volume_25',
+            child: Text('Volume 25%'),
+          ),
+          const PopupMenuItem<String>(
+            value: 'volume_50',
+            child: Text('Volume 50%'),
+          ),
+          const PopupMenuItem<String>(
+            value: 'volume_100',
+            child: Text('Volume 100%'),
+          ),
+          const PopupMenuItem<String>(
+            value: 'volume_150',
+            child: Text('Volume 150%'),
+          ),
+          const PopupMenuItem<String>(
+            value: 'volume_200',
+            child: Text('Volume 200%'),
+          ),
+        ],
       ],
     );
-    if (selection == 'dm') {
-      await onStartDirectMessage(
-        userId: participant.userId,
-        displayName: participant.displayName,
-      );
+    if (selection == null) {
+      return;
+    }
+    switch (selection) {
+      case 'dm':
+        await onStartDirectMessage(
+          userId: participant.userId,
+          displayName: participant.displayName,
+        );
+        break;
+      case 'mute_local':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(participant.clientId, 0);
+        }
+        break;
+      case 'unmute_local':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(participant.clientId, 1);
+        }
+        break;
+      case 'volume_25':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(
+            participant.clientId,
+            0.25,
+          );
+        }
+        break;
+      case 'volume_50':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(participant.clientId, 0.5);
+        }
+        break;
+      case 'volume_100':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(participant.clientId, 1);
+        }
+        break;
+      case 'volume_150':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(participant.clientId, 1.5);
+        }
+        break;
+      case 'volume_200':
+        if (voiceController != null) {
+          await voiceController.setParticipantVolume(participant.clientId, 2);
+        }
+        break;
     }
   }
 }
@@ -7112,25 +7243,34 @@ class _LegacyVoiceChannelView extends StatelessWidget {
             ],
           ),
         );
+        break;
       case 'mute_local':
         await voiceController.setParticipantVolume(participant.clientId, 0);
+        break;
       case 'unmute_local':
         await voiceController.setParticipantVolume(participant.clientId, 1);
+        break;
       case 'volume_25':
         await voiceController.setParticipantVolume(participant.clientId, 0.25);
+        break;
       case 'volume_50':
         await voiceController.setParticipantVolume(participant.clientId, 0.5);
+        break;
       case 'volume_100':
         await voiceController.setParticipantVolume(participant.clientId, 1);
+        break;
       case 'volume_150':
         await voiceController.setParticipantVolume(participant.clientId, 1.5);
+        break;
       case 'volume_200':
         await voiceController.setParticipantVolume(participant.clientId, 2);
+        break;
       case 'kick':
         await repository.removeMemberFromServer(
           serverId: channel.serverId,
           userId: participant.userId,
         );
+        break;
     }
   }
 
@@ -7336,9 +7476,11 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                           child: _MediaTile(
                             title:
                                 '${peer.participant.displayName} • ${(voiceController.participantVolume(peer.participant.clientId) * 100).round()}%',
-                            child: peer.hasMedia
+                            child: peer.hasScreen || peer.hasCamera
                                 ? RTCVideoView(
-                                    peer.renderer,
+                                    peer.hasScreen
+                                        ? peer.screenRenderer
+                                        : peer.cameraRenderer,
                                     objectFit: RTCVideoViewObjectFit
                                         .RTCVideoViewObjectFitCover,
                                   )
@@ -7436,8 +7578,6 @@ class VoiceChannelView extends StatefulWidget {
 }
 
 class _VoiceChannelViewState extends State<VoiceChannelView> {
-  String? _focusedParticipantClientId;
-
   Future<void> _openFullscreen(BuildContext context) async {
     final voiceController = widget.controller;
     if (voiceController == null) {
@@ -7487,37 +7627,6 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
             value: 'dm',
             child: Text('Send direct message'),
           ),
-        PopupMenuItem<String>(
-          value: voiceController.isParticipantMutedLocally(participant.clientId)
-              ? 'unmute_local'
-              : 'mute_local',
-          child: Text(
-            voiceController.isParticipantMutedLocally(participant.clientId)
-                ? 'Unmute locally'
-                : 'Mute locally',
-          ),
-        ),
-        const PopupMenuDivider(),
-        const PopupMenuItem<String>(
-          value: 'volume_25',
-          child: Text('Volume 25%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_50',
-          child: Text('Volume 50%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_100',
-          child: Text('Volume 100%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_150',
-          child: Text('Volume 150%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_200',
-          child: Text('Volume 200%'),
-        ),
         if (widget.canManageServer && !participant.isSelf) ...[
           const PopupMenuDivider(),
           const PopupMenuItem<String>(
@@ -7555,31 +7664,121 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
             ],
           ),
         );
+        break;
       case 'dm':
         await widget.onStartDirectMessage(
           userId: participant.userId,
           displayName: participant.displayName,
         );
-      case 'mute_local':
-        await voiceController.setParticipantVolume(participant.clientId, 0);
-      case 'unmute_local':
-        await voiceController.setParticipantVolume(participant.clientId, 1);
-      case 'volume_25':
-        await voiceController.setParticipantVolume(participant.clientId, 0.25);
-      case 'volume_50':
-        await voiceController.setParticipantVolume(participant.clientId, 0.5);
-      case 'volume_100':
-        await voiceController.setParticipantVolume(participant.clientId, 1);
-      case 'volume_150':
-        await voiceController.setParticipantVolume(participant.clientId, 1.5);
-      case 'volume_200':
-        await voiceController.setParticipantVolume(participant.clientId, 2);
+        break;
       case 'kick':
         await widget.repository.removeMemberFromServer(
           serverId: widget.channel.serverId,
           userId: participant.userId,
         );
+        break;
     }
+  }
+
+  List<_ParticipantStageModel> _participantTilesFor(
+    VoiceChannelSessionController voiceController,
+    VoiceParticipant? selfParticipant,
+  ) {
+    final tiles = <_ParticipantStageModel>[
+      _ParticipantStageModel(
+        tileId: '${voiceController.clientId}:base',
+        title: selfParticipant == null
+            ? 'You'
+            : '${selfParticipant.displayName} (you)',
+        subtitle: voiceController.hasLocalCameraPreview
+            ? 'Camera live'
+            : 'Audio only',
+        renderer: voiceController.hasLocalCameraPreview
+            ? voiceController.localCameraRenderer
+            : null,
+        hasVideo: voiceController.hasLocalCameraPreview,
+        shareKind: voiceController.hasLocalCameraPreview
+            ? ShareKind.camera
+            : ShareKind.audio,
+        isMuted: voiceController.muted,
+        participant: selfParticipant,
+        isSelf: true,
+        isSpeaking: selfParticipant?.isSpeaking ?? false,
+      ),
+      if (voiceController.hasLocalScreenPreview)
+        _ParticipantStageModel(
+          tileId: '${voiceController.clientId}:screen',
+          title: 'Your screen',
+          subtitle: 'Screen sharing',
+          renderer: voiceController.localScreenRenderer,
+          hasVideo: true,
+          shareKind: ShareKind.screen,
+          isMuted: voiceController.muted,
+          participant: selfParticipant,
+          isSelf: true,
+          isSpeaking: selfParticipant?.isSpeaking ?? false,
+          isScreenTile: true,
+        ),
+    ];
+
+    for (final peer in voiceController.remotePeers) {
+      final participant = peer.participant;
+      tiles.add(
+        _ParticipantStageModel(
+          tileId: '${participant.clientId}:base',
+          title: participant.displayName,
+          subtitle: peer.hasCamera ? 'Camera live' : 'Audio only',
+          renderer: peer.hasCamera ? peer.cameraRenderer : null,
+          hasVideo: peer.hasCamera,
+          shareKind: peer.hasCamera ? ShareKind.camera : ShareKind.audio,
+          isMuted: participant.isMuted,
+          participant: participant,
+          isSelf: false,
+          isSpeaking: participant.isSpeaking,
+        ),
+      );
+      if (peer.hasScreen) {
+        tiles.add(
+          _ParticipantStageModel(
+            tileId: '${participant.clientId}:screen',
+            title: "${participant.displayName}'s screen",
+            subtitle: 'Screen sharing',
+            renderer: peer.screenRenderer,
+            hasVideo: true,
+            shareKind: ShareKind.screen,
+            isMuted: participant.isMuted,
+            participant: participant,
+            isSelf: false,
+            isSpeaking: participant.isSpeaking,
+            isScreenTile: true,
+            streamVolume: voiceController.screenShareVolume(
+              participant.clientId,
+            ),
+            onStreamVolumeChanged: (value) {
+              unawaited(
+                voiceController.setScreenShareVolume(
+                  participant.clientId,
+                  value,
+                ),
+              );
+            },
+            onToggleStreamMute: () {
+              final current = voiceController.screenShareVolume(
+                participant.clientId,
+              );
+              unawaited(
+                voiceController.setScreenShareVolume(
+                  participant.clientId,
+                  current == 0 ? 1 : 0,
+                ),
+              );
+            },
+          ),
+        );
+      }
+    }
+
+    return tiles;
   }
 
   @override
@@ -7599,53 +7798,10 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
         final selfParticipant = voiceController.participants
             .where((participant) => participant.isSelf)
             .firstOrNull;
-        final participantTiles = <_ParticipantStageModel>[
-          _ParticipantStageModel(
-            clientId: voiceController.clientId,
-            title: selfParticipant == null
-                ? 'You'
-                : '${selfParticipant.displayName} (you)',
-            subtitle: voiceController.shareKind == ShareKind.audio
-                ? 'Audio only'
-                : voiceController.shareKind == ShareKind.camera
-                ? 'Camera live'
-                : 'Screen sharing',
-            renderer: voiceController.hasLocalPreview
-                ? voiceController.localRenderer
-                : null,
-            hasVideo: voiceController.hasLocalPreview,
-            shareKind: voiceController.shareKind,
-            isMuted: voiceController.muted,
-            participant: selfParticipant,
-            isSelf: true,
-            volume: null,
-            isSpeaking: selfParticipant?.isSpeaking ?? false,
-          ),
-          ...voiceController.remotePeers.map(
-            (peer) => _ParticipantStageModel(
-              clientId: peer.participant.clientId,
-              title: peer.participant.displayName,
-              subtitle: peer.participant.shareKind == ShareKind.audio
-                  ? 'Audio only'
-                  : peer.participant.shareKind == ShareKind.camera
-                  ? 'Camera live'
-                  : 'Screen sharing',
-              renderer: peer.hasMedia ? peer.renderer : null,
-              hasVideo: peer.hasMedia,
-              shareKind: peer.participant.shareKind,
-              isMuted: peer.participant.isMuted,
-              participant: peer.participant,
-              isSelf: false,
-              volume: voiceController.participantVolume(
-                peer.participant.clientId,
-              ),
-              isSpeaking: peer.participant.isSpeaking,
-            ),
-          ),
-        ];
-        final focusedTile = participantTiles
-            .where((tile) => tile.clientId == _focusedParticipantClientId)
-            .firstOrNull;
+        final participantTiles = _participantTilesFor(
+          voiceController,
+          selfParticipant,
+        );
         final joinedInThisChannel =
             widget.activeChannelId == widget.channel.id &&
             voiceController.joined;
@@ -7657,178 +7813,112 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
             border: Border.all(color: palette.border),
           ),
           child: Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            padding: const EdgeInsets.all(14),
+            child: Stack(
               children: [
-                Row(
-                  children: [
-                    Text(
-                      'Voice: ${widget.channel.name}',
-                      style: const TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const Spacer(),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                if (!joinedInThisChannel)
-                  FilledButton.tonalIcon(
-                    onPressed: widget.canJoinVoice && !voiceController.busy
-                        ? widget.onJoinCall
-                        : null,
-                    icon: voiceController.busy
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.call),
-                    label: Text(
-                      voiceController.busy ? 'Connecting...' : 'Join call',
-                    ),
-                  )
-                else
-                  Wrap(
-                    spacing: 10,
-                    runSpacing: 10,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      Chip(label: Text(voiceController.status)),
-                      Text(
-                        'Call controls live in the channel dock.',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ],
-                  ),
-                const SizedBox(height: 18),
-                if (!widget.canJoinVoice)
-                  const Padding(
-                    padding: EdgeInsets.only(bottom: 16),
-                    child: Text(
-                      'Your current role does not have permission to join voice channels in this server.',
-                    ),
-                  ),
-                Expanded(
-                  child: Stack(
-                    children: [
-                      Positioned.fill(
-                        child: !joinedInThisChannel
-                            ? const _EmptyState(
-                                title: 'Voice ready',
-                                message:
-                                    'Join the call to show the live participant stage.',
-                              )
-                            : focusedTile == null
-                            ? _ParticipantGrid(
-                                participants: participantTiles,
-                                onVolumeChangedParticipant:
-                                    (participant, value) {
-                                      final remoteParticipant =
-                                          participant.participant;
-                                      if (participant.isSelf ||
-                                          remoteParticipant == null) {
-                                        return;
-                                      }
-                                      unawaited(
-                                        voiceController.setParticipantVolume(
-                                          remoteParticipant.clientId,
-                                          value,
-                                        ),
-                                      );
-                                    },
-                                onTapParticipant: (participant) {
-                                  setState(() {
-                                    _focusedParticipantClientId =
-                                        participant.clientId;
-                                  });
-                                },
-                                onSecondaryTapParticipant:
-                                    (participant, details) {
-                                      if (participant.participant == null) {
-                                        return;
-                                      }
-                                      unawaited(
-                                        _showParticipantMenu(
-                                          context,
-                                          details.globalPosition,
-                                          voiceController,
-                                          participant.participant!,
-                                        ),
-                                      );
-                                    },
-                              )
-                            : _FocusedParticipantLayout(
-                                focused: focusedTile,
-                                others: participantTiles
-                                    .where(
-                                      (participant) =>
-                                          participant.clientId !=
-                                          focusedTile.clientId,
-                                    )
-                                    .toList(),
-                                onClearFocus: () {
-                                  setState(() {
-                                    _focusedParticipantClientId = null;
-                                  });
-                                },
-                                onVolumeChangedParticipant:
-                                    (participant, value) {
-                                      final remoteParticipant =
-                                          participant.participant;
-                                      if (participant.isSelf ||
-                                          remoteParticipant == null) {
-                                        return;
-                                      }
-                                      unawaited(
-                                        voiceController.setParticipantVolume(
-                                          remoteParticipant.clientId,
-                                          value,
-                                        ),
-                                      );
-                                    },
-                                onTapParticipant: (participant) {
-                                  setState(() {
-                                    _focusedParticipantClientId =
-                                        participant.clientId;
-                                  });
-                                },
-                                onSecondaryTapParticipant:
-                                    (participant, details) {
-                                      if (participant.participant == null) {
-                                        return;
-                                      }
-                                      unawaited(
-                                        _showParticipantMenu(
-                                          context,
-                                          details.globalPosition,
-                                          voiceController,
-                                          participant.participant!,
-                                        ),
-                                      );
-                                    },
+                Positioned.fill(
+                  child: !widget.canJoinVoice
+                      ? const _EmptyState(
+                          title: 'Voice unavailable',
+                          message:
+                              'Your current role does not have permission to join voice channels in this server.',
+                        )
+                      : !joinedInThisChannel
+                      ? Center(
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 380),
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: palette.panelStrong,
+                                borderRadius: BorderRadius.circular(26),
+                                border: Border.all(color: palette.border),
                               ),
-                      ),
-                      if (joinedInThisChannel)
-                        Positioned(
-                          right: 16,
-                          bottom: 16,
-                          child: IconButton.filledTonal(
-                            onPressed: widget.fullscreenMode
-                                ? () => Navigator.of(context).pop()
-                                : () => _openFullscreen(context),
-                            icon: Icon(
-                              widget.fullscreenMode
-                                  ? Icons.fullscreen_exit
-                                  : Icons.fullscreen,
+                              child: Padding(
+                                padding: const EdgeInsets.all(24),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(Icons.call, size: 36),
+                                    const SizedBox(height: 14),
+                                    Text(
+                                      'Ready to join ${widget.channel.name}',
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 10),
+                                    Text(
+                                      'Call controls stay in the channel dock. Join when you want the stage to go live.',
+                                      textAlign: TextAlign.center,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.bodyMedium,
+                                    ),
+                                    const SizedBox(height: 18),
+                                    FilledButton.tonalIcon(
+                                      onPressed: !voiceController.busy
+                                          ? widget.onJoinCall
+                                          : null,
+                                      icon: voiceController.busy
+                                          ? const SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(Icons.call),
+                                      label: Text(
+                                        voiceController.busy
+                                            ? 'Connecting...'
+                                            : 'Join call',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
                           ),
+                        )
+                      : participantTiles.isEmpty
+                      ? const _EmptyState(
+                          title: 'Voice ready',
+                          message: 'No one is visible in the call yet.',
+                        )
+                      : _ParticipantGrid(
+                          participants: participantTiles,
+                          onSecondaryTapParticipant: (participant, details) {
+                            if (participant.participant == null) {
+                              return;
+                            }
+                            unawaited(
+                              _showParticipantMenu(
+                                context,
+                                details.globalPosition,
+                                voiceController,
+                                participant.participant!,
+                              ),
+                            );
+                          },
                         ),
-                    ],
-                  ),
                 ),
+                if (joinedInThisChannel)
+                  Positioned(
+                    right: 10,
+                    bottom: 10,
+                    child: IconButton.filledTonal(
+                      onPressed: widget.fullscreenMode
+                          ? () => Navigator.of(context).pop()
+                          : () => _openFullscreen(context),
+                      icon: Icon(
+                        widget.fullscreenMode
+                            ? Icons.fullscreen_exit
+                            : Icons.fullscreen,
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -7840,7 +7930,7 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
 
 class _ParticipantStageModel {
   const _ParticipantStageModel({
-    required this.clientId,
+    required this.tileId,
     required this.title,
     required this.subtitle,
     required this.renderer,
@@ -7849,11 +7939,14 @@ class _ParticipantStageModel {
     required this.isMuted,
     required this.participant,
     required this.isSelf,
-    required this.volume,
     required this.isSpeaking,
+    this.isScreenTile = false,
+    this.streamVolume,
+    this.onStreamVolumeChanged,
+    this.onToggleStreamMute,
   });
 
-  final String clientId;
+  final String tileId;
   final String title;
   final String subtitle;
   final RTCVideoRenderer? renderer;
@@ -7862,22 +7955,20 @@ class _ParticipantStageModel {
   final bool isMuted;
   final VoiceParticipant? participant;
   final bool isSelf;
-  final double? volume;
   final bool isSpeaking;
+  final bool isScreenTile;
+  final double? streamVolume;
+  final ValueChanged<double>? onStreamVolumeChanged;
+  final VoidCallback? onToggleStreamMute;
 }
 
 class _ParticipantGrid extends StatelessWidget {
   const _ParticipantGrid({
     required this.participants,
-    required this.onVolumeChangedParticipant,
-    required this.onTapParticipant,
     required this.onSecondaryTapParticipant,
   });
 
   final List<_ParticipantStageModel> participants;
-  final void Function(_ParticipantStageModel participant, double value)
-  onVolumeChangedParticipant;
-  final ValueChanged<_ParticipantStageModel> onTapParticipant;
   final void Function(
     _ParticipantStageModel participant,
     TapDownDetails details,
@@ -7886,143 +7977,116 @@ class _ParticipantGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final count = participants.length;
-    final crossAxisCount = count <= 1
-        ? 1
-        : count == 2
-        ? 2
-        : count <= 4
-        ? 2
-        : 3;
+    const spacing = 12.0;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final crossAxisCount = _bestCrossAxisCount(
+          itemCount: participants.length,
+          maxWidth: constraints.maxWidth,
+          maxHeight: constraints.maxHeight,
+          spacing: spacing,
+        );
+        final rowCount = (participants.length / crossAxisCount).ceil();
+        final tileWidth =
+            (constraints.maxWidth - spacing * (crossAxisCount - 1)) /
+            crossAxisCount;
+        final tileHeight =
+            (constraints.maxHeight - spacing * (rowCount - 1)) / rowCount;
 
-    return GridView.builder(
-      itemCount: participants.length,
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: crossAxisCount,
-        crossAxisSpacing: 16,
-        mainAxisSpacing: 16,
-        childAspectRatio: count == 1 ? 1.9 : 1.32,
-      ),
-      itemBuilder: (context, index) {
-        final participant = participants[index];
-        return _ParticipantStageTile(
-          participant: participant,
-          onVolumeChanged: (value) =>
-              onVolumeChangedParticipant(participant, value),
-          onTap: () => onTapParticipant(participant),
-          onSecondaryTapDown: (details) =>
-              onSecondaryTapParticipant(participant, details),
+        return GridView.builder(
+          physics: const NeverScrollableScrollPhysics(),
+          padding: EdgeInsets.zero,
+          itemCount: participants.length,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            crossAxisSpacing: spacing,
+            mainAxisSpacing: spacing,
+            childAspectRatio: tileWidth / tileHeight,
+          ),
+          itemBuilder: (context, index) {
+            final participant = participants[index];
+            return _ParticipantStageTile(
+              key: ValueKey<String>(participant.tileId),
+              participant: participant,
+              onSecondaryTapDown: (details) =>
+                  onSecondaryTapParticipant(participant, details),
+            );
+          },
         );
       },
     );
   }
-}
 
-class _FocusedParticipantLayout extends StatelessWidget {
-  const _FocusedParticipantLayout({
-    required this.focused,
-    required this.others,
-    required this.onClearFocus,
-    required this.onVolumeChangedParticipant,
-    required this.onTapParticipant,
-    required this.onSecondaryTapParticipant,
-  });
+  int _bestCrossAxisCount({
+    required int itemCount,
+    required double maxWidth,
+    required double maxHeight,
+    required double spacing,
+  }) {
+    if (itemCount <= 1) {
+      return 1;
+    }
 
-  final _ParticipantStageModel focused;
-  final List<_ParticipantStageModel> others;
-  final VoidCallback onClearFocus;
-  final void Function(_ParticipantStageModel participant, double value)
-  onVolumeChangedParticipant;
-  final ValueChanged<_ParticipantStageModel> onTapParticipant;
-  final void Function(
-    _ParticipantStageModel participant,
-    TapDownDetails details,
-  )
-  onSecondaryTapParticipant;
+    var bestCount = 1;
+    var bestScore = double.negativeInfinity;
+    for (var candidate = 1; candidate <= itemCount; candidate++) {
+      final rowCount = (itemCount / candidate).ceil();
+      final tileWidth = (maxWidth - spacing * (candidate - 1)) / candidate;
+      final tileHeight = (maxHeight - spacing * (rowCount - 1)) / rowCount;
+      if (tileWidth <= 0 || tileHeight <= 0) {
+        continue;
+      }
 
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Expanded(
-          child: _ParticipantStageTile(
-            participant: focused,
-            onVolumeChanged: (value) =>
-                onVolumeChangedParticipant(focused, value),
-            onTap: onClearFocus,
-            onSecondaryTapDown: (details) =>
-                onSecondaryTapParticipant(focused, details),
-          ),
-        ),
-        if (others.isNotEmpty) ...[
-          const SizedBox(height: 16),
-          SizedBox(
-            height: 136,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: others.length,
-              separatorBuilder: (context, index) => const SizedBox(width: 12),
-              itemBuilder: (context, index) {
-                final participant = others[index];
-                return SizedBox(
-                  width: 220,
-                  child: _ParticipantStageTile(
-                    participant: participant,
-                    compact: true,
-                    onVolumeChanged: (value) =>
-                        onVolumeChangedParticipant(participant, value),
-                    onTap: () => onTapParticipant(participant),
-                    onSecondaryTapDown: (details) =>
-                        onSecondaryTapParticipant(participant, details),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ],
-    );
+      final areaScore = tileWidth * tileHeight;
+      final ratioScore = 1 - ((tileWidth / tileHeight) - 1.2).abs();
+      final score = areaScore + ratioScore * 10000;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCount = candidate;
+      }
+    }
+    return bestCount;
   }
 }
 
 class _ParticipantStageTile extends StatelessWidget {
   const _ParticipantStageTile({
+    super.key,
     required this.participant,
-    required this.onVolumeChanged,
-    required this.onTap,
     required this.onSecondaryTapDown,
-    this.compact = false,
   });
 
   final _ParticipantStageModel participant;
-  final ValueChanged<double> onVolumeChanged;
-  final VoidCallback onTap;
   final GestureTapDownCallback onSecondaryTapDown;
-  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
-    final statusIcon = participant.isMuted
-        ? Icons.mic_off
-        : participant.shareKind == ShareKind.screen
+    final showStreamControls =
+        participant.isScreenTile &&
+        !participant.isSelf &&
+        participant.streamVolume != null &&
+        participant.onStreamVolumeChanged != null &&
+        participant.onToggleStreamMute != null;
+    final statusIcon = participant.isScreenTile
         ? Icons.screen_share
+        : participant.isMuted
+        ? Icons.mic_off
         : participant.shareKind == ShareKind.camera
         ? Icons.videocam
         : Icons.mic;
 
     return GestureDetector(
-      onTap: onTap,
       onSecondaryTapDown: onSecondaryTapDown,
       child: Container(
         decoration: BoxDecoration(
           color: palette.panelStrong,
-          borderRadius: BorderRadius.circular(compact ? 18 : 24),
+          borderRadius: BorderRadius.circular(24),
           border: Border.all(
             color: participant.isSpeaking
                 ? Theme.of(context).colorScheme.secondary
                 : palette.border,
-            width: participant.isSpeaking ? 2.4 : 1,
+            width: 2.4,
           ),
           boxShadow: participant.isSpeaking
               ? [
@@ -8036,79 +8100,88 @@ class _ParticipantStageTile extends StatelessWidget {
                 ]
               : const [],
         ),
-        child: Column(
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          fit: StackFit.expand,
           children: [
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                margin: const EdgeInsets.fromLTRB(10, 10, 10, 0),
-                color: Colors.black,
-                child: participant.hasVideo && participant.renderer != null
-                    ? Center(
-                        child: RTCVideoView(
-                          participant.renderer!,
-                          objectFit: RTCVideoViewObjectFit
-                              .RTCVideoViewObjectFitContain,
-                        ),
-                      )
-                    : DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: palette.heroGradient,
-                        ),
-                        child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(statusIcon, size: compact ? 28 : 48),
-                              const SizedBox(height: 12),
-                              Text(
-                                participant.shareKind == ShareKind.audio
-                                    ? 'Audio only'
-                                    : participant.shareKind == ShareKind.camera
-                                    ? 'Camera unavailable'
-                                    : 'Screen share loading',
-                              ),
-                            ],
-                          ),
-                        ),
+            const ColoredBox(color: Colors.black),
+            if (participant.hasVideo && participant.renderer != null)
+              RTCVideoView(
+                participant.renderer!,
+                objectFit: participant.isScreenTile
+                    ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
+                    : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              )
+            else
+              DecoratedBox(
+                decoration: BoxDecoration(gradient: palette.heroGradient),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(statusIcon, size: 44),
+                      const SizedBox(height: 12),
+                      Text(
+                        participant.isScreenTile
+                            ? 'Screen share live'
+                            : participant.shareKind == ShareKind.camera
+                            ? 'Camera unavailable'
+                            : 'Audio only',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
                       ),
-              ),
-            ),
-            Container(
-              width: double.infinity,
-              padding: EdgeInsets.fromLTRB(14, compact ? 10 : 12, 14, 12),
-              decoration: BoxDecoration(
-                color: palette.panel,
-                borderRadius: BorderRadius.only(
-                  bottomLeft: Radius.circular(compact ? 18 : 24),
-                  bottomRight: Radius.circular(compact ? 18 : 24),
+                    ],
+                  ),
                 ),
               ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.black.withAlpha(0),
+                      Colors.black.withAlpha(210),
+                    ],
+                  ),
+                ),
+                child: Padding(
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    28,
+                    showStreamControls ? 88 : 16,
+                    16,
+                  ),
+                  child: Row(
                     children: [
-                      Icon(statusIcon, size: 16),
+                      Icon(statusIcon, size: 16, color: Colors.white),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
                           mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
                               participant.title,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
+                                color: Colors.white,
                                 fontWeight: FontWeight.w700,
                               ),
                             ),
+                            const SizedBox(height: 2),
                             Text(
                               participant.subtitle,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.bodySmall,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
                             ),
                           ],
                         ),
@@ -8123,49 +8196,90 @@ class _ParticipantStageTile extends StatelessWidget {
                       ],
                     ],
                   ),
-                  if (!participant.isSelf && participant.volume != null) ...[
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Icon(
-                          participant.volume == 0
-                              ? Icons.volume_off
-                              : Icons.volume_up,
-                          size: 16,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              trackHeight: compact ? 2.5 : 3.5,
-                              thumbShape: RoundSliderThumbShape(
-                                enabledThumbRadius: compact ? 6 : 7,
-                              ),
-                              overlayShape: SliderComponentShape.noOverlay,
-                            ),
-                            child: Slider(
-                              min: 0,
-                              max: 2.0,
-                              divisions: 8,
-                              value: participant.volume!
-                                  .clamp(0.0, 2.0)
-                                  .toDouble(),
-                              onChanged: onVolumeChanged,
-                            ),
-                          ),
-                        ),
-                        SizedBox(
-                          width: 46,
-                          child: Text(
-                            '${(participant.volume! * 100).round()}%',
-                            textAlign: TextAlign.right,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ),
-                      ],
+                ),
+              ),
+            ),
+            if (showStreamControls)
+              Positioned(
+                right: 16,
+                bottom: 16,
+                child: _StageStreamVolumeControl(
+                  volume: participant.streamVolume!,
+                  onChanged: participant.onStreamVolumeChanged!,
+                  onToggleMute: participant.onToggleStreamMute!,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StageStreamVolumeControl extends StatelessWidget {
+  const _StageStreamVolumeControl({
+    required this.volume,
+    required this.onChanged,
+    required this.onToggleMute,
+  });
+
+  final double volume;
+  final ValueChanged<double> onChanged;
+  final VoidCallback onToggleMute;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final muted = volume == 0;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withAlpha(168),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: Colors.white.withAlpha(28)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(6, 8, 6, 10),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              onPressed: onToggleMute,
+              tooltip: muted ? 'Unmute stream' : 'Mute stream',
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              padding: EdgeInsets.zero,
+              icon: Icon(
+                muted ? Icons.volume_off : Icons.volume_up,
+                size: 18,
+                color: Colors.white,
+              ),
+            ),
+            SizedBox(
+              height: 124,
+              child: RotatedBox(
+                quarterTurns: 3,
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 4,
+                    thumbColor: colorScheme.secondary,
+                    activeTrackColor: Colors.white,
+                    inactiveTrackColor: Colors.white24,
+                    overlayShape: SliderComponentShape.noOverlay,
+                    thumbShape: const RoundSliderThumbShape(
+                      enabledThumbRadius: 7,
                     ),
-                  ],
-                ],
+                  ),
+                  child: SizedBox(
+                    width: 124,
+                    child: Slider(
+                      value: volume.clamp(0.0, 2.0),
+                      min: 0,
+                      max: 2,
+                      divisions: 8,
+                      onChanged: onChanged,
+                    ),
+                  ),
+                ),
               ),
             ),
           ],
@@ -8490,6 +8604,13 @@ class _CreateServerDialogResult {
   final bool isPublic;
 }
 
+class _ServerDiscoveryResult {
+  const _ServerDiscoveryResult({required this.serverId, this.joinedServer});
+
+  final String serverId;
+  final ServerSummary? joinedServer;
+}
+
 class _StartDirectMessageDialog extends StatefulWidget {
   const _StartDirectMessageDialog({required this.members});
 
@@ -8795,15 +8916,22 @@ class _ServerDiscoveryDialogState extends State<_ServerDiscoveryDialog> {
   Future<void> _handleServerAction(DiscoverableServerSummary server) async {
     try {
       if (server.isMember) {
-        Navigator.of(context).pop(server.id);
+        Navigator.of(context).pop(_ServerDiscoveryResult(serverId: server.id));
         return;
       }
       if (server.isPublic) {
-        await widget.repository.joinPublicServer(server.id);
+        final joinedServer = await widget.repository.joinPublicServer(
+          server.id,
+        );
         if (!mounted) {
           return;
         }
-        Navigator.of(context).pop(server.id);
+        Navigator.of(context).pop(
+          _ServerDiscoveryResult(
+            serverId: server.id,
+            joinedServer: joinedServer,
+          ),
+        );
         return;
       }
       await widget.repository.requestServerJoin(server.id);

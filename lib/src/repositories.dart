@@ -426,7 +426,7 @@ class WorkspaceRepository {
     final normalizedExtension = cleanExtension.isEmpty
         ? 'png'
         : cleanExtension.replaceAll('.', '');
-    final path = '$serverId/avatar.$normalizedExtension';
+    final path = '$serverId/avatar-${_uuid.v4()}.$normalizedExtension';
 
     await client.storage
         .from('server-assets')
@@ -454,7 +454,8 @@ class WorkspaceRepository {
     final normalizedExtension = cleanExtension.isEmpty
         ? 'png'
         : cleanExtension.replaceAll('.', '');
-    final path = '${authService.userId}/avatar.$normalizedExtension';
+    final path =
+        '${authService.userId}/avatar-${_uuid.v4()}.$normalizedExtension';
 
     await client.storage
         .from(_profileAvatarBucket)
@@ -965,10 +966,23 @@ class WorkspaceRepository {
       'create_or_get_direct_conversation',
       params: <String, dynamic>{'other_user_id_input': otherUserId},
     );
-    if (response is String && response.isNotEmpty) {
-      return response;
+    if (response is String && response.trim().isNotEmpty) {
+      return response.trim();
     }
-    throw StateError('Unable to create a direct conversation.');
+    if (response is Map && response.isNotEmpty) {
+      final firstValue = response.values.first;
+      final normalized = firstValue?.toString().trim() ?? '';
+      if (normalized.isNotEmpty && normalized.toLowerCase() != 'null') {
+        return normalized;
+      }
+    }
+    final normalized = response?.toString().trim() ?? '';
+    if (normalized.isNotEmpty && normalized.toLowerCase() != 'null') {
+      return normalized;
+    }
+    throw StateError(
+      'Unable to create a direct conversation. RPC returned: $response',
+    );
   }
 
   Future<List<DirectConversationSummary>>

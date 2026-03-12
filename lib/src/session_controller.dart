@@ -101,14 +101,23 @@ class ScreenShareService {
 }
 
 class VoiceRemotePeer {
-  VoiceRemotePeer({required this.participant, required this.renderer});
+  VoiceRemotePeer({
+    required this.participant,
+    required this.cameraRenderer,
+    required this.screenRenderer,
+  });
 
   VoiceParticipant participant;
-  final RTCVideoRenderer renderer;
-  MediaStream? remoteStream;
-  bool hasVisual = false;
+  final RTCVideoRenderer cameraRenderer;
+  final RTCVideoRenderer screenRenderer;
+  MediaStream? cameraStream;
+  MediaStream? screenStream;
+  MediaStream? screenRenderStream;
 
-  bool get hasMedia => hasVisual && renderer.srcObject != null;
+  bool get hasCamera =>
+      cameraStream != null && cameraRenderer.srcObject != null;
+  bool get hasScreen =>
+      screenStream != null && screenRenderer.srcObject != null;
 }
 
 class VoiceChannelSessionController extends ChangeNotifier {
@@ -132,9 +141,11 @@ class VoiceChannelSessionController extends ChangeNotifier {
   final UiSoundEffects soundEffects;
   final String clientId;
 
-  final RTCVideoRenderer localRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer localCameraRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer localScreenRenderer = RTCVideoRenderer();
   final Map<String, VoiceRemotePeer> _peerStates = <String, VoiceRemotePeer>{};
   final Map<String, double> _participantVolumes = <String, double>{};
+  final Map<String, double> _screenShareVolumes = <String, double>{};
 
   RealtimeChannel? _presenceChannel;
   lk.Room? _room;
@@ -153,6 +164,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   List<VoiceParticipant> _participants = const <VoiceParticipant>[];
   List<VoiceParticipant> _presenceParticipants = const <VoiceParticipant>[];
+  MediaStream? _localScreenRenderStream;
 
   bool get joined => _joined;
   bool get busy => _busy;
@@ -160,7 +172,22 @@ class VoiceChannelSessionController extends ChangeNotifier {
   bool get deafened => _deafened;
   ShareKind get shareKind => _shareKind;
   String get status => _status;
-  bool get hasLocalPreview => localRenderer.srcObject != null;
+  RTCVideoRenderer get localRenderer => localCameraRenderer;
+  bool get hasLocalPreview => localCameraRenderer.srcObject != null;
+  bool get hasLocalCameraPreview => localCameraRenderer.srcObject != null;
+  bool get hasLocalScreenPreview => localScreenRenderer.srcObject != null;
+  bool get isCameraSharing =>
+      _activeVisualPublication(
+        _room?.localParticipant,
+        lk.TrackSource.camera,
+      ) !=
+      null;
+  bool get isScreenSharing =>
+      _activeVisualPublication(
+        _room?.localParticipant,
+        lk.TrackSource.screenShareVideo,
+      ) !=
+      null;
   List<VoiceParticipant> get participants =>
       List<VoiceParticipant>.unmodifiable(_participants);
   List<VoiceParticipant> get presenceParticipants =>
@@ -186,7 +213,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
       return;
     }
     _initialized = true;
-    await localRenderer.initialize();
+    await localCameraRenderer.initialize();
+    await localScreenRenderer.initialize();
   }
 
   Future<void> join() async {
@@ -254,11 +282,15 @@ class VoiceChannelSessionController extends ChangeNotifier {
     await _detachRoom();
     await _disposeRemotePeers();
 
-    localRenderer.srcObject = null;
+    if (_localScreenRenderStream != null) {
+      await _localScreenRenderStream!.dispose();
+      _localScreenRenderStream = null;
+    }
+    localCameraRenderer.srcObject = null;
+    localScreenRenderer.srcObject = null;
     _shareKind = ShareKind.audio;
     _muted = false;
     _deafened = false;
-    _participantVolumes.clear();
 
     if (wasJoined) {
       await soundEffects.play(
@@ -284,16 +316,16 @@ class VoiceChannelSessionController extends ChangeNotifier {
       if (localParticipant == null) {
         throw StateError('LiveKit room is not connected.');
       }
-      await localParticipant.setScreenShareEnabled(false);
       await localParticipant.setCameraEnabled(
         true,
         cameraCaptureOptions: _cameraCaptureOptions(),
       );
-      _shareKind = ShareKind.camera;
       await _syncLocalPreview();
-      await _trackPresence();
       await _syncRoomState();
-      _status = 'Camera live in voice channel.';
+      await _trackPresence();
+      _status = isScreenSharing
+          ? 'Camera and screen share live.'
+          : 'Camera live in voice channel.';
     } catch (error) {
       _status = 'Unable to start camera: $error';
     } finally {
@@ -328,10 +360,9 @@ class VoiceChannelSessionController extends ChangeNotifier {
         height: maxHeight,
         frameRate: frameRate,
       );
-      await localParticipant.setCameraEnabled(false);
       await localParticipant.setScreenShareEnabled(
         true,
-        captureScreenAudio: captureSystemAudio,
+        captureScreenAudio: true,
         screenShareCaptureOptions: lk.ScreenShareCaptureOptions(
           sourceId: source.id,
           maxFrameRate: frameRate.toDouble(),
@@ -342,12 +373,12 @@ class VoiceChannelSessionController extends ChangeNotifier {
           ),
         ),
       );
-      _shareKind = ShareKind.screen;
       await _syncLocalPreview();
-      await _trackPresence();
       await _syncRoomState();
-      _status =
-          'Screen share live at ${maxHeight}p/${frameRate}fps${captureSystemAudio ? ' with audio' : ''}.';
+      await _trackPresence();
+      _status = isCameraSharing
+          ? 'Camera and screen share live with audio.'
+          : 'Screen share live at ${maxHeight}p/${frameRate}fps with audio.';
     } catch (error) {
       _status = 'Unable to start screen share: $error';
     } finally {
@@ -356,13 +387,13 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
   }
 
-  Future<void> stopVisualShare() async {
-    if (!_joined || _busy || _shareKind == ShareKind.audio) {
+  Future<void> stopCameraShare() async {
+    if (!_joined || _busy || !isCameraSharing) {
       return;
     }
 
     _busy = true;
-    _status = 'Stopping visual share...';
+    _status = 'Stopping camera...';
     _safeNotifyListeners();
 
     try {
@@ -371,15 +402,51 @@ class VoiceChannelSessionController extends ChangeNotifier {
         throw StateError('LiveKit room is not connected.');
       }
       await localParticipant.setCameraEnabled(false);
-      await localParticipant.setScreenShareEnabled(false);
-      _shareKind = ShareKind.audio;
       await _syncLocalPreview();
-      await _trackPresence();
       await _syncRoomState();
-      _status = 'Voice-only mode active.';
+      await _trackPresence();
+      _status = isScreenSharing
+          ? 'Screen share still live.'
+          : 'Voice-only mode active.';
     } finally {
       _busy = false;
       _safeNotifyListeners();
+    }
+  }
+
+  Future<void> stopScreenShare() async {
+    if (!_joined || _busy || !isScreenSharing) {
+      return;
+    }
+
+    _busy = true;
+    _status = 'Stopping screen share...';
+    _safeNotifyListeners();
+
+    try {
+      final localParticipant = _room?.localParticipant;
+      if (localParticipant == null) {
+        throw StateError('LiveKit room is not connected.');
+      }
+      await localParticipant.setScreenShareEnabled(false);
+      await _syncLocalPreview();
+      await _syncRoomState();
+      await _trackPresence();
+      _status = isCameraSharing
+          ? 'Camera still live.'
+          : 'Voice-only mode active.';
+    } finally {
+      _busy = false;
+      _safeNotifyListeners();
+    }
+  }
+
+  Future<void> stopVisualShare() async {
+    if (isScreenSharing) {
+      await stopScreenShare();
+    }
+    if (isCameraSharing) {
+      await stopCameraShare();
     }
   }
 
@@ -388,7 +455,21 @@ class VoiceChannelSessionController extends ChangeNotifier {
   }
 
   double participantVolume(String participantClientId) {
-    return _participantVolumes[participantClientId] ?? 1;
+    final participantUserId = _participantUserId(participantClientId);
+    if (participantUserId == null || participantUserId.isEmpty) {
+      return _participantVolumes[participantClientId] ?? 1;
+    }
+    return _participantVolumes[participantUserId] ??
+        preferences.speakerVolumeForUser(participantUserId);
+  }
+
+  double screenShareVolume(String participantClientId) {
+    final participantUserId = _participantUserId(participantClientId);
+    if (participantUserId == null || participantUserId.isEmpty) {
+      return _screenShareVolumes[participantClientId] ?? 1;
+    }
+    return _screenShareVolumes[participantUserId] ??
+        preferences.screenShareVolumeForUser(participantUserId);
   }
 
   bool isParticipantSpeaking(String participantClientId) {
@@ -408,6 +489,32 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   bool isParticipantMutedLocally(String participantClientId) {
     return participantVolume(participantClientId) == 0;
+  }
+
+  String? _participantUserId(String participantClientId) {
+    if (participantClientId == clientId) {
+      return authService.userId;
+    }
+    final participant = _participants.firstWhere(
+      (item) => item.clientId == participantClientId,
+      orElse: () => const VoiceParticipant(
+        clientId: '',
+        userId: '',
+        displayName: '',
+        isSelf: false,
+        isMuted: true,
+        shareKind: ShareKind.audio,
+      ),
+    );
+    if (participant.userId.isNotEmpty) {
+      return participant.userId;
+    }
+    final peer = _peerStates[participantClientId];
+    final peerUserId = peer?.participant.userId;
+    if (peerUserId != null && peerUserId.isNotEmpty) {
+      return peerUserId;
+    }
+    return null;
   }
 
   Future<void> toggleMute() async {
@@ -459,9 +566,37 @@ class VoiceChannelSessionController extends ChangeNotifier {
     double volume,
   ) async {
     final normalized = volume.clamp(0.0, 2.0).toDouble();
-    _participantVolumes[participantClientId] = normalized;
+    final participantUserId = _participantUserId(participantClientId);
+    if (participantUserId == null || participantUserId.isEmpty) {
+      _participantVolumes[participantClientId] = normalized;
+    } else {
+      _participantVolumes[participantUserId] = normalized;
+      await preferences.setSpeakerVolumeForUser(participantUserId, normalized);
+    }
     final peer = _peerStates[participantClientId];
     if (peer != null) {
+      await _applyPeerRendererVolume(peer);
+    }
+    _safeNotifyListeners();
+  }
+
+  Future<void> setScreenShareVolume(
+    String participantClientId,
+    double volume,
+  ) async {
+    final normalized = volume.clamp(0.0, 2.0).toDouble();
+    final participantUserId = _participantUserId(participantClientId);
+    if (participantUserId == null || participantUserId.isEmpty) {
+      _screenShareVolumes[participantClientId] = normalized;
+    } else {
+      _screenShareVolumes[participantUserId] = normalized;
+      await preferences.setScreenShareVolumeForUser(
+        participantUserId,
+        normalized,
+      );
+    }
+    final peer = _peerStates[participantClientId];
+    if (peer != null && peer.screenRenderer.srcObject != null) {
       await _applyPeerRendererVolume(peer);
     }
     _safeNotifyListeners();
@@ -473,7 +608,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
     await leave();
     _disposed = true;
-    await localRenderer.dispose();
+    await localCameraRenderer.dispose();
+    await localScreenRenderer.dispose();
     super.dispose();
   }
 
@@ -675,8 +811,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
         if (userId == null || userId.isEmpty) {
           continue;
         }
-        final displayName =
-            payload['display_name'] as String? ?? 'Anonymous';
+        final displayName = payload['display_name'] as String? ?? 'Anonymous';
         final shareKind = _shareKindFromName(
           payload['share_kind'] as String? ?? ShareKind.audio.name,
         );
@@ -824,7 +959,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
     if (room == null) {
       _participants = const <VoiceParticipant>[];
       await _disposeRemotePeers();
-      localRenderer.srcObject = null;
+      localCameraRenderer.srcObject = null;
+      localScreenRenderer.srcObject = null;
       _safeNotifyListeners();
       return;
     }
@@ -846,9 +982,9 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     final remoteParticipants = room.remoteParticipants.values.toList()
       ..sort(
-        (left, right) => _displayNameForParticipant(left).toLowerCase().compareTo(
-          _displayNameForParticipant(right).toLowerCase(),
-        ),
+        (left, right) => _displayNameForParticipant(left)
+            .toLowerCase()
+            .compareTo(_displayNameForParticipant(right).toLowerCase()),
       );
     final activeRemoteIds = <String>{};
     for (final remoteParticipant in remoteParticipants) {
@@ -864,7 +1000,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
 
     final stalePeerIds = _peerStates.keys
-        .where((participantClientId) => !activeRemoteIds.contains(participantClientId))
+        .where(
+          (participantClientId) =>
+              !activeRemoteIds.contains(participantClientId),
+        )
         .toList();
     for (final peerId in stalePeerIds) {
       final peer = _peerStates.remove(peerId);
@@ -884,11 +1023,40 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   Future<void> _syncLocalPreview() async {
     final localParticipant = _room?.localParticipant;
-    final localTrack =
-        _preferredVideoTrack(localParticipant) ?? _preferredVisualTrack(localParticipant);
-    final stream = localTrack?.mediaStream;
-    if (!identical(localRenderer.srcObject, stream)) {
-      localRenderer.srcObject = stream;
+    final cameraTrack = _activeVisualPublication(
+      localParticipant,
+      lk.TrackSource.camera,
+    )?.track;
+    final screenTrack = _activeVisualPublication(
+      localParticipant,
+      lk.TrackSource.screenShareVideo,
+    )?.track;
+    final screenAudioTrack = _activeVisualPublication(
+      localParticipant,
+      lk.TrackSource.screenShareAudio,
+    )?.track;
+    final cameraStream = cameraTrack?.mediaStream;
+    final screenStream = screenTrack?.mediaStream;
+    final screenRenderStream = await _screenRenderStream(
+      videoTrack: screenTrack,
+      audioTrack: screenAudioTrack,
+      previousCompositeStream: _localScreenRenderStream,
+      label: 'local-screen-preview',
+    );
+    if (!identical(screenRenderStream, screenStream)) {
+      if (_localScreenRenderStream != null &&
+          !identical(_localScreenRenderStream, screenRenderStream)) {
+        await _localScreenRenderStream!.dispose();
+      }
+      _localScreenRenderStream = identical(screenRenderStream, screenStream)
+          ? null
+          : screenRenderStream;
+    }
+    if (!identical(localCameraRenderer.srcObject, cameraStream)) {
+      localCameraRenderer.srcObject = cameraStream;
+    }
+    if (!identical(localScreenRenderer.srcObject, screenRenderStream)) {
+      localScreenRenderer.srcObject = screenRenderStream;
     }
   }
 
@@ -900,9 +1068,15 @@ class VoiceChannelSessionController extends ChangeNotifier {
       return existing;
     }
 
-    final renderer = RTCVideoRenderer();
-    await renderer.initialize();
-    final peer = VoiceRemotePeer(participant: participant, renderer: renderer);
+    final cameraRenderer = RTCVideoRenderer();
+    final screenRenderer = RTCVideoRenderer();
+    await cameraRenderer.initialize();
+    await screenRenderer.initialize();
+    final peer = VoiceRemotePeer(
+      participant: participant,
+      cameraRenderer: cameraRenderer,
+      screenRenderer: screenRenderer,
+    );
     _peerStates[participant.clientId] = peer;
     return peer;
   }
@@ -911,30 +1085,74 @@ class VoiceChannelSessionController extends ChangeNotifier {
     VoiceRemotePeer peer,
     lk.RemoteParticipant participant,
   ) async {
-    final track = _preferredVisualTrack(participant);
-    final stream = track?.mediaStream;
-    peer.remoteStream = stream;
-    peer.hasVisual = track != null && stream != null;
-    if (!identical(peer.renderer.srcObject, stream)) {
-      peer.renderer.srcObject = stream;
+    final cameraTrack = _activeVisualPublication(
+      participant,
+      lk.TrackSource.camera,
+    )?.track;
+    final screenTrack = _activeVisualPublication(
+      participant,
+      lk.TrackSource.screenShareVideo,
+    )?.track;
+    final screenAudioTrack = _activeVisualPublication(
+      participant,
+      lk.TrackSource.screenShareAudio,
+    )?.track;
+    final cameraStream = cameraTrack?.mediaStream;
+    final screenStream = screenTrack?.mediaStream;
+    final screenRenderStream = await _screenRenderStream(
+      videoTrack: screenTrack,
+      audioTrack: screenAudioTrack,
+      previousCompositeStream: peer.screenRenderStream,
+      label:
+          'remote-screen-${participant.sid.isNotEmpty ? participant.sid : participant.identity}',
+    );
+    peer.cameraStream = cameraStream;
+    peer.screenStream = screenRenderStream;
+    if (!identical(peer.screenRenderStream, screenRenderStream)) {
+      if (peer.screenRenderStream != null &&
+          !identical(peer.screenRenderStream, screenRenderStream) &&
+          !identical(peer.screenRenderStream, screenStream)) {
+        await peer.screenRenderStream!.dispose();
+      }
+      peer.screenRenderStream = identical(screenRenderStream, screenStream)
+          ? null
+          : screenRenderStream;
+    }
+    if (!identical(peer.cameraRenderer.srcObject, cameraStream)) {
+      peer.cameraRenderer.srcObject = cameraStream;
+    }
+    if (!identical(peer.screenRenderer.srcObject, screenRenderStream)) {
+      peer.screenRenderer.srcObject = screenRenderStream;
     }
     await _applyPeerRendererVolume(peer);
   }
 
   Future<void> _applyPeerRendererVolume(VoiceRemotePeer peer) async {
-    if (peer.renderer.srcObject == null) {
-      return;
+    final targetVolume = _deafened
+        ? 0.0
+        : participantVolume(peer.participant.clientId);
+    final screenTargetVolume = _deafened
+        ? 0.0
+        : screenShareVolume(peer.participant.clientId);
+    if (peer.cameraRenderer.srcObject != null) {
+      await peer.cameraRenderer.setVolume(targetVolume);
     }
-    await peer.renderer.setVolume(
-      _deafened ? 0.0 : participantVolume(peer.participant.clientId),
-    );
+    if (peer.screenRenderer.srcObject != null) {
+      await peer.screenRenderer.setVolume(screenTargetVolume);
+    }
   }
 
   Future<void> _disposePeer(VoiceRemotePeer peer) async {
-    peer.remoteStream = null;
-    peer.hasVisual = false;
-    peer.renderer.srcObject = null;
-    await peer.renderer.dispose();
+    peer.cameraStream = null;
+    peer.screenStream = null;
+    if (peer.screenRenderStream != null) {
+      await peer.screenRenderStream!.dispose();
+      peer.screenRenderStream = null;
+    }
+    peer.cameraRenderer.srcObject = null;
+    peer.screenRenderer.srcObject = null;
+    await peer.cameraRenderer.dispose();
+    await peer.screenRenderer.dispose();
   }
 
   Future<void> _disposeRemotePeers() async {
@@ -953,10 +1171,14 @@ class VoiceChannelSessionController extends ChangeNotifier {
     final displayName = _displayNameForParticipant(participant);
     final userId =
         metadata?['user_id'] as String? ??
-        (participant.identity.isNotEmpty ? participant.identity : participant.sid);
+        (participant.identity.isNotEmpty
+            ? participant.identity
+            : participant.sid);
 
     return VoiceParticipant(
-      clientId: participant.sid.isNotEmpty ? participant.sid : participant.identity,
+      clientId: participant.sid.isNotEmpty
+          ? participant.sid
+          : participant.identity,
       userId: userId,
       displayName: displayName,
       isSelf: isSelf,
@@ -968,7 +1190,10 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   ShareKind _shareKindForParticipant(lk.Participant participant) {
     final hasScreen =
-        _activeVisualPublication(participant, lk.TrackSource.screenShareVideo) !=
+        _activeVisualPublication(
+          participant,
+          lk.TrackSource.screenShareVideo,
+        ) !=
         null;
     if (hasScreen) {
       return ShareKind.screen;
@@ -994,26 +1219,51 @@ class VoiceChannelSessionController extends ChangeNotifier {
     }
   }
 
-  lk.Track? _preferredVisualTrack(lk.Participant? participant) {
-    if (participant == null) {
+  Future<MediaStream?> _screenRenderStream({
+    required lk.Track? videoTrack,
+    required lk.Track? audioTrack,
+    required MediaStream? previousCompositeStream,
+    required String label,
+  }) async {
+    final baseStream = videoTrack?.mediaStream;
+    if (videoTrack == null || baseStream == null) {
       return null;
     }
-    return _activeVisualPublication(
-          participant,
-          lk.TrackSource.screenShareVideo,
-        )?.track ??
-        _activeVisualPublication(participant, lk.TrackSource.camera)?.track;
-  }
 
-  lk.LocalVideoTrack? _preferredVideoTrack(lk.LocalParticipant? participant) {
-    final track = _preferredVisualTrack(participant);
-    return track is lk.LocalVideoTrack ? track : null;
+    final baseAudioTracks = baseStream.getAudioTracks();
+    if (audioTrack == null ||
+        identical(audioTrack.mediaStream, baseStream) ||
+        baseAudioTracks.any(
+          (track) => track.id == audioTrack.mediaStreamTrack.id,
+        )) {
+      return baseStream;
+    }
+
+    if (previousCompositeStream != null) {
+      final sameVideo = previousCompositeStream.getVideoTracks().any(
+        (track) => track.id == videoTrack.mediaStreamTrack.id,
+      );
+      final sameAudio = previousCompositeStream.getAudioTracks().any(
+        (track) => track.id == audioTrack.mediaStreamTrack.id,
+      );
+      if (sameVideo && sameAudio) {
+        return previousCompositeStream;
+      }
+    }
+
+    final compositeStream = await createLocalMediaStream(label);
+    await compositeStream.addTrack(videoTrack.mediaStreamTrack);
+    await compositeStream.addTrack(audioTrack.mediaStreamTrack);
+    return compositeStream;
   }
 
   lk.TrackPublication<lk.Track>? _activeVisualPublication(
-    lk.Participant participant,
+    lk.Participant? participant,
     lk.TrackSource source,
   ) {
+    if (participant == null) {
+      return null;
+    }
     final publication = participant.getTrackPublicationBySource(source);
     if (publication == null || publication.track == null || publication.muted) {
       return null;
@@ -1038,13 +1288,24 @@ class VoiceChannelSessionController extends ChangeNotifier {
     lk.TrackPublication<lk.Track> publication,
   ) async {
     if (publication.source == lk.TrackSource.camera ||
-        publication.source == lk.TrackSource.screenShareVideo) {
-      final peer = _peerStates[
-          participant.sid.isNotEmpty ? participant.sid : participant.identity];
+        publication.source == lk.TrackSource.screenShareVideo ||
+        publication.source == lk.TrackSource.screenShareAudio) {
+      final peer =
+          _peerStates[participant.sid.isNotEmpty
+              ? participant.sid
+              : participant.identity];
       if (peer != null) {
-        peer.remoteStream = null;
-        peer.hasVisual = false;
-        peer.renderer.srcObject = null;
+        if (publication.source == lk.TrackSource.camera) {
+          peer.cameraStream = null;
+          peer.cameraRenderer.srcObject = null;
+        } else {
+          peer.screenStream = null;
+          if (peer.screenRenderStream != null) {
+            await peer.screenRenderStream!.dispose();
+            peer.screenRenderStream = null;
+          }
+          peer.screenRenderer.srcObject = null;
+        }
       }
     }
     await _syncRoomState();
