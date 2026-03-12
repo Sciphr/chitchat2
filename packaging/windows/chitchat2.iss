@@ -26,6 +26,8 @@ DisableProgramGroupPage=yes
 OutputDir={#MyAppOutputDir}
 OutputBaseFilename=ChitChat-Setup-{#MyAppVersion}
 SetupIconFile=..\..\windows\runner\resources\app_icon.ico
+WizardImageFile=installer_wizard.bmp
+WizardSmallImageFile=installer_wizard_small.bmp
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -34,19 +36,18 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\{#MyAppExeName}
+CloseApplications=yes
+ForceCloseApplications=yes
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
 Source: "{#MyAppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent

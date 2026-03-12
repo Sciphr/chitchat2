@@ -61,7 +61,11 @@ class _ChatAppState extends State<ChatApp> {
       SystemMouseCursors.click,
     );
     return AnimatedBuilder(
-      animation: Listenable.merge([_preferences, _updateController]),
+      animation: Listenable.merge([
+        _preferences,
+        _updateController,
+        desktopFullscreenPresentationListenable,
+      ]),
       builder: (context, _) {
         final colorScheme = colorSchemeForTheme(_preferences.themeScheme);
         final palette = paletteForTheme(_preferences.themeScheme);
@@ -134,6 +138,7 @@ class _ChatAppState extends State<ChatApp> {
             return _DesktopWindowFrame(
               appVersion: _updateController.currentVersion,
               updateController: _updateController,
+              immersiveMode: desktopFullscreenPresentationActive,
               child: content,
             );
           },
@@ -553,15 +558,20 @@ class _DesktopWindowFrame extends StatelessWidget {
   const _DesktopWindowFrame({
     required this.child,
     required this.updateController,
+    required this.immersiveMode,
     this.appVersion,
   });
 
   final Widget child;
   final AppUpdateController updateController;
+  final bool immersiveMode;
   final String? appVersion;
 
   @override
   Widget build(BuildContext context) {
+    if (immersiveMode) {
+      return child;
+    }
     final palette = Theme.of(context).extension<AppThemePalette>()!;
     final titleBarHeight = appWindow.titleBarHeight;
     return WindowBorder(

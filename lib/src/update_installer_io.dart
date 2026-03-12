@@ -24,9 +24,53 @@ Future<void> installWindowsUpdateFromRelease({
   await sink.close();
   httpClient.close(force: true);
 
-  await Process.start(
-    targetFile.path,
-    const <String>[],
-    mode: ProcessStartMode.detached,
+  final helperScript = File(
+    '${targetFile.parent.path}\\chitchat_update_helper_${DateTime.now().microsecondsSinceEpoch}.ps1',
   );
+  final currentExecutable = Platform.resolvedExecutable;
+  final currentPid = pid;
+  await helperScript.writeAsString('''
+\$installerPath = ${_toPowerShellLiteral(targetFile.path)}
+\$appPath = ${_toPowerShellLiteral(currentExecutable)}
+\$targetPid = $currentPid
+\$arguments = @(
+  '/SP-',
+  '/VERYSILENT',
+  '/SUPPRESSMSGBOXES',
+  '/NOCANCEL',
+  '/NORESTART',
+  '/CLOSEAPPLICATIONS',
+  '/FORCECLOSEAPPLICATIONS',
+  '/MERGETASKS=!desktopicon'
+)
+
+while (Get-Process -Id \$targetPid -ErrorAction SilentlyContinue) {
+  Start-Sleep -Milliseconds 200
 }
+
+Start-Process -FilePath \$installerPath -ArgumentList \$arguments -Wait | Out-Null
+
+if (Test-Path -LiteralPath \$appPath) {
+  Start-Sleep -Milliseconds 400
+  Start-Process -FilePath \$appPath | Out-Null
+}
+
+Remove-Item -LiteralPath \$installerPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath \$PSCommandPath -Force -ErrorAction SilentlyContinue
+''');
+
+  await Process.start('powershell.exe', <String>[
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-WindowStyle',
+    'Hidden',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    helperScript.path,
+  ], mode: ProcessStartMode.detached);
+  exit(0);
+}
+
+String _toPowerShellLiteral(String value) => "'${value.replaceAll("'", "''")}'";

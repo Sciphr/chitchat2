@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -9,6 +10,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_preferences.dart';
 import 'app_toast.dart';
+import 'desktop_integration.dart';
 import 'desktop_notifications.dart';
 import 'models.dart';
 import 'repositories.dart';
@@ -7443,7 +7445,7 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                     crossAxisCount: 2,
                     crossAxisSpacing: 16,
                     mainAxisSpacing: 16,
-                    childAspectRatio: 1.3,
+                    childAspectRatio: 16 / 9,
                     children: [
                       _MediaTile(
                         title: voiceController.shareKind == ShareKind.audio
@@ -7453,7 +7455,7 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                             ? RTCVideoView(
                                 voiceController.localRenderer,
                                 objectFit: RTCVideoViewObjectFit
-                                    .RTCVideoViewObjectFitCover,
+                                    .RTCVideoViewObjectFitContain,
                               )
                             : const Center(
                                 child: Text(
@@ -7482,7 +7484,7 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                                         ? peer.screenRenderer
                                         : peer.cameraRenderer,
                                     objectFit: RTCVideoViewObjectFit
-                                        .RTCVideoViewObjectFitCover,
+                                        .RTCVideoViewObjectFitContain,
                                   )
                                 : const Center(
                                     child: Text('Waiting for media...'),
@@ -7554,6 +7556,7 @@ class VoiceChannelView extends StatefulWidget {
     required this.onLeaveCall,
     required this.onStartDirectMessage,
     this.fullscreenMode = false,
+    this.initialShowcasedTileId,
   });
 
   final ChannelSummary channel;
@@ -7572,12 +7575,21 @@ class VoiceChannelView extends StatefulWidget {
   })
   onStartDirectMessage;
   final bool fullscreenMode;
+  final String? initialShowcasedTileId;
 
   @override
   State<VoiceChannelView> createState() => _VoiceChannelViewState();
 }
 
 class _VoiceChannelViewState extends State<VoiceChannelView> {
+  late String? _showcasedTileId;
+
+  @override
+  void initState() {
+    super.initState();
+    _showcasedTileId = widget.initialShowcasedTileId;
+  }
+
   Future<void> _openFullscreen(BuildContext context) async {
     final voiceController = widget.controller;
     if (voiceController == null) {
@@ -7598,6 +7610,7 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
           onJoinCall: widget.onJoinCall,
           onLeaveCall: widget.onLeaveCall,
           onStartDirectMessage: widget.onStartDirectMessage,
+          initialShowcasedTileId: _showcasedTileId,
         ),
       ),
     );
@@ -7802,6 +7815,23 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
           voiceController,
           selfParticipant,
         );
+        final effectiveShowcasedTileId =
+            participantTiles.length > 1 &&
+                participantTiles.any(
+                  (participant) => participant.tileId == _showcasedTileId,
+                )
+            ? _showcasedTileId
+            : null;
+        if (effectiveShowcasedTileId != _showcasedTileId) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) {
+              return;
+            }
+            setState(() {
+              _showcasedTileId = effectiveShowcasedTileId;
+            });
+          });
+        }
         final joinedInThisChannel =
             widget.activeChannelId == widget.channel.id &&
             voiceController.joined;
@@ -7810,10 +7840,12 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
           decoration: BoxDecoration(
             color: palette.panelMuted,
             borderRadius: BorderRadius.circular(widget.fullscreenMode ? 0 : 28),
-            border: Border.all(color: palette.border),
+            border: widget.fullscreenMode
+                ? null
+                : Border.all(color: palette.border),
           ),
           child: Padding(
-            padding: const EdgeInsets.all(14),
+            padding: EdgeInsets.all(widget.fullscreenMode ? 0 : 14),
             child: Stack(
               children: [
                 Positioned.fill(
@@ -7889,6 +7921,16 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                         )
                       : _ParticipantGrid(
                           participants: participantTiles,
+                          showcasedTileId: effectiveShowcasedTileId,
+                          fullscreenMode: widget.fullscreenMode,
+                          onShowcasedTileChanged: (tileId) {
+                            if (_showcasedTileId == tileId) {
+                              return;
+                            }
+                            setState(() {
+                              _showcasedTileId = tileId;
+                            });
+                          },
                           onSecondaryTapParticipant: (participant, details) {
                             if (participant.participant == null) {
                               return;
@@ -7906,8 +7948,9 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                 ),
                 if (joinedInThisChannel)
                   Positioned(
-                    right: 10,
-                    bottom: 10,
+                    right: widget.fullscreenMode ? 16 : 10,
+                    top: widget.fullscreenMode ? 16 : null,
+                    bottom: widget.fullscreenMode ? null : 10,
                     child: IconButton.filledTonal(
                       onPressed: widget.fullscreenMode
                           ? () => Navigator.of(context).pop()
@@ -7962,91 +8005,514 @@ class _ParticipantStageModel {
   final VoidCallback? onToggleStreamMute;
 }
 
-class _ParticipantGrid extends StatelessWidget {
+class _ParticipantGrid extends StatefulWidget {
   const _ParticipantGrid({
     required this.participants,
+    required this.showcasedTileId,
+    required this.onShowcasedTileChanged,
     required this.onSecondaryTapParticipant,
+    this.fullscreenMode = false,
   });
 
   final List<_ParticipantStageModel> participants;
+  final String? showcasedTileId;
+  final ValueChanged<String?> onShowcasedTileChanged;
   final void Function(
     _ParticipantStageModel participant,
     TapDownDetails details,
   )
   onSecondaryTapParticipant;
+  final bool fullscreenMode;
+
+  @override
+  State<_ParticipantGrid> createState() => _ParticipantGridState();
+}
+
+class _ParticipantGridState extends State<_ParticipantGrid> {
+  static const double _spacing = 12;
+  static const double _tileAspectRatio = 16 / 9;
+  static const double _thumbnailTargetWidth = 180;
+  static const double _fullscreenThumbnailTargetWidth = 132;
+
+  late bool _thumbnailDrawerExpanded;
+
+  @override
+  void initState() {
+    super.initState();
+    _thumbnailDrawerExpanded = !widget.fullscreenMode;
+  }
+
+  @override
+  void didUpdateWidget(covariant _ParticipantGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.fullscreenMode != oldWidget.fullscreenMode) {
+      _thumbnailDrawerExpanded = !widget.fullscreenMode;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    const spacing = 12.0;
     return LayoutBuilder(
       builder: (context, constraints) {
-        final crossAxisCount = _bestCrossAxisCount(
-          itemCount: participants.length,
-          maxWidth: constraints.maxWidth,
-          maxHeight: constraints.maxHeight,
-          spacing: spacing,
-        );
-        final rowCount = (participants.length / crossAxisCount).ceil();
-        final tileWidth =
-            (constraints.maxWidth - spacing * (crossAxisCount - 1)) /
-            crossAxisCount;
-        final tileHeight =
-            (constraints.maxHeight - spacing * (rowCount - 1)) / rowCount;
-
-        return GridView.builder(
-          physics: const NeverScrollableScrollPhysics(),
-          padding: EdgeInsets.zero,
-          itemCount: participants.length,
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: crossAxisCount,
-            crossAxisSpacing: spacing,
-            mainAxisSpacing: spacing,
-            childAspectRatio: tileWidth / tileHeight,
-          ),
-          itemBuilder: (context, index) {
-            final participant = participants[index];
-            return _ParticipantStageTile(
-              key: ValueKey<String>(participant.tileId),
-              participant: participant,
-              onSecondaryTapDown: (details) =>
-                  onSecondaryTapParticipant(participant, details),
-            );
-          },
-        );
+        final showcasedTileId = widget.showcasedTileId;
+        final showcasedParticipant = widget.participants
+            .where((participant) => participant.tileId == showcasedTileId)
+            .firstOrNull;
+        if (showcasedTileId != null &&
+            showcasedParticipant == null &&
+            widget.participants.length > 1) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              widget.onShowcasedTileChanged(null);
+            }
+          });
+        }
+        if (showcasedParticipant != null && widget.participants.length > 1) {
+          return _buildShowcaseLayout(
+            context,
+            constraints,
+            showcasedParticipant,
+          );
+        }
+        return _buildEvenLayout(context, constraints, widget.participants);
       },
     );
   }
 
-  int _bestCrossAxisCount({
+  Widget _buildShowcaseLayout(
+    BuildContext context,
+    BoxConstraints constraints,
+    _ParticipantStageModel showcasedParticipant,
+  ) {
+    final remainingParticipants = widget.participants
+        .where(
+          (participant) => participant.tileId != showcasedParticipant.tileId,
+        )
+        .toList();
+    if (widget.fullscreenMode) {
+      return _buildFullscreenShowcaseLayout(
+        context,
+        constraints,
+        showcasedParticipant,
+        remainingParticipants,
+      );
+    }
+
+    final minShowcaseHeight = math.min(240.0, constraints.maxHeight * 0.62);
+    final thumbnailBudget = remainingParticipants.isEmpty
+        ? 0.0
+        : math.max(
+            0.0,
+            math.min(
+              constraints.maxHeight - minShowcaseHeight - _spacing,
+              math.min(148.0, constraints.maxHeight * 0.2),
+            ),
+          );
+    final preferredThumbnailColumns = remainingParticipants.isEmpty
+        ? 1
+        : math.max(
+            1,
+            math.min(
+              remainingParticipants.length,
+              ((constraints.maxWidth + _spacing) /
+                      (_thumbnailTargetWidth + _spacing))
+                  .round(),
+            ),
+          );
+    final thumbnailLayout = remainingParticipants.isEmpty
+        ? null
+        : _bestLandscapeLayout(
+            itemCount: remainingParticipants.length,
+            maxWidth: constraints.maxWidth,
+            maxHeight: thumbnailBudget,
+            spacing: _spacing,
+            preferredColumns: preferredThumbnailColumns,
+          );
+    final thumbnailHeight = thumbnailLayout?.contentHeight ?? 0.0;
+    final showcaseHeight = math.max(
+      0.0,
+      constraints.maxHeight -
+          thumbnailHeight -
+          (remainingParticipants.isEmpty ? 0.0 : _spacing),
+    );
+    final showcaseWidth = math.min(
+      constraints.maxWidth,
+      showcaseHeight * _tileAspectRatio,
+    );
+
+    return Column(
+      children: [
+        Expanded(
+          child: Center(
+            child: SizedBox(
+              width: showcaseWidth,
+              child: AspectRatio(
+                aspectRatio: _tileAspectRatio,
+                child: _ParticipantStageTile(
+                  key: ValueKey<String>(showcasedParticipant.tileId),
+                  participant: showcasedParticipant,
+                  showcased: true,
+                  onTap: () => _handleParticipantTap(showcasedParticipant),
+                  onSecondaryTapDown: (details) => widget
+                      .onSecondaryTapParticipant(showcasedParticipant, details),
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (thumbnailLayout != null) ...[
+          const SizedBox(height: _spacing),
+          SizedBox(
+            height: thumbnailHeight,
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: SizedBox(
+                width: math.min(
+                  constraints.maxWidth,
+                  thumbnailLayout.contentWidth,
+                ),
+                child: Wrap(
+                  spacing: _spacing,
+                  runSpacing: _spacing,
+                  alignment: WrapAlignment.center,
+                  children: remainingParticipants
+                      .map(
+                        (participant) => SizedBox(
+                          width: thumbnailLayout.tileWidth,
+                          child: AspectRatio(
+                            aspectRatio: _tileAspectRatio,
+                            child: _ParticipantStageTile(
+                              key: ValueKey<String>(participant.tileId),
+                              participant: participant,
+                              compact: true,
+                              onTap: () => _handleParticipantTap(participant),
+                              onSecondaryTapDown: (details) =>
+                                  widget.onSecondaryTapParticipant(
+                                    participant,
+                                    details,
+                                  ),
+                            ),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildFullscreenShowcaseLayout(
+    BuildContext context,
+    BoxConstraints constraints,
+    _ParticipantStageModel showcasedParticipant,
+    List<_ParticipantStageModel> remainingParticipants,
+  ) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    const collapsedToggleHeight = 44.0;
+    final thumbnailBudget =
+        !_thumbnailDrawerExpanded || remainingParticipants.isEmpty
+        ? 0.0
+        : math.min(124.0, constraints.maxHeight * 0.14);
+    final preferredThumbnailColumns = remainingParticipants.isEmpty
+        ? 1
+        : math.max(
+            1,
+            math.min(
+              remainingParticipants.length,
+              ((constraints.maxWidth + _spacing) /
+                      (_fullscreenThumbnailTargetWidth + _spacing))
+                  .round(),
+            ),
+          );
+    final thumbnailLayout = remainingParticipants.isEmpty
+        ? null
+        : _bestLandscapeLayout(
+            itemCount: remainingParticipants.length,
+            maxWidth: math.max(0, constraints.maxWidth - 56),
+            maxHeight: thumbnailBudget,
+            spacing: _spacing,
+            preferredColumns: preferredThumbnailColumns,
+          );
+    final trayHeight = !_thumbnailDrawerExpanded || thumbnailLayout == null
+        ? 0.0
+        : thumbnailLayout.contentHeight + 58;
+    final reservedBottomSpace = remainingParticipants.isEmpty
+        ? 0.0
+        : _thumbnailDrawerExpanded
+        ? trayHeight + 16
+        : collapsedToggleHeight + 18;
+    final showcaseHeight = math.max(
+      0.0,
+      constraints.maxHeight - reservedBottomSpace,
+    );
+    final showcaseWidth = math.min(
+      constraints.maxWidth,
+      showcaseHeight * _tileAspectRatio,
+    );
+
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: Padding(
+            padding: EdgeInsets.only(bottom: reservedBottomSpace),
+            child: Center(
+              child: SizedBox(
+                width: showcaseWidth,
+                child: AspectRatio(
+                  aspectRatio: _tileAspectRatio,
+                  child: _ParticipantStageTile(
+                    key: ValueKey<String>(showcasedParticipant.tileId),
+                    participant: showcasedParticipant,
+                    showcased: true,
+                    onTap: () => _handleParticipantTap(showcasedParticipant),
+                    onSecondaryTapDown: (details) =>
+                        widget.onSecondaryTapParticipant(
+                          showcasedParticipant,
+                          details,
+                        ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (remainingParticipants.isNotEmpty)
+          Positioned(
+            left: 16,
+            right: 16,
+            bottom: 16,
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: _thumbnailDrawerExpanded && thumbnailLayout != null
+                      ? math.min(
+                          constraints.maxWidth - 32,
+                          thumbnailLayout.contentWidth + 28,
+                        )
+                      : 220,
+                ),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: palette.panelMuted.withAlpha(238),
+                    borderRadius: BorderRadius.circular(22),
+                    border: Border.all(color: palette.border),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withAlpha(72),
+                        blurRadius: 24,
+                        offset: const Offset(0, 10),
+                      ),
+                    ],
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextButton.icon(
+                          onPressed: _toggleThumbnailDrawer,
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          ),
+                          icon: Icon(
+                            _thumbnailDrawerExpanded
+                                ? Icons.keyboard_arrow_down
+                                : Icons.keyboard_arrow_up,
+                          ),
+                          label: Text(
+                            _thumbnailDrawerExpanded
+                                ? 'Hide participants'
+                                : 'Show participants',
+                          ),
+                        ),
+                        if (_thumbnailDrawerExpanded && thumbnailLayout != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: SizedBox(
+                              width: thumbnailLayout.contentWidth,
+                              child: Wrap(
+                                spacing: _spacing,
+                                runSpacing: _spacing,
+                                alignment: WrapAlignment.center,
+                                children: remainingParticipants
+                                    .map(
+                                      (participant) => SizedBox(
+                                        width: thumbnailLayout.tileWidth,
+                                        child: AspectRatio(
+                                          aspectRatio: _tileAspectRatio,
+                                          child: _ParticipantStageTile(
+                                            key: ValueKey<String>(
+                                              participant.tileId,
+                                            ),
+                                            participant: participant,
+                                            compact: true,
+                                            onTap: () => _handleParticipantTap(
+                                              participant,
+                                            ),
+                                            onSecondaryTapDown: (details) =>
+                                                widget
+                                                    .onSecondaryTapParticipant(
+                                                      participant,
+                                                      details,
+                                                    ),
+                                          ),
+                                        ),
+                                      ),
+                                    )
+                                    .toList(),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildEvenLayout(
+    BuildContext context,
+    BoxConstraints constraints,
+    List<_ParticipantStageModel> participants,
+  ) {
+    final layout = _bestLandscapeLayout(
+      itemCount: participants.length,
+      maxWidth: constraints.maxWidth,
+      maxHeight: constraints.maxHeight,
+      spacing: _spacing,
+    );
+    return Center(
+      child: SizedBox(
+        width: math.min(constraints.maxWidth, layout.contentWidth),
+        child: Wrap(
+          spacing: _spacing,
+          runSpacing: _spacing,
+          alignment: WrapAlignment.center,
+          runAlignment: WrapAlignment.center,
+          children: participants
+              .map(
+                (participant) => SizedBox(
+                  width: layout.tileWidth,
+                  child: AspectRatio(
+                    aspectRatio: _tileAspectRatio,
+                    child: _ParticipantStageTile(
+                      key: ValueKey<String>(participant.tileId),
+                      participant: participant,
+                      onTap: participants.length > 1
+                          ? () => _handleParticipantTap(participant)
+                          : null,
+                      onSecondaryTapDown: (details) => widget
+                          .onSecondaryTapParticipant(participant, details),
+                    ),
+                  ),
+                ),
+              )
+              .toList(),
+        ),
+      ),
+    );
+  }
+
+  _LandscapeWrapLayout _bestLandscapeLayout({
     required int itemCount,
     required double maxWidth,
     required double maxHeight,
     required double spacing,
+    int? preferredColumns,
   }) {
-    if (itemCount <= 1) {
-      return 1;
+    if (itemCount <= 0 || maxWidth <= 0 || maxHeight <= 0) {
+      return const _LandscapeWrapLayout(
+        tileWidth: 0,
+        tileHeight: 0,
+        contentWidth: 0,
+        contentHeight: 0,
+      );
     }
 
-    var bestCount = 1;
+    _LandscapeWrapLayout? bestLayout;
     var bestScore = double.negativeInfinity;
     for (var candidate = 1; candidate <= itemCount; candidate++) {
       final rowCount = (itemCount / candidate).ceil();
-      final tileWidth = (maxWidth - spacing * (candidate - 1)) / candidate;
-      final tileHeight = (maxHeight - spacing * (rowCount - 1)) / rowCount;
+      final widthPerTile = (maxWidth - spacing * (candidate - 1)) / candidate;
+      final heightPerTile = (maxHeight - spacing * (rowCount - 1)) / rowCount;
+      final tileWidth = math.min(
+        widthPerTile,
+        heightPerTile * _tileAspectRatio,
+      );
+      final tileHeight = tileWidth / _tileAspectRatio;
       if (tileWidth <= 0 || tileHeight <= 0) {
         continue;
       }
 
-      final areaScore = tileWidth * tileHeight;
-      final ratioScore = 1 - ((tileWidth / tileHeight) - 1.2).abs();
-      final score = areaScore + ratioScore * 10000;
+      final contentWidth = candidate * tileWidth + spacing * (candidate - 1);
+      final contentHeight = rowCount * tileHeight + spacing * (rowCount - 1);
+      final preferencePenalty = preferredColumns == null
+          ? 0.0
+          : (candidate - preferredColumns).abs() * 320.0;
+      final rowPenalty = (rowCount - 1) * 72.0;
+      final score = tileWidth * tileHeight - preferencePenalty - rowPenalty;
       if (score > bestScore) {
         bestScore = score;
-        bestCount = candidate;
+        bestLayout = _LandscapeWrapLayout(
+          tileWidth: tileWidth,
+          tileHeight: tileHeight,
+          contentWidth: contentWidth,
+          contentHeight: contentHeight,
+        );
       }
     }
-    return bestCount;
+
+    return bestLayout ??
+        const _LandscapeWrapLayout(
+          tileWidth: 0,
+          tileHeight: 0,
+          contentWidth: 0,
+          contentHeight: 0,
+        );
   }
+
+  void _handleParticipantTap(_ParticipantStageModel participant) {
+    if (widget.participants.length <= 1) {
+      return;
+    }
+    widget.onShowcasedTileChanged(
+      widget.showcasedTileId == participant.tileId ? null : participant.tileId,
+    );
+  }
+
+  void _toggleThumbnailDrawer() {
+    setState(() {
+      _thumbnailDrawerExpanded = !_thumbnailDrawerExpanded;
+    });
+  }
+}
+
+class _LandscapeWrapLayout {
+  const _LandscapeWrapLayout({
+    required this.tileWidth,
+    required this.tileHeight,
+    required this.contentWidth,
+    required this.contentHeight,
+  });
+
+  final double tileWidth;
+  final double tileHeight;
+  final double contentWidth;
+  final double contentHeight;
 }
 
 class _ParticipantStageTile extends StatelessWidget {
@@ -8054,10 +8520,16 @@ class _ParticipantStageTile extends StatelessWidget {
     super.key,
     required this.participant,
     required this.onSecondaryTapDown,
+    this.onTap,
+    this.compact = false,
+    this.showcased = false,
   });
 
   final _ParticipantStageModel participant;
   final GestureTapDownCallback onSecondaryTapDown;
+  final VoidCallback? onTap;
+  final bool compact;
+  final bool showcased;
 
   @override
   Widget build(BuildContext context) {
@@ -8065,6 +8537,7 @@ class _ParticipantStageTile extends StatelessWidget {
     final showStreamControls =
         participant.isScreenTile &&
         !participant.isSelf &&
+        !compact &&
         participant.streamVolume != null &&
         participant.onStreamVolumeChanged != null &&
         participant.onToggleStreamMute != null;
@@ -8076,140 +8549,155 @@ class _ParticipantStageTile extends StatelessWidget {
         ? Icons.videocam
         : Icons.mic;
 
-    return GestureDetector(
-      onSecondaryTapDown: onSecondaryTapDown,
-      child: Container(
-        decoration: BoxDecoration(
-          color: palette.panelStrong,
-          borderRadius: BorderRadius.circular(24),
-          border: Border.all(
-            color: participant.isSpeaking
-                ? Theme.of(context).colorScheme.secondary
-                : palette.border,
-            width: 2.4,
+    final borderColor = showcased
+        ? palette.borderStrong
+        : participant.isSpeaking
+        ? Theme.of(context).colorScheme.secondary
+        : palette.border;
+    final borderWidth = showcased ? 2.8 : 2.4;
+    final baseShadowColor = showcased
+        ? palette.borderStrong.withAlpha(68)
+        : Theme.of(context).colorScheme.secondary.withAlpha(70);
+
+    return MouseRegion(
+      cursor: onTap == null ? MouseCursor.defer : SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: onTap,
+        onSecondaryTapDown: onSecondaryTapDown,
+        child: Container(
+          decoration: BoxDecoration(
+            color: palette.panelStrong,
+            borderRadius: BorderRadius.circular(compact ? 20 : 24),
+            border: Border.all(color: borderColor, width: borderWidth),
+            boxShadow: showcased || participant.isSpeaking
+                ? [
+                    BoxShadow(
+                      color: baseShadowColor,
+                      blurRadius: showcased ? 22 : 18,
+                      spreadRadius: showcased ? 3 : 2,
+                    ),
+                  ]
+                : const [],
           ),
-          boxShadow: participant.isSpeaking
-              ? [
-                  BoxShadow(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.secondary.withAlpha(70),
-                    blurRadius: 18,
-                    spreadRadius: 2,
-                  ),
-                ]
-              : const [],
-        ),
-        clipBehavior: Clip.antiAlias,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            const ColoredBox(color: Colors.black),
-            if (participant.hasVideo && participant.renderer != null)
-              RTCVideoView(
-                participant.renderer!,
-                objectFit: participant.isScreenTile
-                    ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
-                    : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-              )
-            else
-              DecoratedBox(
-                decoration: BoxDecoration(gradient: palette.heroGradient),
-                child: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(statusIcon, size: 44),
-                      const SizedBox(height: 12),
-                      Text(
-                        participant.isScreenTile
-                            ? 'Screen share live'
-                            : participant.shareKind == ShareKind.camera
-                            ? 'Camera unavailable'
-                            : 'Audio only',
-                        style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.black.withAlpha(0),
-                      Colors.black.withAlpha(210),
-                    ],
-                  ),
-                ),
-                child: Padding(
-                  padding: EdgeInsets.fromLTRB(
-                    16,
-                    28,
-                    showStreamControls ? 88 : 16,
-                    16,
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(statusIcon, size: 16, color: Colors.white),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              participant.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              participant.subtitle,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      if (participant.isSpeaking) ...[
-                        const SizedBox(width: 8),
-                        Icon(
-                          Icons.mic,
-                          size: 16,
-                          color: Theme.of(context).colorScheme.secondary,
+          clipBehavior: Clip.antiAlias,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              const ColoredBox(color: Colors.black),
+              if (participant.hasVideo && participant.renderer != null)
+                RTCVideoView(
+                  participant.renderer!,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                )
+              else
+                DecoratedBox(
+                  decoration: BoxDecoration(gradient: palette.heroGradient),
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(statusIcon, size: compact ? 32 : 44),
+                        SizedBox(height: compact ? 8 : 12),
+                        Text(
+                          participant.isScreenTile
+                              ? 'Screen share live'
+                              : participant.shareKind == ShareKind.camera
+                              ? 'Camera unavailable'
+                              : 'Audio only',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: compact ? 12 : 14,
+                          ),
                         ),
                       ],
-                    ],
+                    ),
+                  ),
+                ),
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Colors.black.withAlpha(0),
+                        Colors.black.withAlpha(210),
+                      ],
+                    ),
+                  ),
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      compact ? 12 : 16,
+                      compact ? 18 : 28,
+                      showStreamControls ? 88 : (compact ? 12 : 16),
+                      compact ? 12 : 16,
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          statusIcon,
+                          size: compact ? 14 : 16,
+                          color: Colors.white,
+                        ),
+                        SizedBox(width: compact ? 6 : 8),
+                        Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                participant.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: compact ? 12 : 14,
+                                ),
+                              ),
+                              if (!compact) ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  participant.subtitle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                        if (participant.isSpeaking) ...[
+                          SizedBox(width: compact ? 6 : 8),
+                          Icon(
+                            Icons.mic,
+                            size: compact ? 14 : 16,
+                            color: Theme.of(context).colorScheme.secondary,
+                          ),
+                        ],
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
-            if (showStreamControls)
-              Positioned(
-                right: 16,
-                bottom: 16,
-                child: _StageStreamVolumeControl(
-                  volume: participant.streamVolume!,
-                  onChanged: participant.onStreamVolumeChanged!,
-                  onToggleMute: participant.onToggleStreamMute!,
+              if (showStreamControls)
+                Positioned(
+                  right: 16,
+                  bottom: 16,
+                  child: _StageStreamVolumeControl(
+                    volume: participant.streamVolume!,
+                    onChanged: participant.onStreamVolumeChanged!,
+                    onToggleMute: participant.onToggleStreamMute!,
+                  ),
                 ),
-              ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -9132,7 +9620,7 @@ class _ServerDiscoveryDialogState extends State<_ServerDiscoveryDialog> {
   }
 }
 
-class _FullscreenVoiceCallPage extends StatelessWidget {
+class _FullscreenVoiceCallPage extends StatefulWidget {
   const _FullscreenVoiceCallPage({
     required this.channel,
     required this.repository,
@@ -9145,6 +9633,7 @@ class _FullscreenVoiceCallPage extends StatelessWidget {
     required this.onJoinCall,
     required this.onLeaveCall,
     required this.onStartDirectMessage,
+    this.initialShowcasedTileId,
   });
 
   final ChannelSummary channel;
@@ -9162,30 +9651,54 @@ class _FullscreenVoiceCallPage extends StatelessWidget {
     required String displayName,
   })
   onStartDirectMessage;
+  final String? initialShowcasedTileId;
+
+  @override
+  State<_FullscreenVoiceCallPage> createState() =>
+      _FullscreenVoiceCallPageState();
+}
+
+class _FullscreenVoiceCallPageState extends State<_FullscreenVoiceCallPage> {
+  late final bool _restoreWindowOnExit;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreWindowOnExit = enterDesktopFullscreenPresentation();
+  }
+
+  @override
+  void dispose() {
+    exitDesktopFullscreenPresentation(restoreWindow: _restoreWindowOnExit);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
     return Scaffold(
-      body: Container(
-        decoration: BoxDecoration(gradient: palette.appBackground),
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: VoiceChannelView(
-              channel: channel,
-              repository: repository,
-              controller: controller,
-              activeChannelId: activeChannelId,
-              canJoinVoice: canJoinVoice,
-              canManageServer: canManageServer,
-              canStreamCamera: canStreamCamera,
-              canShareScreen: canShareScreen,
-              onJoinCall: onJoinCall,
-              onLeaveCall: onLeaveCall,
-              onStartDirectMessage: onStartDirectMessage,
-              fullscreenMode: true,
-            ),
+      body: CallbackShortcuts(
+        bindings: <ShortcutActivator, VoidCallback>{
+          const SingleActivator(LogicalKeyboardKey.escape): () {
+            Navigator.of(context).maybePop();
+          },
+        },
+        child: Container(
+          decoration: BoxDecoration(gradient: palette.appBackground),
+          child: VoiceChannelView(
+            channel: widget.channel,
+            repository: widget.repository,
+            controller: widget.controller,
+            activeChannelId: widget.activeChannelId,
+            canJoinVoice: widget.canJoinVoice,
+            canManageServer: widget.canManageServer,
+            canStreamCamera: widget.canStreamCamera,
+            canShareScreen: widget.canShareScreen,
+            onJoinCall: widget.onJoinCall,
+            onLeaveCall: widget.onLeaveCall,
+            onStartDirectMessage: widget.onStartDirectMessage,
+            fullscreenMode: true,
+            initialShowcasedTileId: widget.initialShowcasedTileId,
           ),
         ),
       ),
