@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:win32/win32.dart';
 
 enum UiSoundEffect {
+  message(segments: [740, 880], segmentMs: 80),
   joinCall(segments: [660, 880], segmentMs: 90),
   leaveCall(segments: [880, 660], segmentMs: 100),
   mute(segments: [480], segmentMs: 90),

@@ -3,10 +3,12 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'app_preferences.dart';
+import 'app_toast.dart';
 import 'repositories.dart';
 import 'session_controller.dart';
 
@@ -38,6 +40,8 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
   final Uint8List _speakerTestToneBytes = _buildSpeakerTestTone();
 
   bool _savingProfile = false;
+  bool _loadingProfile = true;
+  bool _uploadingAvatar = false;
   bool _loadingDevices = true;
   bool _testingMic = false;
   bool _testingSpeaker = false;
@@ -57,6 +61,7 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
   RTCPeerConnection? _micMeterSecondaryConnection;
   RTCRtpSender? _micMeterSender;
   Timer? _micMeterTimer;
+  String? _avatarPath;
 
   @override
   void initState() {
@@ -64,6 +69,7 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
     _selectedAudioInputId = widget.preferences.preferredAudioInputId;
     _selectedAudioOutputId = widget.preferences.preferredAudioOutputId;
     _selectedVideoInputId = widget.preferences.preferredVideoInputId;
+    unawaited(_loadProfile());
     unawaited(_initializeMediaTools());
   }
 
@@ -97,6 +103,26 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
     );
   }
 
+  Future<void> _loadProfile() async {
+    try {
+      final profile = await widget.repository.fetchCurrentUserProfile();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _avatarPath = profile.avatarPath;
+        _loadingProfile = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _loadingProfile = false;
+      });
+    }
+  }
+
   Future<void> _saveProfile() async {
     final nextName = _displayNameController.text.trim();
     if (nextName.isEmpty) {
@@ -113,20 +139,81 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Profile updated.')));
+      final profile = await widget.repository.fetchCurrentUserProfile();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _avatarPath = profile.avatarPath;
+      });
+      showAppToast(context, 'Profile updated.', tone: AppToastTone.success);
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
           _savingProfile = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _pickAndUploadAvatar() async {
+    if (_uploadingAvatar) {
+      return;
+    }
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty || !mounted) {
+      return;
+    }
+
+    final file = result.files.first;
+    final bytes = file.bytes;
+    if (bytes == null || bytes.isEmpty) {
+      showAppToast(
+        context,
+        'Unable to read that image file.',
+        tone: AppToastTone.error,
+      );
+      return;
+    }
+
+    final extension = _fileExtension(file.name);
+    setState(() {
+      _uploadingAvatar = true;
+    });
+    try {
+      final profile = await widget.repository.uploadCurrentUserAvatar(
+        bytes: bytes,
+        fileExtension: extension,
+      );
+      await widget.onProfileUpdated?.call();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _avatarPath = profile.avatarPath;
+      });
+      showAppToast(
+        context,
+        'Profile picture updated.',
+        tone: AppToastTone.success,
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _uploadingAvatar = false;
         });
       }
     }
@@ -571,6 +658,12 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
                       _ProfileSettingsTab(
                         controller: _displayNameController,
                         saving: _savingProfile,
+                        loadingProfile: _loadingProfile,
+                        avatarUrl: widget.repository.publicProfileAvatarUrl(
+                          _avatarPath,
+                        ),
+                        uploadingAvatar: _uploadingAvatar,
+                        onUploadAvatar: _pickAndUploadAvatar,
                         onSave: _saveProfile,
                       ),
                       _AppearanceSettingsTab(preferences: widget.preferences),
@@ -617,19 +710,70 @@ class _ProfileSettingsTab extends StatelessWidget {
   const _ProfileSettingsTab({
     required this.controller,
     required this.saving,
+    required this.loadingProfile,
+    required this.avatarUrl,
+    required this.uploadingAvatar,
+    required this.onUploadAvatar,
     required this.onSave,
   });
 
   final TextEditingController controller;
   final bool saving;
+  final bool loadingProfile;
+  final String? avatarUrl;
+  final bool uploadingAvatar;
+  final Future<void> Function() onUploadAvatar;
   final Future<void> Function() onSave;
 
   @override
   Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
     return ListView(
       children: [
         const Text(
           'Change the display name shown across servers, chat messages, and voice presence.',
+        ),
+        const SizedBox(height: 18),
+        Row(
+          children: [
+            CircleAvatar(
+              radius: 30,
+              backgroundColor: palette.panelAccent.withAlpha(140),
+              backgroundImage: avatarUrl == null
+                  ? null
+                  : NetworkImage(avatarUrl!),
+              child: avatarUrl == null && !loadingProfile
+                  ? Text(
+                      controller.text.trim().isEmpty
+                          ? '?'
+                          : controller.text
+                                .trim()
+                                .characters
+                                .first
+                                .toUpperCase(),
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    )
+                  : loadingProfile
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : null,
+            ),
+            const SizedBox(width: 16),
+            FilledButton.tonalIcon(
+              onPressed: uploadingAvatar ? null : onUploadAvatar,
+              icon: uploadingAvatar
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.image_outlined),
+              label: Text(uploadingAvatar ? 'Uploading...' : 'Upload picture'),
+            ),
+          ],
         ),
         const SizedBox(height: 18),
         TextField(
@@ -648,6 +792,14 @@ class _ProfileSettingsTab extends StatelessWidget {
       ],
     );
   }
+}
+
+String _fileExtension(String fileName) {
+  final separatorIndex = fileName.lastIndexOf('.');
+  if (separatorIndex <= 0 || separatorIndex == fileName.length - 1) {
+    return '';
+  }
+  return fileName.substring(separatorIndex).toLowerCase();
 }
 
 class _AppearanceSettingsTab extends StatelessWidget {
@@ -716,6 +868,16 @@ class _AppearanceSettingsTab extends StatelessWidget {
                 unawaited(preferences.setUse24HourTime(value));
               },
             ),
+            SwitchListTile(
+              value: preferences.showMessageTimestamps,
+              title: const Text('Show message timestamps'),
+              subtitle: const Text(
+                'Show message times in chat headers instead of hiding them.',
+              ),
+              onChanged: (value) {
+                unawaited(preferences.setShowMessageTimestamps(value));
+              },
+            ),
           ],
         );
       },
@@ -741,8 +903,10 @@ class _NotificationSettingsTab extends StatelessWidget {
             const SizedBox(height: 18),
             SwitchListTile(
               value: preferences.desktopNotifications,
-              title: const Text('Desktop notifications'),
-              subtitle: const Text('Show local desktop alerts for activity.'),
+              title: const Text('Activity notifications'),
+              subtitle: const Text(
+                'Show desktop notifications and in-app alerts for new messages and activity.',
+              ),
               onChanged: (value) {
                 unawaited(preferences.setDesktopNotifications(value));
               },

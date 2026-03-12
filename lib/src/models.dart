@@ -1,6 +1,10 @@
+import 'dart:typed_data';
+
 enum ChannelKind { text, voice }
 
 enum ShareKind { audio, camera, screen }
+
+enum MessageAttachmentKind { image, video, audio, file }
 
 enum ServerPermission {
   viewChannel('view_channel', 'View channel'),
@@ -111,6 +115,26 @@ class DiscoverableServerSummary {
   }
 }
 
+class UserProfileSummary {
+  const UserProfileSummary({
+    required this.id,
+    required this.displayName,
+    required this.avatarPath,
+  });
+
+  final String id;
+  final String displayName;
+  final String? avatarPath;
+
+  factory UserProfileSummary.fromMap(Map<String, dynamic> map) {
+    return UserProfileSummary(
+      id: map['id'] as String,
+      displayName: map['display_name'] as String? ?? 'Unknown',
+      avatarPath: map['avatar_path'] as String?,
+    );
+  }
+}
+
 class ServerJoinRequestSummary {
   const ServerJoinRequestSummary({
     required this.id,
@@ -209,12 +233,14 @@ class ChannelMessage {
     required this.body,
     required this.senderId,
     required this.senderDisplayName,
+    required this.senderAvatarPath,
     required this.createdAt,
     this.replyToMessageId,
     this.replyToBody,
     this.replyToSenderDisplayName,
     this.deletedAt,
     this.deletedBy,
+    this.attachments = const <MessageAttachment>[],
     this.reactions = const <MessageReactionSummary>[],
   });
 
@@ -223,12 +249,14 @@ class ChannelMessage {
   final String body;
   final String senderId;
   final String senderDisplayName;
+  final String? senderAvatarPath;
   final DateTime createdAt;
   final String? replyToMessageId;
   final String? replyToBody;
   final String? replyToSenderDisplayName;
   final DateTime? deletedAt;
   final String? deletedBy;
+  final List<MessageAttachment> attachments;
   final List<MessageReactionSummary> reactions;
 
   bool get deleted => deletedAt != null;
@@ -240,6 +268,7 @@ class ChannelMessage {
       body: map['body'] as String,
       senderId: map['sender_id'] as String,
       senderDisplayName: map['sender_display_name'] as String? ?? 'Unknown',
+      senderAvatarPath: map['sender_avatar_path'] as String?,
       createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
       replyToMessageId: map['reply_to_message_id'] as String?,
       replyToBody: map['reply_to_body'] as String?,
@@ -248,6 +277,7 @@ class ChannelMessage {
           ? null
           : DateTime.parse(map['deleted_at'] as String).toLocal(),
       deletedBy: map['deleted_by'] as String?,
+      attachments: MessageAttachment.listFromRaw(map['attachments']),
       reactions: MessageReactionSummary.listFromRaw(map['reactions']),
     );
   }
@@ -258,6 +288,7 @@ class DirectConversationSummary {
     required this.conversationId,
     required this.otherUserId,
     required this.otherDisplayName,
+    required this.otherAvatarPath,
     required this.lastMessageAt,
     required this.lastMessagePreview,
     required this.lastMessageSenderId,
@@ -267,6 +298,7 @@ class DirectConversationSummary {
   final String conversationId;
   final String otherUserId;
   final String otherDisplayName;
+  final String? otherAvatarPath;
   final DateTime? lastMessageAt;
   final String? lastMessagePreview;
   final String? lastMessageSenderId;
@@ -277,6 +309,7 @@ class DirectConversationSummary {
       conversationId: map['conversation_id'] as String,
       otherUserId: map['other_user_id'] as String,
       otherDisplayName: map['other_display_name'] as String? ?? 'Unknown',
+      otherAvatarPath: map['other_avatar_path'] as String?,
       lastMessageAt: map['last_message_at'] == null
           ? null
           : DateTime.parse(map['last_message_at'] as String).toLocal(),
@@ -294,12 +327,14 @@ class DirectMessage {
     required this.body,
     required this.senderId,
     required this.senderDisplayName,
+    required this.senderAvatarPath,
     required this.createdAt,
     this.replyToMessageId,
     this.replyToBody,
     this.replyToSenderDisplayName,
     this.deletedAt,
     this.deletedBy,
+    this.attachments = const <MessageAttachment>[],
     this.reactions = const <MessageReactionSummary>[],
   });
 
@@ -308,12 +343,14 @@ class DirectMessage {
   final String body;
   final String senderId;
   final String senderDisplayName;
+  final String? senderAvatarPath;
   final DateTime createdAt;
   final String? replyToMessageId;
   final String? replyToBody;
   final String? replyToSenderDisplayName;
   final DateTime? deletedAt;
   final String? deletedBy;
+  final List<MessageAttachment> attachments;
   final List<MessageReactionSummary> reactions;
 
   bool get deleted => deletedAt != null;
@@ -325,6 +362,7 @@ class DirectMessage {
       body: map['body'] as String,
       senderId: map['sender_id'] as String,
       senderDisplayName: map['sender_display_name'] as String? ?? 'Unknown',
+      senderAvatarPath: map['sender_avatar_path'] as String?,
       createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
       replyToMessageId: map['reply_to_message_id'] as String?,
       replyToBody: map['reply_to_body'] as String?,
@@ -333,16 +371,86 @@ class DirectMessage {
           ? null
           : DateTime.parse(map['deleted_at'] as String).toLocal(),
       deletedBy: map['deleted_by'] as String?,
+      attachments: MessageAttachment.listFromRaw(map['attachments']),
       reactions: MessageReactionSummary.listFromRaw(map['reactions']),
     );
   }
 }
 
-class MessageReactionSummary {
-  const MessageReactionSummary({
-    required this.emoji,
-    required this.userIds,
+class MessageAttachment {
+  const MessageAttachment({
+    required this.path,
+    required this.fileName,
+    required this.sizeBytes,
+    required this.kind,
+    this.contentType,
   });
+
+  final String path;
+  final String fileName;
+  final int sizeBytes;
+  final MessageAttachmentKind kind;
+  final String? contentType;
+
+  bool get isImage => kind == MessageAttachmentKind.image;
+
+  factory MessageAttachment.fromMap(Map<String, dynamic> map) {
+    final rawKind = map['kind']?.toString();
+    final kind = MessageAttachmentKind.values.firstWhere(
+      (value) => value.name == rawKind,
+      orElse: () => MessageAttachmentKind.file,
+    );
+    return MessageAttachment(
+      path: map['path'] as String? ?? '',
+      fileName: map['file_name'] as String? ?? 'Attachment',
+      sizeBytes: map['size_bytes'] as int? ?? 0,
+      kind: kind,
+      contentType: map['content_type'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return <String, dynamic>{
+      'path': path,
+      'file_name': fileName,
+      'size_bytes': sizeBytes,
+      'kind': kind.name,
+      'content_type': contentType,
+    }..removeWhere((key, value) => value == null);
+  }
+
+  static List<MessageAttachment> listFromRaw(Object? raw) {
+    if (raw is! List) {
+      return const <MessageAttachment>[];
+    }
+    return raw
+        .whereType<Map>()
+        .map(
+          (item) => MessageAttachment.fromMap(Map<String, dynamic>.from(item)),
+        )
+        .where((attachment) => attachment.path.isNotEmpty)
+        .toList(growable: false);
+  }
+}
+
+class OutgoingMessageAttachment {
+  const OutgoingMessageAttachment({
+    required this.fileName,
+    required this.bytes,
+    required this.kind,
+    this.contentType,
+  });
+
+  final String fileName;
+  final Uint8List bytes;
+  final MessageAttachmentKind kind;
+  final String? contentType;
+
+  int get sizeBytes => bytes.lengthInBytes;
+}
+
+class MessageReactionSummary {
+  const MessageReactionSummary({required this.emoji, required this.userIds});
 
   final String emoji;
   final List<String> userIds;
@@ -517,12 +625,14 @@ class ServerMember {
   const ServerMember({
     required this.userId,
     required this.displayName,
+    required this.avatarPath,
     required this.joinedAt,
     required this.roleIds,
   });
 
   final String userId;
   final String displayName;
+  final String? avatarPath;
   final DateTime joinedAt;
   final Set<String> roleIds;
 }

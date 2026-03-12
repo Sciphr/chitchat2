@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app_preferences.dart';
+import 'app_toast.dart';
 import 'models.dart';
 import 'repositories.dart';
 
@@ -57,9 +58,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
   bool get _canManageServer =>
       widget.access.hasPermission(ServerPermission.manageServer);
   bool get _canReviewJoinRequests =>
-      widget.access.isOwner ||
-      _canInviteMembers ||
-      _canManageServer;
+      widget.access.isOwner || _canInviteMembers || _canManageServer;
   bool get _canEditServerPicture => widget.access.isOwner;
 
   ChannelSummary? get _selectedOverrideChannel {
@@ -126,7 +125,9 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       _loadingJoinRequests = true;
     });
     try {
-      final requests = await widget.repository.fetchServerJoinRequests(_server.id);
+      final requests = await widget.repository.fetchServerJoinRequests(
+        _server.id,
+      );
       if (!mounted) {
         return;
       }
@@ -212,17 +213,13 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Role created.')));
+      showAppToast(context, 'Role created.', tone: AppToastTone.success);
       await _load();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
@@ -271,17 +268,13 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Role updated.')));
+      showAppToast(context, 'Role updated.', tone: AppToastTone.success);
       await _load();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
@@ -336,17 +329,17 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
+      showAppToast(
         context,
-      ).showSnackBar(const SnackBar(content: Text('Member roles updated.')));
+        'Member roles updated.',
+        tone: AppToastTone.success,
+      );
       await _load();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
@@ -403,17 +396,17 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Updated access for ${role.name}.')),
+      showAppToast(
+        context,
+        'Updated access for ${role.name}.',
+        tone: AppToastTone.success,
       );
       await _loadChannelOverrides();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
@@ -439,11 +432,12 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       _saving = true;
     });
     try {
-      final updatedServer = await widget.repository.updateServerDiscoverySettings(
-        serverId: _server.id,
-        isPublic: isPublic,
-        description: description,
-      );
+      final updatedServer = await widget.repository
+          .updateServerDiscoverySettings(
+            serverId: _server.id,
+            isPublic: isPublic,
+            description: description,
+          );
       _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
@@ -451,16 +445,16 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       setState(() {
         _server = updatedServer;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Server visibility updated.')),
+      showAppToast(
+        context,
+        'Server visibility updated.',
+        tone: AppToastTone.success,
       );
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
@@ -486,23 +480,19 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            approve
-                ? 'Approved ${request.displayName}.'
-                : 'Declined ${request.displayName}.',
-          ),
-        ),
+      showAppToast(
+        context,
+        approve
+            ? 'Approved ${request.displayName}.'
+            : 'Declined ${request.displayName}.',
+        tone: AppToastTone.success,
       );
       await _loadJoinRequests();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     } finally {
       if (mounted) {
         setState(() {
@@ -539,7 +529,8 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                           runSpacing: 8,
                           children: [
                             ActionChip(
-                              onPressed: () => _runGeneralAction(widget.onCopyInvite),
+                              onPressed: () =>
+                                  _runGeneralAction(widget.onCopyInvite),
                               avatar: const Icon(Icons.content_copy, size: 18),
                               label: Text('Invite ${_server.inviteCode}'),
                             ),
@@ -639,10 +630,11 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                     _JoinRequestsTab(
                                       loading: _loadingJoinRequests,
                                       requests: _joinRequests,
-                                      onApprove: (request) => _reviewJoinRequest(
-                                        request,
-                                        approve: true,
-                                      ),
+                                      onApprove: (request) =>
+                                          _reviewJoinRequest(
+                                            request,
+                                            approve: true,
+                                          ),
                                       onReject: (request) => _reviewJoinRequest(
                                         request,
                                         approve: false,
@@ -722,9 +714,7 @@ class _GeneralTab extends StatelessWidget {
               const SizedBox(height: 10),
               Text('Name: ${server.name}'),
               const SizedBox(height: 6),
-              Text(
-                'Visibility: ${server.isPublic ? 'Public' : 'Private'}',
-              ),
+              Text('Visibility: ${server.isPublic ? 'Public' : 'Private'}'),
               const SizedBox(height: 6),
               OutlinedButton.icon(
                 onPressed: onCopyInvite,
@@ -744,8 +734,10 @@ class _GeneralTab extends StatelessWidget {
                   if (!context.mounted) {
                     return;
                   }
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Server ID copied to clipboard.')),
+                  showAppToast(
+                    context,
+                    'Server ID copied to clipboard.',
+                    tone: AppToastTone.success,
                   );
                 },
                 icon: const Icon(Icons.badge_outlined, size: 18),
@@ -768,13 +760,14 @@ class _GeneralTab extends StatelessWidget {
             if (canManageServer)
               FilledButton.tonalIcon(
                 onPressed: () async {
-                  final result = await showDialog<_ServerDiscoverySettingsResult>(
-                    context: context,
-                    builder: (context) => _ServerDiscoverySettingsDialog(
-                      initialIsPublic: server.isPublic,
-                      initialDescription: server.description,
-                    ),
-                  );
+                  final result =
+                      await showDialog<_ServerDiscoverySettingsResult>(
+                        context: context,
+                        builder: (context) => _ServerDiscoverySettingsDialog(
+                          initialIsPublic: server.isPublic,
+                          initialDescription: server.description,
+                        ),
+                      );
                   if (result == null) {
                     return;
                   }
@@ -935,9 +928,7 @@ class _JoinRequestsTab extends StatelessWidget {
       return const Center(child: CircularProgressIndicator());
     }
     if (requests.isEmpty) {
-      return const Center(
-        child: Text('No pending join requests right now.'),
-      );
+      return const Center(child: Text('No pending join requests right now.'));
     }
     return ListView.separated(
       itemCount: requests.length,
@@ -1079,10 +1070,7 @@ class _ServerDiscoverySettingsDialogState
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('Save'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('Save')),
       ],
     );
   }

@@ -4,6 +4,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
 import 'app_bootstrap.dart';
 import 'desktop_integration.dart';
@@ -145,6 +146,9 @@ class WorkspaceRepository {
   final AuthService authService;
   static const String _serverSummarySelect =
       'id, name, owner_id, invite_code, description, is_public, avatar_path, created_at';
+  static const String _messageAttachmentBucket = 'message-attachments';
+  static const String _profileAvatarBucket = 'profile-assets';
+  static const Uuid _uuid = Uuid();
 
   bool get hasGiphyApiKey => AppBootstrap.giphyApiKey.trim().isNotEmpty;
 
@@ -153,6 +157,21 @@ class WorkspaceRepository {
       'id': authService.userId,
       'display_name': authService.displayName,
     });
+  }
+
+  Future<UserProfileSummary> fetchCurrentUserProfile() async {
+    final row =
+        await client
+            .from('user_profiles')
+            .select('id, display_name, avatar_path')
+            .eq('id', authService.userId)
+            .maybeSingle() ??
+        <String, dynamic>{
+          'id': authService.userId,
+          'display_name': authService.displayName,
+          'avatar_path': null,
+        };
+    return UserProfileSummary.fromMap(Map<String, dynamic>.from(row));
   }
 
   Future<List<ServerSummary>> fetchServers() async {
@@ -357,14 +376,26 @@ class WorkspaceRepository {
     return client.storage.from('server-assets').getPublicUrl(avatarPath);
   }
 
-  Future<String> fetchLiveKitToken({
-    required String channelId,
-  }) async {
+  String? publicMessageAttachmentUrl(String? attachmentPath) {
+    if (attachmentPath == null || attachmentPath.isEmpty) {
+      return null;
+    }
+    return client.storage
+        .from(_messageAttachmentBucket)
+        .getPublicUrl(attachmentPath);
+  }
+
+  String? publicProfileAvatarUrl(String? avatarPath) {
+    if (avatarPath == null || avatarPath.isEmpty) {
+      return null;
+    }
+    return client.storage.from(_profileAvatarBucket).getPublicUrl(avatarPath);
+  }
+
+  Future<String> fetchLiveKitToken({required String channelId}) async {
     final response = await client.functions.invoke(
       AppBootstrap.liveKitTokenFunctionName,
-      body: <String, dynamic>{
-        'channelId': channelId,
-      },
+      body: <String, dynamic>{'channelId': channelId},
     );
 
     if (response.status >= 400) {
@@ -413,6 +444,37 @@ class WorkspaceRepository {
         .single();
 
     return ServerSummary.fromMap(row);
+  }
+
+  Future<UserProfileSummary> uploadCurrentUserAvatar({
+    required Uint8List bytes,
+    required String fileExtension,
+  }) async {
+    final cleanExtension = fileExtension.trim().toLowerCase();
+    final normalizedExtension = cleanExtension.isEmpty
+        ? 'png'
+        : cleanExtension.replaceAll('.', '');
+    final path = '${authService.userId}/avatar.$normalizedExtension';
+
+    await client.storage
+        .from(_profileAvatarBucket)
+        .uploadBinary(
+          path,
+          bytes,
+          fileOptions: const FileOptions(cacheControl: '3600', upsert: true),
+        );
+
+    final row = await client
+        .from('user_profiles')
+        .upsert({
+          'id': authService.userId,
+          'display_name': authService.displayName,
+          'avatar_path': path,
+        })
+        .select('id, display_name, avatar_path')
+        .single();
+
+    return UserProfileSummary.fromMap(Map<String, dynamic>.from(row));
   }
 
   Future<List<ChannelSummary>> fetchChannels(String serverId) async {
@@ -505,13 +567,16 @@ class WorkspaceRepository {
         ? const <dynamic>[]
         : await client
                   .from('user_profiles')
-                  .select('id, display_name')
+                  .select('id, display_name, avatar_path')
                   .inFilter('id', userIds)
               as List<dynamic>;
     final profilesById = {
       for (final row in profileRows)
-        (row as Map<String, dynamic>)['id'] as String:
-            row['display_name'] as String? ?? 'Unknown',
+        (row as Map<String, dynamic>)['id'] as String: UserProfileSummary(
+          id: row['id'] as String,
+          displayName: row['display_name'] as String? ?? 'Unknown',
+          avatarPath: row['avatar_path'] as String?,
+        ),
     };
 
     final memberRoleRows =
@@ -532,9 +597,11 @@ class WorkspaceRepository {
       final record = row as Map<String, dynamic>;
       final userId = record['user_id'] as String;
       final fallbackName = 'User ${userId.substring(0, 8)}';
+      final profile = profilesById[userId];
       return ServerMember(
         userId: userId,
-        displayName: profilesById[userId] ?? fallbackName,
+        displayName: profile?.displayName ?? fallbackName,
+        avatarPath: profile?.avatarPath,
         joinedAt: DateTime.parse(record['joined_at'] as String).toLocal(),
         roleIds: roleIdsByUser[userId] ?? const <String>{},
       );
@@ -796,25 +863,79 @@ class WorkspaceRepository {
         );
   }
 
+  Stream<Map<String, List<ChannelMessage>>> watchChannelsMessages(
+    List<String> channelIds,
+  ) {
+    if (channelIds.isEmpty) {
+      return Stream.value(const <String, List<ChannelMessage>>{});
+    }
+
+    final uniqueChannelIds = channelIds.toSet().toList(growable: false);
+    return client
+        .from('channel_messages')
+        .stream(primaryKey: ['id'])
+        .inFilter('channel_id', uniqueChannelIds)
+        .order('created_at', ascending: true)
+        .map((rows) {
+          final grouped = <String, List<ChannelMessage>>{
+            for (final channelId in uniqueChannelIds)
+              channelId: <ChannelMessage>[],
+          };
+          for (final row in rows) {
+            final message = ChannelMessage.fromMap(row);
+            if (message.deleted) {
+              continue;
+            }
+            final channelMessages = grouped.putIfAbsent(
+              message.channelId,
+              () => <ChannelMessage>[],
+            );
+            channelMessages.add(message);
+          }
+          return grouped;
+        });
+  }
+
   Future<void> sendChannelMessage({
     required String channelId,
     required String body,
     ChannelMessage? replyToMessage,
+    List<OutgoingMessageAttachment> attachments =
+        const <OutgoingMessageAttachment>[],
   }) async {
     final cleanBody = body.trim();
-    if (cleanBody.isEmpty) {
+    if (cleanBody.isEmpty && attachments.isEmpty) {
       return;
     }
 
-    await client.from('channel_messages').insert({
-      'channel_id': channelId,
-      'sender_id': authService.userId,
-      'sender_display_name': authService.displayName,
-      'body': cleanBody,
-      'reply_to_message_id': replyToMessage?.id,
-      'reply_to_body': replyToMessage == null ? null : _replyPreview(replyToMessage.body),
-      'reply_to_sender_display_name': replyToMessage?.senderDisplayName,
-    });
+    final messageId = _uuid.v4();
+    final senderAvatarPath = await _currentUserAvatarPath();
+    final uploadedAttachments = await _uploadMessageAttachments(
+      messageId: messageId,
+      scope: 'channel',
+      scopeId: channelId,
+      attachments: attachments,
+    );
+
+    try {
+      await client.from('channel_messages').insert({
+        'id': messageId,
+        'channel_id': channelId,
+        'sender_id': authService.userId,
+        'sender_display_name': authService.displayName,
+        'sender_avatar_path': senderAvatarPath,
+        'body': cleanBody,
+        'attachments': uploadedAttachments.map((item) => item.toMap()).toList(),
+        'reply_to_message_id': replyToMessage?.id,
+        'reply_to_body': replyToMessage == null
+            ? null
+            : _replyPreview(replyToMessage.body),
+        'reply_to_sender_display_name': replyToMessage?.senderDisplayName,
+      });
+    } catch (_) {
+      await _removeUploadedAttachments(uploadedAttachments);
+      rethrow;
+    }
   }
 
   Future<void> deleteChannelMessage(String messageId) async {
@@ -850,13 +971,18 @@ class WorkspaceRepository {
     throw StateError('Unable to create a direct conversation.');
   }
 
-  Future<List<DirectConversationSummary>> fetchDirectConversationSummaries() async {
+  Future<List<DirectConversationSummary>>
+  fetchDirectConversationSummaries() async {
     final response = await client.rpc('list_direct_conversations');
     if (response is! List) {
       return const <DirectConversationSummary>[];
     }
     return response
-        .map((row) => DirectConversationSummary.fromMap(Map<String, dynamic>.from(row as Map)))
+        .map(
+          (row) => DirectConversationSummary.fromMap(
+            Map<String, dynamic>.from(row as Map),
+          ),
+        )
         .toList()
       ..sort((left, right) {
         final rightTime = right.lastMessageAt;
@@ -937,21 +1063,42 @@ class WorkspaceRepository {
     required String conversationId,
     required String body,
     DirectMessage? replyToMessage,
+    List<OutgoingMessageAttachment> attachments =
+        const <OutgoingMessageAttachment>[],
   }) async {
     final cleanBody = body.trim();
-    if (cleanBody.isEmpty) {
+    if (cleanBody.isEmpty && attachments.isEmpty) {
       return;
     }
 
-    await client.from('direct_messages').insert({
-      'conversation_id': conversationId,
-      'sender_id': authService.userId,
-      'sender_display_name': authService.displayName,
-      'body': cleanBody,
-      'reply_to_message_id': replyToMessage?.id,
-      'reply_to_body': replyToMessage == null ? null : _replyPreview(replyToMessage.body),
-      'reply_to_sender_display_name': replyToMessage?.senderDisplayName,
-    });
+    final messageId = _uuid.v4();
+    final senderAvatarPath = await _currentUserAvatarPath();
+    final uploadedAttachments = await _uploadMessageAttachments(
+      messageId: messageId,
+      scope: 'direct',
+      scopeId: conversationId,
+      attachments: attachments,
+    );
+
+    try {
+      await client.from('direct_messages').insert({
+        'id': messageId,
+        'conversation_id': conversationId,
+        'sender_id': authService.userId,
+        'sender_display_name': authService.displayName,
+        'sender_avatar_path': senderAvatarPath,
+        'body': cleanBody,
+        'attachments': uploadedAttachments.map((item) => item.toMap()).toList(),
+        'reply_to_message_id': replyToMessage?.id,
+        'reply_to_body': replyToMessage == null
+            ? null
+            : _replyPreview(replyToMessage.body),
+        'reply_to_sender_display_name': replyToMessage?.senderDisplayName,
+      });
+    } catch (_) {
+      await _removeUploadedAttachments(uploadedAttachments);
+      rethrow;
+    }
   }
 
   Future<void> markDirectConversationRead(String conversationId) async {
@@ -993,26 +1140,18 @@ class WorkspaceRepository {
 
     final normalizedQuery = query.trim();
     final uri = normalizedQuery.isEmpty
-        ? Uri.https(
-            'api.giphy.com',
-            '/v1/gifs/trending',
-            <String, String>{
-              'api_key': apiKey,
-              'limit': '$limit',
-              'rating': 'pg-13',
-            },
-          )
-        : Uri.https(
-            'api.giphy.com',
-            '/v1/gifs/search',
-            <String, String>{
-              'api_key': apiKey,
-              'q': normalizedQuery,
-              'limit': '$limit',
-              'rating': 'pg-13',
-              'lang': 'en',
-            },
-          );
+        ? Uri.https('api.giphy.com', '/v1/gifs/trending', <String, String>{
+            'api_key': apiKey,
+            'limit': '$limit',
+            'rating': 'pg-13',
+          })
+        : Uri.https('api.giphy.com', '/v1/gifs/search', <String, String>{
+            'api_key': apiKey,
+            'q': normalizedQuery,
+            'limit': '$limit',
+            'rating': 'pg-13',
+            'lang': 'en',
+          });
 
     final response = await http.get(uri);
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -1032,12 +1171,8 @@ class WorkspaceRepository {
 
     return data
         .whereType<Map>()
-        .map(
-          (item) => GiphyGifResult.fromMap(Map<String, dynamic>.from(item)),
-        )
-        .where(
-          (gif) => gif.previewUrl.isNotEmpty && gif.gifUrl.isNotEmpty,
-        )
+        .map((item) => GiphyGifResult.fromMap(Map<String, dynamic>.from(item)))
+        .where((gif) => gif.previewUrl.isNotEmpty && gif.gifUrl.isNotEmpty)
         .toList(growable: false);
   }
 
@@ -1047,5 +1182,135 @@ class WorkspaceRepository {
       return normalized;
     }
     return '${normalized.substring(0, 137)}...';
+  }
+
+  Future<String?> _currentUserAvatarPath() async {
+    final row = await client
+        .from('user_profiles')
+        .select('avatar_path')
+        .eq('id', authService.userId)
+        .maybeSingle();
+    return row?['avatar_path'] as String?;
+  }
+
+  Future<List<MessageAttachment>> _uploadMessageAttachments({
+    required String messageId,
+    required String scope,
+    required String scopeId,
+    required List<OutgoingMessageAttachment> attachments,
+  }) async {
+    if (attachments.isEmpty) {
+      return const <MessageAttachment>[];
+    }
+
+    final uploaded = <MessageAttachment>[];
+    try {
+      for (var index = 0; index < attachments.length; index++) {
+        final attachment = attachments[index];
+        final sanitizedFileName = _sanitizeAttachmentFileName(
+          attachment.fileName,
+        );
+        final extension = _fileExtension(sanitizedFileName);
+        final path =
+            '$scope/$scopeId/${authService.userId}/$messageId/$index$extension';
+
+        await client.storage
+            .from(_messageAttachmentBucket)
+            .uploadBinary(
+              path,
+              attachment.bytes,
+              fileOptions: FileOptions(
+                cacheControl: '3600',
+                upsert: false,
+                contentType:
+                    attachment.contentType ??
+                    _contentTypeForFileName(sanitizedFileName),
+              ),
+            );
+
+        uploaded.add(
+          MessageAttachment(
+            path: path,
+            fileName: sanitizedFileName,
+            sizeBytes: attachment.sizeBytes,
+            kind: attachment.kind,
+            contentType:
+                attachment.contentType ??
+                _contentTypeForFileName(sanitizedFileName),
+          ),
+        );
+      }
+      return uploaded;
+    } catch (_) {
+      await _removeUploadedAttachments(uploaded);
+      rethrow;
+    }
+  }
+
+  Future<void> _removeUploadedAttachments(
+    List<MessageAttachment> attachments,
+  ) async {
+    if (attachments.isEmpty) {
+      return;
+    }
+    try {
+      await client.storage
+          .from(_messageAttachmentBucket)
+          .remove(attachments.map((attachment) => attachment.path).toList());
+    } catch (_) {
+      // Attachment cleanup should not hide the original failure.
+    }
+  }
+
+  String _sanitizeAttachmentFileName(String fileName) {
+    final trimmed = fileName.trim();
+    final normalized = trimmed.isEmpty ? 'attachment' : trimmed;
+    return normalized.replaceAll(RegExp(r'[^A-Za-z0-9._ -]'), '_');
+  }
+
+  String _fileExtension(String fileName) {
+    final separatorIndex = fileName.lastIndexOf('.');
+    if (separatorIndex <= 0 || separatorIndex == fileName.length - 1) {
+      return '';
+    }
+    return fileName.substring(separatorIndex).toLowerCase();
+  }
+
+  String? _contentTypeForFileName(String fileName) {
+    switch (_fileExtension(fileName)) {
+      case '.png':
+        return 'image/png';
+      case '.jpg':
+      case '.jpeg':
+        return 'image/jpeg';
+      case '.gif':
+        return 'image/gif';
+      case '.webp':
+        return 'image/webp';
+      case '.bmp':
+        return 'image/bmp';
+      case '.svg':
+        return 'image/svg+xml';
+      case '.mp4':
+        return 'video/mp4';
+      case '.mov':
+        return 'video/quicktime';
+      case '.webm':
+        return 'video/webm';
+      case '.mp3':
+        return 'audio/mpeg';
+      case '.wav':
+        return 'audio/wav';
+      case '.ogg':
+        return 'audio/ogg';
+      case '.pdf':
+        return 'application/pdf';
+      case '.txt':
+        return 'text/plain';
+      case '.json':
+        return 'application/json';
+      default:
+        return 'application/octet-stream';
+    }
   }
 }

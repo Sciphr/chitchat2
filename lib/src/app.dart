@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_bootstrap.dart';
 import 'app_preferences.dart';
+import 'app_toast.dart';
 import 'desktop_integration.dart';
 import 'repositories.dart';
 import 'update_service.dart';
@@ -562,84 +563,159 @@ class _DesktopWindowFrame extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final titleBarHeight = appWindow.titleBarHeight;
     return WindowBorder(
       color: palette.border,
       width: 1,
-      child: Column(
-        children: [
-          _DesktopTitleBar(
-            appVersion: appVersion,
-            updateController: updateController,
-          ),
-          Expanded(child: child),
-        ],
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxHeight = constraints.maxHeight;
+          if (maxHeight.isFinite && maxHeight < titleBarHeight) {
+            return _DesktopTitleBar(
+              appVersion: appVersion,
+              updateController: updateController,
+              heightOverride: maxHeight <= 0 ? 0 : maxHeight,
+              showControls: false,
+            );
+          }
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _DesktopTitleBar(
+                appVersion: appVersion,
+                updateController: updateController,
+              ),
+              Expanded(child: child),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
 class _DesktopTitleBar extends StatelessWidget {
-  const _DesktopTitleBar({required this.updateController, this.appVersion});
+  const _DesktopTitleBar({
+    required this.updateController,
+    this.appVersion,
+    this.heightOverride,
+    this.showControls = true,
+  });
 
   final AppUpdateController updateController;
   final String? appVersion;
+  final double? heightOverride;
+  final bool showControls;
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
-    return WindowTitleBarBox(
-      child: Container(
-        height: 46,
-        color: palette.panelMuted,
-        padding: const EdgeInsets.only(left: 12),
-        child: Row(
-          children: [
-            Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                gradient: palette.heroGradient,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: palette.border),
-              ),
-              alignment: Alignment.center,
-              child: const Icon(Icons.forum_rounded, size: 16),
+    final nativeTitleBarHeight = appWindow.titleBarHeight;
+    final titleBarButtonSize = appWindow.titleBarButtonSize;
+    final titleBarHeight = heightOverride ?? nativeTitleBarHeight;
+    if (titleBarHeight <= 0) {
+      return const SizedBox.shrink();
+    }
+
+    if (!showControls || titleBarHeight < nativeTitleBarHeight) {
+      return WindowTitleBarBox(
+        child: SizedBox(
+          height: titleBarHeight,
+          child: MoveWindow(
+            child: ColoredBox(
+              color: palette.panelMuted,
+              child: const SizedBox.expand(),
             ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: MoveWindow(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    appVersion == null || appVersion!.isEmpty
-                        ? 'ChitChat'
-                        : 'ChitChat v$appVersion',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
+          ),
+        ),
+      );
+    }
+
+    final brandSize = titleBarHeight >= 32 ? 28.0 : titleBarHeight - 4;
+    return WindowTitleBarBox(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final width = constraints.maxWidth;
+          final showBrand = width >= 220;
+          final showTitle = width >= 280;
+          final showUpdate = updateController.enabled && width >= 340;
+          final leftPadding = width >= 220 ? 12.0 : 4.0;
+
+          return SizedBox(
+            height: titleBarHeight,
+            child: ColoredBox(
+              color: palette.panelMuted,
+              child: Padding(
+                padding: EdgeInsets.only(left: leftPadding),
+                child: Row(
+                  children: [
+                    if (showBrand) ...[
+                      Container(
+                        width: brandSize,
+                        height: brandSize,
+                        decoration: BoxDecoration(
+                          gradient: palette.heroGradient,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: palette.border),
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          Icons.forum_rounded,
+                          size: brandSize >= 28 ? 16 : 14,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                    ],
+                    Expanded(
+                      child: MoveWindow(
+                        child: SizedBox.expand(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: showTitle
+                                ? Text(
+                                    appVersion == null || appVersion!.isEmpty
+                                        ? 'ChitChat'
+                                        : 'ChitChat v$appVersion',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(fontWeight: FontWeight.w700),
+                                  )
+                                : const SizedBox.shrink(),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
+                    if (showUpdate)
+                      _DesktopUpdateButton(
+                        updateController: updateController,
+                        buttonSize: titleBarButtonSize,
+                      ),
+                    const _DesktopWindowButtons(),
+                  ],
                 ),
               ),
             ),
-            _DesktopUpdateButton(updateController: updateController),
-            const _DesktopWindowButtons(),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
 }
 
 class _DesktopUpdateButton extends StatelessWidget {
-  const _DesktopUpdateButton({required this.updateController});
+  const _DesktopUpdateButton({
+    required this.updateController,
+    required this.buttonSize,
+  });
 
   final AppUpdateController updateController;
+  final Size buttonSize;
 
   Future<void> _handlePressed(BuildContext context) async {
-    final messenger = ScaffoldMessenger.of(context);
-
     UpdateActionResult result;
     if (updateController.hasUpdate) {
       result = await updateController.installUpdate();
@@ -653,44 +729,32 @@ class _DesktopUpdateButton extends StatelessWidget {
 
     switch (result) {
       case UpdateActionResult.disabled:
-        messenger.showSnackBar(
-          const SnackBar(
-            content: Text('Updates are not enabled for this build.'),
-          ),
-        );
+        showAppToast(context, 'Updates are not enabled for this build.');
       case UpdateActionResult.noUpdate:
         if (updateController.errorMessage != null) {
-          messenger.showSnackBar(
-            SnackBar(content: Text(updateController.errorMessage!)),
+          showAppToast(
+            context,
+            updateController.errorMessage!,
+            tone: AppToastTone.error,
           );
         } else {
-          messenger.showSnackBar(
-            const SnackBar(
-              content: Text('You already have the latest version.'),
-            ),
-          );
+          showAppToast(context, 'You already have the latest version.');
         }
       case UpdateActionResult.updateAvailable:
         final latestVersion =
             updateController.latestVersion ?? 'a newer version';
-        messenger.showSnackBar(
-          SnackBar(
-            content: Text(
-              'Update $latestVersion is available. Click update again to install.',
-            ),
-          ),
+        showAppToast(
+          context,
+          'Update $latestVersion is available. Click update again to install.',
+          tone: AppToastTone.success,
         );
       case UpdateActionResult.installing:
-        messenger.showSnackBar(
-          const SnackBar(content: Text('Update check already in progress.')),
-        );
+        showAppToast(context, 'Update check already in progress.');
       case UpdateActionResult.startedInstaller:
-        messenger.showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Installer launched. Follow the update prompt to continue.',
-            ),
-          ),
+        showAppToast(
+          context,
+          'Installer launched. Follow the update prompt to continue.',
+          tone: AppToastTone.success,
         );
     }
   }
@@ -719,53 +783,57 @@ class _DesktopUpdateButton extends StatelessWidget {
             button: true,
             enabled: !updateController.busy,
             label: tooltip,
-            child: IconButton(
-              onPressed: updateController.busy
-                  ? null
-                  : () => _handlePressed(context),
-              visualDensity: VisualDensity.standard,
-              style: ButtonStyle(
-                minimumSize: const WidgetStatePropertyAll(Size(46, 46)),
-                maximumSize: const WidgetStatePropertyAll(Size(46, 46)),
-                padding: const WidgetStatePropertyAll(EdgeInsets.zero),
-                shape: const WidgetStatePropertyAll(
-                  RoundedRectangleBorder(),
+            child: SizedBox(
+              width: buttonSize.width,
+              height: buttonSize.height,
+              child: IconButton(
+                onPressed: updateController.busy
+                    ? null
+                    : () => _handlePressed(context),
+                visualDensity: VisualDensity.standard,
+                style: ButtonStyle(
+                  minimumSize: WidgetStatePropertyAll(buttonSize),
+                  maximumSize: WidgetStatePropertyAll(buttonSize),
+                  padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+                  shape: const WidgetStatePropertyAll(RoundedRectangleBorder()),
+                  backgroundColor: WidgetStateProperty.resolveWith((states) {
+                    if (states.contains(WidgetState.pressed)) {
+                      return palette.panelAccent;
+                    }
+                    if (states.contains(WidgetState.hovered)) {
+                      return palette.panelStrong;
+                    }
+                    return Colors.transparent;
+                  }),
                 ),
-                backgroundColor: WidgetStateProperty.resolveWith((states) {
-                  if (states.contains(WidgetState.pressed)) {
-                    return palette.panelAccent;
-                  }
-                  if (states.contains(WidgetState.hovered)) {
-                    return palette.panelStrong;
-                  }
-                  return Colors.transparent;
-                }),
-              ),
-              icon: updateController.busy
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Stack(
-                      clipBehavior: Clip.none,
-                      children: [
-                        const Icon(Icons.sync, size: 18),
-                        if (updateController.hasUpdate)
-                          Positioned(
-                            right: -2,
-                            top: -2,
-                            child: Container(
-                              width: 8,
-                              height: 8,
-                              decoration: BoxDecoration(
-                                color: Theme.of(context).colorScheme.secondary,
-                                shape: BoxShape.circle,
+                icon: updateController.busy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Stack(
+                        clipBehavior: Clip.none,
+                        children: [
+                          const Icon(Icons.sync, size: 18),
+                          if (updateController.hasUpdate)
+                            Positioned(
+                              right: -2,
+                              top: -2,
+                              child: Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.secondary,
+                                  shape: BoxShape.circle,
+                                ),
                               ),
                             ),
-                          ),
-                      ],
-                    ),
+                        ],
+                      ),
+              ),
             ),
           ),
         );

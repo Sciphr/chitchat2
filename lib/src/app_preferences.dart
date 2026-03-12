@@ -10,11 +10,13 @@ class AppPreferences extends ChangeNotifier {
   bool _messageAnimations = true;
   bool _reduceMotion = false;
   bool _use24HourTime = false;
+  bool _showMessageTimestamps = true;
   String? _preferredAudioInputId;
   String? _preferredAudioOutputId;
   String? _preferredVideoInputId;
   bool _noiseCancellation = true;
   double _inputSensitivity = 1.0;
+  Map<String, DateTime> _channelLastReadAtById = const <String, DateTime>{};
 
   AppThemeScheme get themeScheme => _themeScheme;
   bool get desktopNotifications => _desktopNotifications;
@@ -22,6 +24,7 @@ class AppPreferences extends ChangeNotifier {
   bool get messageAnimations => _messageAnimations;
   bool get reduceMotion => _reduceMotion;
   bool get use24HourTime => _use24HourTime;
+  bool get showMessageTimestamps => _showMessageTimestamps;
   String? get preferredAudioInputId => _preferredAudioInputId;
   String? get preferredAudioOutputId => _preferredAudioOutputId;
   String? get preferredVideoInputId => _preferredVideoInputId;
@@ -37,11 +40,13 @@ class AppPreferences extends ChangeNotifier {
   static const _messageAnimationsKey = 'prefs.message_animations';
   static const _reduceMotionKey = 'prefs.reduce_motion';
   static const _use24HourTimeKey = 'prefs.use_24_hour_time';
+  static const _showMessageTimestampsKey = 'prefs.show_message_timestamps';
   static const _audioInputKey = 'prefs.audio_input_id';
   static const _audioOutputKey = 'prefs.audio_output_id';
   static const _videoInputKey = 'prefs.video_input_id';
   static const _noiseCancellationKey = 'prefs.noise_cancellation';
   static const _inputSensitivityKey = 'prefs.input_sensitivity';
+  static const _channelLastReadAtKey = 'prefs.channel_last_read_at';
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -55,6 +60,7 @@ class AppPreferences extends ChangeNotifier {
     _messageAnimations = prefs.getBool(_messageAnimationsKey) ?? true;
     _reduceMotion = prefs.getBool(_reduceMotionKey) ?? false;
     _use24HourTime = prefs.getBool(_use24HourTimeKey) ?? false;
+    _showMessageTimestamps = prefs.getBool(_showMessageTimestampsKey) ?? true;
     _preferredAudioInputId = prefs.getString(_audioInputKey);
     _preferredAudioOutputId = prefs.getString(_audioOutputKey);
     _preferredVideoInputId = prefs.getString(_videoInputKey);
@@ -63,6 +69,8 @@ class AppPreferences extends ChangeNotifier {
       0.5,
       2.0,
     );
+    final rawChannelReadAt = prefs.getString(_channelLastReadAtKey);
+    _channelLastReadAtById = _decodeChannelLastReadAt(rawChannelReadAt);
     notifyListeners();
   }
 
@@ -106,6 +114,13 @@ class AppPreferences extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_use24HourTimeKey, value);
+  }
+
+  Future<void> setShowMessageTimestamps(bool value) async {
+    _showMessageTimestamps = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_showMessageTimestampsKey, value);
   }
 
   Future<void> setPreferredAudioInputId(String? value) async {
@@ -153,6 +168,49 @@ class AppPreferences extends ChangeNotifier {
     notifyListeners();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_inputSensitivityKey, _inputSensitivity);
+  }
+
+  DateTime? channelLastReadAt(String channelId) =>
+      _channelLastReadAtById[channelId];
+
+  Future<void> markChannelRead(String channelId, DateTime timestamp) async {
+    final previous = _channelLastReadAtById[channelId];
+    if (previous != null && !timestamp.isAfter(previous)) {
+      return;
+    }
+    _channelLastReadAtById = Map<String, DateTime>.from(_channelLastReadAtById)
+      ..[channelId] = timestamp;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _channelLastReadAtKey,
+      _encodeChannelLastReadAt(_channelLastReadAtById),
+    );
+  }
+
+  Map<String, DateTime> _decodeChannelLastReadAt(String? raw) {
+    if (raw == null || raw.isEmpty) {
+      return const <String, DateTime>{};
+    }
+    final values = <String, DateTime>{};
+    for (final entry in raw.split('|')) {
+      final separator = entry.indexOf('=');
+      if (separator <= 0 || separator >= entry.length - 1) {
+        continue;
+      }
+      final channelId = entry.substring(0, separator);
+      final timestamp = DateTime.tryParse(entry.substring(separator + 1));
+      if (timestamp != null) {
+        values[channelId] = timestamp.toLocal();
+      }
+    }
+    return values;
+  }
+
+  String _encodeChannelLastReadAt(Map<String, DateTime> values) {
+    return values.entries
+        .map((entry) => '${entry.key}=${entry.value.toUtc().toIso8601String()}')
+        .join('|');
   }
 }
 

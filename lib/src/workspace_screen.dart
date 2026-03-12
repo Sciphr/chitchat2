@@ -1,12 +1,15 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_preferences.dart';
+import 'app_toast.dart';
+import 'desktop_notifications.dart';
 import 'models.dart';
 import 'repositories.dart';
 import 'session_controller.dart';
@@ -67,6 +70,16 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   bool _displayNamePromptShown = false;
   bool _showDirectMessages = false;
   String? _selectedDirectConversationId;
+  bool _serverDetailsPanelCollapsed = false;
+  bool _directMessagesDetailsPanelCollapsed = true;
+  StreamSubscription<Map<String, List<ChannelMessage>>>?
+  _channelMessagesSubscription;
+  Map<String, List<ChannelMessage>> _channelMessagesById =
+      const <String, List<ChannelMessage>>{};
+  Map<String, int> _channelUnreadCounts = const <String, int>{};
+  Map<String, int> _lastChannelUnreadCounts = const <String, int>{};
+  Map<String, int> _lastDirectUnreadCounts = const <String, int>{};
+  String? _currentUserAvatarPath;
 
   @override
   void initState() {
@@ -81,6 +94,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   @override
   void dispose() {
     widget.preferences.removeListener(_handlePreferenceChanges);
+    unawaited(_channelMessagesSubscription?.cancel());
     unawaited(_activeVoiceController?.close());
     if (!identical(_previewVoiceController, _activeVoiceController)) {
       unawaited(_previewVoiceController?.close());
@@ -96,6 +110,199 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 
   void _handlePreferenceChanges() {
     unawaited(_applyPreferredAudioSettings());
+    _recomputeChannelUnreadCounts(notify: false);
+  }
+
+  bool get _detailsPanelCollapsed => _showDirectMessages
+      ? _directMessagesDetailsPanelCollapsed
+      : _serverDetailsPanelCollapsed;
+
+  void _setDetailsPanelCollapsed(bool value) {
+    setState(() {
+      if (_showDirectMessages) {
+        _directMessagesDetailsPanelCollapsed = value;
+      } else {
+        _serverDetailsPanelCollapsed = value;
+      }
+    });
+  }
+
+  void _toggleDetailsPanel() {
+    _setDetailsPanelCollapsed(!_detailsPanelCollapsed);
+  }
+
+  Future<void> _resubscribeChannelMessages() async {
+    await _channelMessagesSubscription?.cancel();
+    _channelMessagesSubscription = null;
+
+    final textChannelIds = _channels
+        .where((channel) => channel.kind == ChannelKind.text)
+        .map((channel) => channel.id)
+        .toList(growable: false);
+    if (textChannelIds.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _channelMessagesById = const <String, List<ChannelMessage>>{};
+        _channelUnreadCounts = const <String, int>{};
+        _lastChannelUnreadCounts = const <String, int>{};
+      });
+      return;
+    }
+
+    _channelMessagesSubscription = widget.workspaceRepository
+        .watchChannelsMessages(textChannelIds)
+        .listen((messagesById) {
+          _channelMessagesById = messagesById;
+          _recomputeChannelUnreadCounts(notify: true);
+        });
+  }
+
+  void _recomputeChannelUnreadCounts({required bool notify}) {
+    final previousUnreadCounts = _lastChannelUnreadCounts;
+    final nextUnreadCounts = <String, int>{};
+    for (final channel in _channels) {
+      if (channel.kind != ChannelKind.text) {
+        continue;
+      }
+      final lastReadAt = widget.preferences.channelLastReadAt(channel.id);
+      final messages =
+          _channelMessagesById[channel.id] ?? const <ChannelMessage>[];
+      final unreadCount = messages.where((message) {
+        if (message.senderId == widget.authService.userId) {
+          return false;
+        }
+        if (lastReadAt == null) {
+          return true;
+        }
+        return message.createdAt.isAfter(lastReadAt);
+      }).length;
+      nextUnreadCounts[channel.id] = unreadCount;
+    }
+
+    final notifyChannels = notify && previousUnreadCounts.isNotEmpty
+        ? _channels
+              .where((channel) {
+                final previousUnread = previousUnreadCounts[channel.id] ?? 0;
+                final nextUnread = nextUnreadCounts[channel.id] ?? 0;
+                return channel.kind == ChannelKind.text &&
+                    nextUnread > previousUnread &&
+                    channel.id != _selectedChannel?.id;
+              })
+              .toList(growable: false)
+        : const <ChannelSummary>[];
+    _lastChannelUnreadCounts = nextUnreadCounts;
+
+    if (mounted && !mapEquals(_channelUnreadCounts, nextUnreadCounts)) {
+      setState(() {
+        _channelUnreadCounts = nextUnreadCounts;
+      });
+    }
+
+    if (notifyChannels.isEmpty) {
+      return;
+    }
+
+    final latestChannel = notifyChannels.last;
+    final lastReadAt = widget.preferences.channelLastReadAt(latestChannel.id);
+    final messages =
+        _channelMessagesById[latestChannel.id] ?? const <ChannelMessage>[];
+    ChannelMessage? latestUnreadMessage;
+    for (final message in messages.reversed) {
+      if (message.senderId == widget.authService.userId) {
+        continue;
+      }
+      if (lastReadAt != null && !message.createdAt.isAfter(lastReadAt)) {
+        continue;
+      }
+      latestUnreadMessage = message;
+      break;
+    }
+    if (latestUnreadMessage == null) {
+      return;
+    }
+    final unreadMessage = latestUnreadMessage;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _notifyActivity(
+        toastMessage:
+            '${unreadMessage.senderDisplayName} in #${latestChannel.name}',
+        desktopTitle:
+            '${unreadMessage.senderDisplayName} in #${latestChannel.name}',
+        desktopBody: _messageActivityPreview(
+          body: unreadMessage.body,
+          attachments: unreadMessage.attachments,
+          deleted: unreadMessage.deleted,
+        ),
+      );
+    });
+  }
+
+  void _handleDirectConversationNotifications(
+    List<DirectConversationSummary> conversations,
+  ) {
+    final nextUnreadCounts = <String, int>{
+      for (final conversation in conversations)
+        conversation.conversationId: conversation.unreadCount,
+    };
+    if (_lastDirectUnreadCounts.isEmpty) {
+      _lastDirectUnreadCounts = nextUnreadCounts;
+      return;
+    }
+
+    final newUnreadConversations = conversations
+        .where((conversation) {
+          final previousUnread =
+              _lastDirectUnreadCounts[conversation.conversationId] ?? 0;
+          return conversation.unreadCount > previousUnread &&
+              conversation.conversationId != _selectedDirectConversationId;
+        })
+        .toList(growable: false);
+    _lastDirectUnreadCounts = nextUnreadCounts;
+
+    if (newUnreadConversations.isEmpty) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      final latestConversation = newUnreadConversations.last;
+      _notifyActivity(
+        toastMessage: 'New DM from ${latestConversation.otherDisplayName}.',
+        desktopTitle: 'New DM from ${latestConversation.otherDisplayName}',
+        desktopBody:
+            latestConversation.lastMessagePreview?.trim().isNotEmpty == true
+            ? latestConversation.lastMessagePreview
+            : 'Open ChitChat to read it.',
+      );
+    });
+  }
+
+  void _notifyActivity({
+    required String toastMessage,
+    required String desktopTitle,
+    String? desktopBody,
+  }) {
+    if (widget.preferences.desktopNotifications) {
+      showAppToast(context, toastMessage, tone: AppToastTone.neutral);
+      unawaited(
+        showDesktopNotification(title: desktopTitle, body: desktopBody),
+      );
+    }
+    if (widget.preferences.playSounds) {
+      unawaited(
+        _soundEffects.play(
+          UiSoundEffect.message,
+          enabled: widget.preferences.playSounds,
+        ),
+      );
+    }
   }
 
   Future<void> _applyPreferredAudioOutput() async {
@@ -287,7 +494,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
           ),
           callback: (_) {
             if (mounted) {
-              unawaited(_loadServers(selectFirstServer: _selectedServer == null));
+              unawaited(
+                _loadServers(selectFirstServer: _selectedServer == null),
+              );
             }
           },
         )
@@ -304,7 +513,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 _selectedServer?.id == serverId ||
                 _servers.any((server) => server.id == serverId);
             if (shouldRefresh && mounted) {
-              unawaited(_loadServers(selectFirstServer: _selectedServer == null));
+              unawaited(
+                _loadServers(selectFirstServer: _selectedServer == null),
+              );
             }
           },
         );
@@ -454,7 +665,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     } catch (error) {
       await client.removeChannel(realtimeChannel);
       if (_selectedServer?.id == server.id) {
-        debugPrint('Server structure subscription failed for ${server.id}: $error');
+        debugPrint(
+          'Server structure subscription failed for ${server.id}: $error',
+        );
       }
     }
   }
@@ -602,9 +815,12 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
     if (staleChannelIds.isNotEmpty && mounted) {
       setState(() {
-        _voiceParticipantsByChannel = Map<String, List<VoiceParticipant>>.from(
-          _voiceParticipantsByChannel,
-        )..removeWhere((channelId, _) => !desiredChannelIds.contains(channelId));
+        _voiceParticipantsByChannel =
+            Map<String, List<VoiceParticipant>>.from(
+              _voiceParticipantsByChannel,
+            )..removeWhere(
+              (channelId, _) => !desiredChannelIds.contains(channelId),
+            );
       });
     }
 
@@ -944,6 +1160,25 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
   }
 
+  Future<void> _openActiveVoiceChannel() async {
+    final activeChannel = _activeVoiceChannel;
+    if (activeChannel == null) {
+      return;
+    }
+
+    final targetServer = _servers.cast<ServerSummary?>().firstWhere(
+      (server) => server?.id == activeChannel.serverId,
+      orElse: () => _selectedServer,
+    );
+    if (targetServer != null && _selectedServer?.id != targetServer.id) {
+      await _selectServer(targetServer);
+    }
+    if (!mounted) {
+      return;
+    }
+    await _selectChannel(activeChannel);
+  }
+
   Future<void> _loadServers({bool selectFirstServer = false}) async {
     setState(() {
       _loadingServers = true;
@@ -992,6 +1227,13 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   Future<void> _initializeWorkspace() async {
     try {
       await widget.workspaceRepository.ensureCurrentProfile();
+      final currentProfile = await widget.workspaceRepository
+          .fetchCurrentUserProfile();
+      if (mounted) {
+        setState(() {
+          _currentUserAvatarPath = currentProfile.avatarPath;
+        });
+      }
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -1007,6 +1249,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   }
 
   Future<void> _handleProfileUpdated() async {
+    final currentProfile = await widget.workspaceRepository
+        .fetchCurrentUserProfile();
     await _activeVoiceController?.refreshLocalParticipantProfile();
     if (!identical(_previewVoiceController, _activeVoiceController)) {
       await _previewVoiceController?.refreshLocalParticipantProfile();
@@ -1017,7 +1261,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       await _loadServerRoster(selectedServer);
     }
     if (mounted) {
-      setState(() {});
+      setState(() {
+        _currentUserAvatarPath = currentProfile.avatarPath;
+      });
     }
   }
 
@@ -1113,9 +1359,11 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
               if (!dialogContext.mounted) {
                 return;
               }
-              ScaffoldMessenger.of(
+              showAppToast(
                 dialogContext,
-              ).showSnackBar(SnackBar(content: Text(error.toString())));
+                error.toString(),
+                tone: AppToastTone.error,
+              );
             }
           }
 
@@ -1152,9 +1400,11 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       );
 
       if (saved == true && mounted) {
-        ScaffoldMessenger.of(
+        showAppToast(
           context,
-        ).showSnackBar(const SnackBar(content: Text('Display name updated.')));
+          'Display name updated.',
+          tone: AppToastTone.success,
+        );
       }
     } finally {
       controller.dispose();
@@ -1186,6 +1436,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         _channels = channels;
         _loadingChannels = false;
       });
+      await _resubscribeChannelMessages();
       await _syncVoicePresenceSubscriptions(serverId, channels);
 
       if (selectFirst && channels.isNotEmpty) {
@@ -1227,11 +1478,16 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     _serverRoles = const <ServerRole>[];
     _serverMembers = const <ServerMember>[];
     _voiceParticipantsByChannel = const <String, List<VoiceParticipant>>{};
+    _channelMessagesById = const <String, List<ChannelMessage>>{};
+    _channelUnreadCounts = const <String, int>{};
     _serverAccess = null;
     _memberRosterError = null;
     _loadingMemberRoster = server != null;
     _loadingServerAccess = server != null;
     setState(() {});
+
+    await _channelMessagesSubscription?.cancel();
+    _channelMessagesSubscription = null;
 
     if (server != null) {
       await Future.wait<void>([
@@ -1251,10 +1507,44 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
     setState(() {
       _showDirectMessages = true;
+      _directMessagesDetailsPanelCollapsed = true;
       if (conversationId != null) {
         _selectedDirectConversationId = conversationId;
       }
     });
+  }
+
+  Future<void> _promptStartDirectMessage() async {
+    final candidates =
+        _serverMembers
+            .where((member) => member.userId != widget.authService.userId)
+            .toList()
+          ..sort(
+            (left, right) => left.displayName.toLowerCase().compareTo(
+              right.displayName.toLowerCase(),
+            ),
+          );
+    if (candidates.isEmpty) {
+      showAppToast(
+        context,
+        'Pick a server with members first to start a new direct message.',
+        tone: AppToastTone.neutral,
+      );
+      return;
+    }
+
+    final selectedMember = await showDialog<ServerMember>(
+      context: context,
+      builder: (context) => _StartDirectMessageDialog(members: candidates),
+    );
+    if (selectedMember == null) {
+      return;
+    }
+
+    await _startDirectMessage(
+      userId: selectedMember.userId,
+      displayName: selectedMember.displayName,
+    );
   }
 
   Future<void> _startDirectMessage({
@@ -1272,27 +1562,30 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       }
       setState(() {
         _showDirectMessages = true;
+        _directMessagesDetailsPanelCollapsed = true;
         _selectedDirectConversationId = conversationId;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Opened direct messages with $displayName.')),
+      showAppToast(
+        context,
+        'Opened direct messages with $displayName.',
+        tone: AppToastTone.success,
       );
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
   void _selectDirectConversation(String conversationId) {
-    if (_selectedDirectConversationId == conversationId && _showDirectMessages) {
+    if (_selectedDirectConversationId == conversationId &&
+        _showDirectMessages) {
       return;
     }
     setState(() {
       _showDirectMessages = true;
+      _directMessagesDetailsPanelCollapsed = true;
       _selectedDirectConversationId = conversationId;
     });
   }
@@ -1358,9 +1651,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1405,9 +1696,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1542,9 +1831,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1592,9 +1879,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1640,9 +1925,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1682,9 +1965,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       setState(() {
         _categories = previousCategories;
       });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1797,9 +2078,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       setState(() {
         _channels = previousChannels;
       });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1812,8 +2091,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     if (!mounted) {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Invite code copied to clipboard.')),
+    showAppToast(
+      context,
+      'Invite code copied to clipboard.',
+      tone: AppToastTone.success,
     );
   }
 
@@ -1850,9 +2131,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -1927,12 +2206,16 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     return StreamBuilder<List<DirectConversationSummary>>(
       stream: _directConversationSummariesStream,
       builder: (context, directConversationsSnapshot) {
-        final directConversations = directConversationsSnapshot.data ?? const <DirectConversationSummary>[];
+        final directConversations =
+            directConversationsSnapshot.data ??
+            const <DirectConversationSummary>[];
+        _handleDirectConversationNotifications(directConversations);
         final selectedDirectConversation = _selectedDirectConversationId == null
             ? null
             : directConversations.cast<DirectConversationSummary?>().firstWhere(
                 (conversation) =>
-                    conversation?.conversationId == _selectedDirectConversationId,
+                    conversation?.conversationId ==
+                    _selectedDirectConversationId,
                 orElse: () => null,
               );
         if (_showDirectMessages &&
@@ -1953,7 +2236,9 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         );
         final activeVoiceController = _activeVoiceController;
         final voiceParticipantsByChannel =
-            Map<String, List<VoiceParticipant>>.from(_voiceParticipantsByChannel);
+            Map<String, List<VoiceParticipant>>.from(
+              _voiceParticipantsByChannel,
+            );
         if (activeVoiceController != null && _activeVoiceChannel != null) {
           final activeChannelId = _activeVoiceChannel!.id;
           final presenceParticipants =
@@ -2003,7 +2288,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         final sidebar = _showDirectMessages
             ? _DirectMessagesSidebar(
                 conversations: directConversations,
-                loading: !directConversationsSnapshot.hasData &&
+                loading:
+                    !directConversationsSnapshot.hasData &&
                     directConversationsSnapshot.connectionState !=
                         ConnectionState.active,
                 error: directConversationsSnapshot.hasError
@@ -2011,7 +2297,21 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                     : null,
                 selectedConversationId: _selectedDirectConversationId,
                 currentDisplayName: widget.authService.displayName,
+                currentAvatarUrl: widget.workspaceRepository
+                    .publicProfileAvatarUrl(_currentUserAvatarPath),
+                avatarUrlForPath:
+                    widget.workspaceRepository.publicProfileAvatarUrl,
                 onSelectConversation: _selectDirectConversation,
+                canStartConversation: _serverMembers.any(
+                  (member) => member.userId != widget.authService.userId,
+                ),
+                onStartConversation: _promptStartDirectMessage,
+                activeVoiceChannel: _activeVoiceChannel,
+                activeVoiceController: activeVoiceController,
+                canStreamCamera: true,
+                canShareScreen: true,
+                onOpenActiveVoiceChannel: _openActiveVoiceChannel,
+                onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
                 onOpenUserSettings: _openUserSettings,
                 onSignOut: widget.authService.signOut,
               )
@@ -2025,20 +2325,31 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 error: _channelError,
                 access: _serverAccess,
                 selectedChannelId: _selectedChannel?.id,
+                channelUnreadCounts: _channelUnreadCounts,
                 voiceParticipantsByChannel: voiceParticipantsByChannel,
+                activeVoiceChannel: _activeVoiceChannel,
+                activeVoiceController: activeVoiceController,
+                canStreamCamera: true,
+                canShareScreen: true,
                 onSelectChannel: _selectChannel,
                 onRenameCategory: _promptRenameCategory,
                 onReorderCategories: _reorderCategories,
-            onMoveChannel: _moveChannel,
-            onOpenSettings: _openServerSettings,
-            onCopyInviteCode: _copyInviteCode,
-            onOpenUserSettings: _openUserSettings,
-            onSignOut: widget.authService.signOut,
-            currentDisplayName: widget.authService.displayName,
-                onStartDirectMessage: ({
-                  required userId,
-                  required displayName,
-                }) => _startDirectMessage(userId: userId, displayName: displayName),
+                onMoveChannel: _moveChannel,
+                onOpenSettings: _openServerSettings,
+                onCopyInviteCode: _copyInviteCode,
+                onOpenUserSettings: _openUserSettings,
+                onSignOut: widget.authService.signOut,
+                currentDisplayName: widget.authService.displayName,
+                currentAvatarUrl: widget.workspaceRepository
+                    .publicProfileAvatarUrl(_currentUserAvatarPath),
+                onOpenActiveVoiceChannel: _openActiveVoiceChannel,
+                onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
+                onStartDirectMessage:
+                    ({required userId, required displayName}) =>
+                        _startDirectMessage(
+                          userId: userId,
+                          displayName: displayName,
+                        ),
               )
             : AnimatedBuilder(
                 animation: activeVoiceController,
@@ -2051,27 +2362,39 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                   error: _channelError,
                   access: _serverAccess,
                   selectedChannelId: _selectedChannel?.id,
+                  channelUnreadCounts: _channelUnreadCounts,
                   voiceParticipantsByChannel: voiceParticipantsByChannel,
+                  activeVoiceChannel: _activeVoiceChannel,
+                  activeVoiceController: activeVoiceController,
+                  canStreamCamera: true,
+                  canShareScreen: true,
                   onSelectChannel: _selectChannel,
                   onRenameCategory: _promptRenameCategory,
                   onReorderCategories: _reorderCategories,
-              onMoveChannel: _moveChannel,
-              onOpenSettings: _openServerSettings,
-              onCopyInviteCode: _copyInviteCode,
-              onOpenUserSettings: _openUserSettings,
-              onSignOut: widget.authService.signOut,
-              currentDisplayName: widget.authService.displayName,
-                  onStartDirectMessage: ({
-                    required userId,
-                    required displayName,
-                  }) =>
-                      _startDirectMessage(userId: userId, displayName: displayName),
+                  onMoveChannel: _moveChannel,
+                  onOpenSettings: _openServerSettings,
+                  onCopyInviteCode: _copyInviteCode,
+                  onOpenUserSettings: _openUserSettings,
+                  onSignOut: widget.authService.signOut,
+                  currentDisplayName: widget.authService.displayName,
+                  currentAvatarUrl: widget.workspaceRepository
+                      .publicProfileAvatarUrl(_currentUserAvatarPath),
+                  onOpenActiveVoiceChannel: _openActiveVoiceChannel,
+                  onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
+                  onStartDirectMessage:
+                      ({required userId, required displayName}) =>
+                          _startDirectMessage(
+                            userId: userId,
+                            displayName: displayName,
+                          ),
                 ),
               );
 
         final membersPanel = _showDirectMessages
             ? _DirectMessagesInfoPanel(
                 selectedConversation: selectedDirectConversation,
+                avatarUrlForPath:
+                    widget.workspaceRepository.publicProfileAvatarUrl,
               )
             : _ServerMembersPanel(
                 server: selectedServer,
@@ -2081,34 +2404,47 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 loading: _loadingMemberRoster,
                 error: _memberRosterError,
                 currentUserId: widget.authService.userId,
-                onStartDirectMessage: ({
-                  required userId,
-                  required displayName,
-                }) =>
-                    _startDirectMessage(userId: userId, displayName: displayName),
+                avatarUrlForPath:
+                    widget.workspaceRepository.publicProfileAvatarUrl,
+                onStartDirectMessage:
+                    ({required userId, required displayName}) =>
+                        _startDirectMessage(
+                          userId: userId,
+                          displayName: displayName,
+                        ),
               );
 
         final content = _showDirectMessages
             ? selectedDirectConversation == null
-                ? const _EmptyState(
-                    title: 'Direct messages',
-                    message: 'Pick a conversation or start one from a member, message, or voice participant.',
-                  )
-                : DirectMessageView(
-                    key: ValueKey<String>(selectedDirectConversation.conversationId),
-                    conversation: selectedDirectConversation,
-                    repository: widget.workspaceRepository,
-                    currentUserId: widget.authService.userId,
-                    use24HourTime: widget.preferences.use24HourTime,
-                    motionDuration: widget.preferences.motionDuration,
-                    animateMessages: widget.preferences.messageAnimations &&
-                        !widget.preferences.reduceMotion,
-                    onStartDirectMessage: ({
-                      required userId,
-                      required displayName,
-                    }) =>
-                        _startDirectMessage(userId: userId, displayName: displayName),
-                  )
+                  ? const _EmptyState(
+                      title: 'Direct messages',
+                      message:
+                          'Pick a conversation or start one from a member, message, or voice participant.',
+                    )
+                  : DirectMessageView(
+                      key: ValueKey<String>(
+                        selectedDirectConversation.conversationId,
+                      ),
+                      conversation: selectedDirectConversation,
+                      repository: widget.workspaceRepository,
+                      currentUserId: widget.authService.userId,
+                      use24HourTime: widget.preferences.use24HourTime,
+                      showTimestamps: widget.preferences.showMessageTimestamps,
+                      motionDuration: widget.preferences.motionDuration,
+                      animateMessages:
+                          widget.preferences.messageAnimations &&
+                          !widget.preferences.reduceMotion,
+                      onMarkRead: () =>
+                          widget.workspaceRepository.markDirectConversationRead(
+                            selectedDirectConversation.conversationId,
+                          ),
+                      onStartDirectMessage:
+                          ({required userId, required displayName}) =>
+                              _startDirectMessage(
+                                userId: userId,
+                                displayName: displayName,
+                              ),
+                    )
             : _selectedChannel == null
             ? const _EmptyState(
                 title: 'Select a channel',
@@ -2121,21 +2457,31 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 repository: widget.workspaceRepository,
                 currentUserId: widget.authService.userId,
                 canSendMessages:
-                    _serverAccess?.hasPermission(ServerPermission.sendMessages) ??
+                    _serverAccess?.hasPermission(
+                      ServerPermission.sendMessages,
+                    ) ??
                     true,
                 canManageMessages:
-                    _serverAccess?.hasPermission(ServerPermission.manageMessages) ??
+                    _serverAccess?.hasPermission(
+                      ServerPermission.manageMessages,
+                    ) ??
                     false,
                 use24HourTime: widget.preferences.use24HourTime,
+                showTimestamps: widget.preferences.showMessageTimestamps,
                 motionDuration: widget.preferences.motionDuration,
                 animateMessages:
                     widget.preferences.messageAnimations &&
                     !widget.preferences.reduceMotion,
-                onStartDirectMessage: ({
-                  required userId,
-                  required displayName,
-                }) =>
-                    _startDirectMessage(userId: userId, displayName: displayName),
+                onMarkRead: (timestamp) => widget.preferences.markChannelRead(
+                  _selectedChannel!.id,
+                  timestamp,
+                ),
+                onStartDirectMessage:
+                    ({required userId, required displayName}) =>
+                        _startDirectMessage(
+                          userId: userId,
+                          displayName: displayName,
+                        ),
               )
             : VoiceChannelView(
                 channel: _selectedChannel!,
@@ -2146,21 +2492,28 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                     _serverAccess?.hasPermission(ServerPermission.joinVoice) ??
                     true,
                 canManageServer:
-                    _serverAccess?.hasPermission(ServerPermission.manageServer) ??
+                    _serverAccess?.hasPermission(
+                      ServerPermission.manageServer,
+                    ) ??
                     false,
                 canStreamCamera:
-                    _serverAccess?.hasPermission(ServerPermission.streamCamera) ??
+                    _serverAccess?.hasPermission(
+                      ServerPermission.streamCamera,
+                    ) ??
                     true,
                 canShareScreen:
-                    _serverAccess?.hasPermission(ServerPermission.shareScreen) ??
+                    _serverAccess?.hasPermission(
+                      ServerPermission.shareScreen,
+                    ) ??
                     true,
                 onJoinCall: _joinSelectedVoiceChannel,
                 onLeaveCall: _leaveActiveVoiceChannel,
-                onStartDirectMessage: ({
-                  required userId,
-                  required displayName,
-                }) =>
-                    _startDirectMessage(userId: userId, displayName: displayName),
+                onStartDirectMessage:
+                    ({required userId, required displayName}) =>
+                        _startDirectMessage(
+                          userId: userId,
+                          displayName: displayName,
+                        ),
               );
 
         return Scaffold(
@@ -2250,8 +2603,37 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 18),
-                    SizedBox(width: 288, child: membersPanel),
+                    const SizedBox(width: 12),
+                    _DetailsPanelToggle(
+                      collapsed: _detailsPanelCollapsed,
+                      directMessages: _showDirectMessages,
+                      onPressed: _toggleDetailsPanel,
+                    ),
+                    TweenAnimationBuilder<double>(
+                      tween: Tween<double>(
+                        begin: 0,
+                        end: _detailsPanelCollapsed ? 0 : 1,
+                      ),
+                      duration: widget.preferences.motionDuration,
+                      curve: Curves.easeOutCubic,
+                      builder: (context, factor, child) {
+                        return SizedBox(
+                          width: 288 * factor,
+                          child: IgnorePointer(
+                            ignoring: factor < 0.99,
+                            child: ClipRect(
+                              child: OverflowBox(
+                                minWidth: 288,
+                                maxWidth: 288,
+                                alignment: Alignment.centerRight,
+                                child: child,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                      child: SizedBox(width: 288, child: membersPanel),
+                    ),
                   ],
                 ),
               ),
@@ -2303,9 +2685,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -2368,9 +2748,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 }
@@ -2378,11 +2756,13 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
 class _SidebarAccountFooter extends StatelessWidget {
   const _SidebarAccountFooter({
     required this.displayName,
+    required this.avatarUrl,
     required this.onOpenUserSettings,
     required this.onSignOut,
   });
 
   final String displayName;
+  final String? avatarUrl;
   final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
 
@@ -2413,17 +2793,11 @@ class _SidebarAccountFooter extends StatelessWidget {
                     ),
                     child: Row(
                       children: [
-                        Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
-                            color: palette.panelAccent.withAlpha(120),
-                            shape: BoxShape.circle,
-                          ),
-                          child: Icon(
-                            Icons.account_circle_outlined,
-                            color: theme.colorScheme.onSurface,
-                          ),
+                        _UserAvatar(
+                          displayName: displayName,
+                          avatarUrl: avatarUrl,
+                          size: 38,
+                          backgroundColor: palette.panelAccent.withAlpha(120),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
@@ -2465,7 +2839,17 @@ class _DirectMessagesSidebar extends StatelessWidget {
     required this.error,
     required this.selectedConversationId,
     required this.currentDisplayName,
+    required this.currentAvatarUrl,
+    required this.avatarUrlForPath,
     required this.onSelectConversation,
+    required this.canStartConversation,
+    required this.onStartConversation,
+    required this.activeVoiceChannel,
+    required this.activeVoiceController,
+    required this.canStreamCamera,
+    required this.canShareScreen,
+    required this.onOpenActiveVoiceChannel,
+    required this.onLeaveActiveVoiceChannel,
     required this.onOpenUserSettings,
     required this.onSignOut,
   });
@@ -2475,13 +2859,25 @@ class _DirectMessagesSidebar extends StatelessWidget {
   final String? error;
   final String? selectedConversationId;
   final String currentDisplayName;
+  final String? currentAvatarUrl;
+  final String? Function(String? avatarPath) avatarUrlForPath;
   final ValueChanged<String> onSelectConversation;
+  final bool canStartConversation;
+  final Future<void> Function() onStartConversation;
+  final ChannelSummary? activeVoiceChannel;
+  final VoiceChannelSessionController? activeVoiceController;
+  final bool canStreamCamera;
+  final bool canShareScreen;
+  final Future<void> Function() onOpenActiveVoiceChannel;
+  final Future<void> Function() onLeaveActiveVoiceChannel;
   final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final dockChannel = activeVoiceChannel;
+    final dockController = activeVoiceController;
     return DecoratedBox(
       decoration: BoxDecoration(
         color: palette.panelMuted,
@@ -2503,6 +2899,15 @@ class _DirectMessagesSidebar extends StatelessWidget {
             Text(
               'Private conversations stay here across all servers.',
               style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 16),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: FilledButton.tonalIcon(
+                onPressed: canStartConversation ? onStartConversation : null,
+                icon: const Icon(Icons.edit_square),
+                label: const Text('Start DM'),
+              ),
             ),
             const SizedBox(height: 16),
             if (error != null)
@@ -2527,11 +2932,11 @@ class _DirectMessagesSidebar extends StatelessWidget {
                       itemBuilder: (context, index) {
                         final conversation = conversations[index];
                         final selected =
-                            conversation.conversationId == selectedConversationId;
+                            conversation.conversationId ==
+                            selectedConversationId;
                         return InkWell(
-                          onTap: () => onSelectConversation(
-                            conversation.conversationId,
-                          ),
+                          onTap: () =>
+                              onSelectConversation(conversation.conversationId),
                           borderRadius: BorderRadius.circular(18),
                           child: Ink(
                             padding: const EdgeInsets.all(12),
@@ -2548,22 +2953,14 @@ class _DirectMessagesSidebar extends StatelessWidget {
                             ),
                             child: Row(
                               children: [
-                                Container(
-                                  width: 38,
-                                  height: 38,
-                                  decoration: BoxDecoration(
-                                    color: palette.panelAccent.withAlpha(140),
-                                    shape: BoxShape.circle,
+                                _UserAvatar(
+                                  displayName: conversation.otherDisplayName,
+                                  avatarUrl: avatarUrlForPath(
+                                    conversation.otherAvatarPath,
                                   ),
-                                  child: Center(
-                                    child: Text(
-                                      conversation.otherDisplayName.characters.first
-                                          .toUpperCase(),
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w800,
-                                      ),
-                                    ),
-                                  ),
+                                  size: 38,
+                                  backgroundColor: palette.panelAccent
+                                      .withAlpha(140),
                                 ),
                                 const SizedBox(width: 12),
                                 Expanded(
@@ -2603,11 +3000,23 @@ class _DirectMessagesSidebar extends StatelessWidget {
                       },
                     ),
             ),
+            if (dockChannel != null && dockController != null) ...[
+              const SizedBox(height: 14),
+              _ActiveVoiceDock(
+                channel: dockChannel,
+                controller: dockController,
+                canStreamCamera: canStreamCamera,
+                canShareScreen: canShareScreen,
+                onOpenChannel: onOpenActiveVoiceChannel,
+                onLeaveCall: onLeaveActiveVoiceChannel,
+              ),
+            ],
             const SizedBox(height: 14),
             const Divider(height: 1),
             const SizedBox(height: 10),
             _SidebarAccountFooter(
               displayName: currentDisplayName,
+              avatarUrl: currentAvatarUrl,
               onOpenUserSettings: onOpenUserSettings,
               onSignOut: onSignOut,
             ),
@@ -2619,9 +3028,13 @@ class _DirectMessagesSidebar extends StatelessWidget {
 }
 
 class _DirectMessagesInfoPanel extends StatelessWidget {
-  const _DirectMessagesInfoPanel({required this.selectedConversation});
+  const _DirectMessagesInfoPanel({
+    required this.selectedConversation,
+    required this.avatarUrlForPath,
+  });
 
   final DirectConversationSummary? selectedConversation;
+  final String? Function(String? avatarPath) avatarUrlForPath;
 
   @override
   Widget build(BuildContext context) {
@@ -2643,6 +3056,14 @@ class _DirectMessagesInfoPanel extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  _UserAvatar(
+                    displayName: selectedConversation!.otherDisplayName,
+                    avatarUrl: avatarUrlForPath(
+                      selectedConversation!.otherAvatarPath,
+                    ),
+                    size: 56,
+                  ),
+                  const SizedBox(height: 14),
                   Text(
                     selectedConversation!.otherDisplayName,
                     style: Theme.of(context).textTheme.headlineSmall?.copyWith(
@@ -2657,10 +3078,7 @@ class _DirectMessagesInfoPanel extends StatelessWidget {
                   const SizedBox(height: 4),
                   SelectableText(selectedConversation!.otherUserId),
                   const SizedBox(height: 18),
-                  Text(
-                    'Unread',
-                    style: Theme.of(context).textTheme.labelLarge,
-                  ),
+                  Text('Unread', style: Theme.of(context).textTheme.labelLarge),
                   const SizedBox(height: 4),
                   Text('${selectedConversation!.unreadCount} message(s)'),
                 ],
@@ -2690,6 +3108,209 @@ class _UnreadBadge extends StatelessWidget {
           fontWeight: FontWeight.w700,
         ),
       ),
+    );
+  }
+}
+
+class _DetailsPanelToggle extends StatelessWidget {
+  const _DetailsPanelToggle({
+    required this.collapsed,
+    required this.directMessages,
+    required this.onPressed,
+  });
+
+  final bool collapsed;
+  final bool directMessages;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return SizedBox(
+      width: 44,
+      child: Center(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: palette.panelStrong,
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: palette.border),
+          ),
+          child: IconButton(
+            onPressed: onPressed,
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+            icon: Icon(
+              collapsed ? Icons.chevron_left : Icons.chevron_right,
+              size: 20,
+            ),
+            selectedIcon: Icon(
+              collapsed ? Icons.chevron_left : Icons.chevron_right,
+              size: 20,
+            ),
+            isSelected: !directMessages && !collapsed,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ActiveVoiceDock extends StatelessWidget {
+  const _ActiveVoiceDock({
+    required this.channel,
+    required this.controller,
+    required this.canStreamCamera,
+    required this.canShareScreen,
+    required this.onOpenChannel,
+    required this.onLeaveCall,
+  });
+
+  final ChannelSummary channel;
+  final VoiceChannelSessionController controller;
+  final bool canStreamCamera;
+  final bool canShareScreen;
+  final Future<void> Function() onOpenChannel;
+  final Future<void> Function() onLeaveCall;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            color: palette.panelStrong,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: palette.borderStrong.withAlpha(170)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                InkWell(
+                  onTap: onOpenChannel,
+                  borderRadius: BorderRadius.circular(14),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 2,
+                      vertical: 2,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.graphic_eq),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'In voice: ${channel.name}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                controller.status,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        const Icon(Icons.open_in_new, size: 18),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    IconButton.filledTonal(
+                      onPressed: controller.busy ? null : controller.toggleMute,
+                      icon: Icon(controller.muted ? Icons.mic_off : Icons.mic),
+                    ),
+                    IconButton.filledTonal(
+                      onPressed: controller.busy
+                          ? null
+                          : controller.toggleDeafen,
+                      icon: Icon(
+                        controller.deafened
+                            ? Icons.hearing_disabled
+                            : Icons.hearing,
+                      ),
+                    ),
+                    IconButton.filledTonal(
+                      onPressed: controller.busy || !canStreamCamera
+                          ? null
+                          : () async {
+                              if (controller.shareKind == ShareKind.camera) {
+                                await controller.stopVisualShare();
+                                return;
+                              }
+                              await controller.startCameraShare();
+                            },
+                      icon: Icon(
+                        controller.shareKind == ShareKind.camera
+                            ? Icons.videocam_off
+                            : Icons.videocam,
+                      ),
+                    ),
+                    IconButton.filledTonal(
+                      onPressed:
+                          controller.busy ||
+                              !canShareScreen ||
+                              !WebRTC.platformIsDesktop
+                          ? null
+                          : () async {
+                              if (controller.shareKind == ShareKind.screen) {
+                                await controller.stopVisualShare();
+                                return;
+                              }
+                              final selection =
+                                  await showDialog<_ScreenShareSelection>(
+                                    context: context,
+                                    builder: (context) =>
+                                        ScreenSourcePickerDialog(
+                                          controller: controller,
+                                        ),
+                                  );
+                              if (selection != null) {
+                                await controller.startScreenShare(
+                                  selection.source,
+                                  maxWidth: selection.preset.width,
+                                  maxHeight: selection.preset.height,
+                                  frameRate: selection.preset.frameRate,
+                                  captureSystemAudio:
+                                      selection.captureSystemAudio,
+                                );
+                              }
+                            },
+                      icon: Icon(
+                        controller.shareKind == ShareKind.screen
+                            ? Icons.stop_screen_share
+                            : Icons.screen_share,
+                      ),
+                    ),
+                    IconButton.filled(
+                      onPressed: controller.busy ? null : onLeaveCall,
+                      icon: const Icon(Icons.call_end),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -2733,10 +3354,7 @@ class _WorkspaceRailTile extends StatelessWidget {
           boxShadow: selected
               ? [
                   BoxShadow(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .primary
-                        .withAlpha(120),
+                    color: Theme.of(context).colorScheme.primary.withAlpha(120),
                     blurRadius: 20,
                     spreadRadius: 3,
                   ),
@@ -3030,6 +3648,57 @@ class _ServerAvatar extends StatelessWidget {
   }
 }
 
+class _UserAvatar extends StatelessWidget {
+  const _UserAvatar({
+    required this.displayName,
+    required this.avatarUrl,
+    required this.size,
+    this.backgroundColor,
+  });
+
+  final String displayName;
+  final String? avatarUrl;
+  final double size;
+  final Color? backgroundColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final fallback = Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color:
+            backgroundColor ??
+            Theme.of(context).colorScheme.surfaceContainerHigh,
+        shape: BoxShape.circle,
+      ),
+      alignment: Alignment.center,
+      child: Text(
+        displayName.trim().isEmpty
+            ? '?'
+            : displayName.characters.first.toUpperCase(),
+        style: TextStyle(fontWeight: FontWeight.w800, fontSize: size * 0.38),
+      ),
+    );
+
+    if (avatarUrl == null) {
+      return fallback;
+    }
+
+    return ClipOval(
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: Image.network(
+          avatarUrl!,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) => fallback,
+        ),
+      ),
+    );
+  }
+}
+
 class _ChannelSidebar extends StatefulWidget {
   const _ChannelSidebar({
     required this.server,
@@ -3040,7 +3709,12 @@ class _ChannelSidebar extends StatefulWidget {
     required this.error,
     required this.access,
     required this.selectedChannelId,
+    required this.channelUnreadCounts,
     required this.voiceParticipantsByChannel,
+    required this.activeVoiceChannel,
+    required this.activeVoiceController,
+    required this.canStreamCamera,
+    required this.canShareScreen,
     required this.onSelectChannel,
     required this.onRenameCategory,
     required this.onReorderCategories,
@@ -3050,6 +3724,9 @@ class _ChannelSidebar extends StatefulWidget {
     required this.onOpenUserSettings,
     required this.onSignOut,
     required this.currentDisplayName,
+    required this.currentAvatarUrl,
+    required this.onOpenActiveVoiceChannel,
+    required this.onLeaveActiveVoiceChannel,
     required this.onStartDirectMessage,
   });
 
@@ -3061,7 +3738,12 @@ class _ChannelSidebar extends StatefulWidget {
   final String? error;
   final ServerAccess? access;
   final String? selectedChannelId;
+  final Map<String, int> channelUnreadCounts;
   final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
+  final ChannelSummary? activeVoiceChannel;
+  final VoiceChannelSessionController? activeVoiceController;
+  final bool canStreamCamera;
+  final bool canShareScreen;
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
   final Future<void> Function(ChannelCategorySummary category) onRenameCategory;
   final Future<void> Function(int oldIndex, int newIndex) onReorderCategories;
@@ -3076,6 +3758,9 @@ class _ChannelSidebar extends StatefulWidget {
   final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
   final String currentDisplayName;
+  final String? currentAvatarUrl;
+  final Future<void> Function() onOpenActiveVoiceChannel;
+  final Future<void> Function() onLeaveActiveVoiceChannel;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -3174,9 +3859,9 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                 Icon(
                                   Icons.content_copy_outlined,
                                   size: 18,
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .onSurfaceVariant,
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
                                 ),
                               ],
                             ),
@@ -3240,9 +3925,10 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                                 channels: uncategorizedChannels,
                                                 selectedChannelId:
                                                     widget.selectedChannelId,
-                                                voiceParticipantsByChannel:
-                                                    widget
-                                                        .voiceParticipantsByChannel,
+                                                channelUnreadCounts:
+                                                    widget.channelUnreadCounts,
+                                                voiceParticipantsByChannel: widget
+                                                    .voiceParticipantsByChannel,
                                                 onStartDirectMessage:
                                                     widget.onStartDirectMessage,
                                                 canManageChannels:
@@ -3300,9 +3986,10 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                                                 channels: categoryChannels,
                                                 selectedChannelId:
                                                     widget.selectedChannelId,
-                                                voiceParticipantsByChannel:
-                                                    widget
-                                                        .voiceParticipantsByChannel,
+                                                channelUnreadCounts:
+                                                    widget.channelUnreadCounts,
+                                                voiceParticipantsByChannel: widget
+                                                    .voiceParticipantsByChannel,
                                                 onStartDirectMessage:
                                                     widget.onStartDirectMessage,
                                                 canManageChannels:
@@ -3338,11 +4025,24 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                       ],
                     ),
             ),
+            if (widget.activeVoiceController != null &&
+                widget.activeVoiceChannel != null) ...[
+              const SizedBox(height: 14),
+              _ActiveVoiceDock(
+                channel: widget.activeVoiceChannel!,
+                controller: widget.activeVoiceController!,
+                canStreamCamera: widget.canStreamCamera,
+                canShareScreen: widget.canShareScreen,
+                onOpenChannel: widget.onOpenActiveVoiceChannel,
+                onLeaveCall: widget.onLeaveActiveVoiceChannel,
+              ),
+            ],
             const SizedBox(height: 14),
             const Divider(height: 1),
             const SizedBox(height: 10),
             _SidebarAccountFooter(
               displayName: widget.currentDisplayName,
+              avatarUrl: widget.currentAvatarUrl,
               onOpenUserSettings: widget.onOpenUserSettings,
               onSignOut: widget.onSignOut,
             ),
@@ -3358,6 +4058,7 @@ class _CategorySection extends StatelessWidget {
     required this.category,
     required this.channels,
     required this.selectedChannelId,
+    required this.channelUnreadCounts,
     required this.voiceParticipantsByChannel,
     required this.onStartDirectMessage,
     required this.canManageChannels,
@@ -3373,6 +4074,7 @@ class _CategorySection extends StatelessWidget {
   final ChannelCategorySummary category;
   final List<ChannelSummary> channels;
   final String? selectedChannelId;
+  final Map<String, int> channelUnreadCounts;
   final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
   final Future<void> Function({
     required String userId,
@@ -3428,6 +4130,7 @@ class _CategorySection extends StatelessWidget {
             categoryId: category.id,
             channels: channels,
             selectedChannelId: selectedChannelId,
+            channelUnreadCounts: channelUnreadCounts,
             voiceParticipantsByChannel: voiceParticipantsByChannel,
             onStartDirectMessage: onStartDirectMessage,
             canManageChannels: canManageChannels,
@@ -3529,6 +4232,7 @@ class _ChannelList extends StatelessWidget {
     required this.categoryId,
     required this.channels,
     required this.selectedChannelId,
+    required this.channelUnreadCounts,
     required this.voiceParticipantsByChannel,
     required this.onStartDirectMessage,
     required this.canManageChannels,
@@ -3542,6 +4246,7 @@ class _ChannelList extends StatelessWidget {
   final String? categoryId;
   final List<ChannelSummary> channels;
   final String? selectedChannelId;
+  final Map<String, int> channelUnreadCounts;
   final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
   final Future<void> Function({
     required String userId,
@@ -3603,6 +4308,7 @@ class _ChannelList extends StatelessWidget {
               key: ValueKey<String>(channels[index].id),
               channel: channels[index],
               selected: channels[index].id == selectedChannelId,
+              unreadCount: channelUnreadCounts[channels[index].id] ?? 0,
               voiceParticipants:
                   voiceParticipantsByChannel[channels[index].id] ??
                   const <VoiceParticipant>[],
@@ -3631,6 +4337,7 @@ class _ChannelTile extends StatelessWidget {
     super.key,
     required this.channel,
     required this.selected,
+    required this.unreadCount,
     required this.voiceParticipants,
     required this.onStartDirectMessage,
     required this.onTap,
@@ -3641,6 +4348,7 @@ class _ChannelTile extends StatelessWidget {
 
   final ChannelSummary channel;
   final bool selected;
+  final int unreadCount;
   final List<VoiceParticipant> voiceParticipants;
   final Future<void> Function({
     required String userId,
@@ -3667,6 +4375,8 @@ class _ChannelTile extends StatelessWidget {
           style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
         ),
       ),
+      if (channel.kind == ChannelKind.text && unreadCount > 0)
+        _UnreadBadge(count: unreadCount),
     ];
     final showVoiceParticipants =
         channel.kind == ChannelKind.voice && voiceParticipants.isNotEmpty;
@@ -3719,15 +4429,21 @@ class _ChannelTile extends StatelessWidget {
                                   Icon(
                                     participant.isMuted
                                         ? Icons.mic_off
-                                        : participant.shareKind == ShareKind.screen
+                                        : participant.shareKind ==
+                                              ShareKind.screen
                                         ? Icons.screen_share
-                                        : participant.shareKind == ShareKind.camera
+                                        : participant.shareKind ==
+                                              ShareKind.camera
                                         ? Icons.videocam
                                         : Icons.mic,
                                     size: 13,
                                     color: participant.isSpeaking
-                                        ? Theme.of(context).colorScheme.secondary
-                                        : Theme.of(context).colorScheme.onSurface,
+                                        ? Theme.of(
+                                            context,
+                                          ).colorScheme.secondary
+                                        : Theme.of(
+                                            context,
+                                          ).colorScheme.onSurface,
                                   ),
                                   const SizedBox(width: 6),
                                   Expanded(
@@ -3737,7 +4453,9 @@ class _ChannelTile extends StatelessWidget {
                                           : participant.displayName,
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
-                                      style: Theme.of(context).textTheme.bodySmall
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
                                           ?.copyWith(
                                             color: participant.isSpeaking
                                                 ? Theme.of(
@@ -3833,10 +4551,7 @@ class _ChannelTile extends StatelessWidget {
         position.dy,
       ),
       items: const [
-        PopupMenuItem<String>(
-          value: 'dm',
-          child: Text('Send direct message'),
-        ),
+        PopupMenuItem<String>(value: 'dm', child: Text('Send direct message')),
       ],
     );
     if (selection == 'dm') {
@@ -3945,6 +4660,7 @@ class _ServerMembersPanel extends StatelessWidget {
     required this.loading,
     required this.error,
     required this.currentUserId,
+    required this.avatarUrlForPath,
     required this.onStartDirectMessage,
   });
 
@@ -3955,6 +4671,7 @@ class _ServerMembersPanel extends StatelessWidget {
   final bool loading;
   final String? error;
   final String currentUserId;
+  final String? Function(String? avatarPath) avatarUrlForPath;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4030,6 +4747,7 @@ class _ServerMembersPanel extends StatelessWidget {
                             group: group,
                             onlineMemberIds: onlineMemberIds,
                             currentUserId: currentUserId,
+                            avatarUrlForPath: avatarUrlForPath,
                             onStartDirectMessage: onStartDirectMessage,
                           ),
                         ),
@@ -4139,12 +4857,14 @@ class _ServerMemberRoleSection extends StatelessWidget {
     required this.group,
     required this.onlineMemberIds,
     required this.currentUserId,
+    required this.avatarUrlForPath,
     required this.onStartDirectMessage,
   });
 
   final _ServerMemberRoleGroup group;
   final Set<String> onlineMemberIds;
   final String currentUserId;
+  final String? Function(String? avatarPath) avatarUrlForPath;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4176,6 +4896,7 @@ class _ServerMemberRoleSection extends StatelessWidget {
             member: member,
             online: true,
             isCurrentUser: member.userId == currentUserId,
+            avatarUrl: avatarUrlForPath(member.avatarPath),
             onStartDirectMessage: onStartDirectMessage,
           ),
         ),
@@ -4186,6 +4907,7 @@ class _ServerMemberRoleSection extends StatelessWidget {
             member: member,
             online: false,
             isCurrentUser: member.userId == currentUserId,
+            avatarUrl: avatarUrlForPath(member.avatarPath),
             onStartDirectMessage: onStartDirectMessage,
           ),
         ),
@@ -4199,12 +4921,14 @@ class _ServerMemberRow extends StatelessWidget {
     required this.member,
     required this.online,
     required this.isCurrentUser,
+    required this.avatarUrl,
     required this.onStartDirectMessage,
   });
 
   final ServerMember member;
   final bool online;
   final bool isCurrentUser;
+  final String? avatarUrl;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4215,27 +4939,45 @@ class _ServerMemberRow extends StatelessWidget {
   Widget build(BuildContext context) {
     const onlineIndicatorColor = Color(0xFF34C759);
     const offlineIndicatorColor = Color(0xFF8E97A6);
-    final indicatorColor = online ? onlineIndicatorColor : offlineIndicatorColor;
+    final indicatorColor = online
+        ? onlineIndicatorColor
+        : offlineIndicatorColor;
     return Builder(
       builder: (context) => GestureDetector(
         onSecondaryTapDown: isCurrentUser
             ? null
             : (details) {
-                unawaited(
-                  _showMemberMenu(context, details.globalPosition),
-                );
+                unawaited(_showMemberMenu(context, details.globalPosition));
               },
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Row(
             children: [
-              Container(
-                width: 10,
-                height: 10,
-                decoration: BoxDecoration(
-                  color: indicatorColor,
-                  shape: BoxShape.circle,
-                ),
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  _UserAvatar(
+                    displayName: member.displayName,
+                    avatarUrl: avatarUrl,
+                    size: 30,
+                  ),
+                  Positioned(
+                    right: -1,
+                    bottom: -1,
+                    child: Container(
+                      width: 10,
+                      height: 10,
+                      decoration: BoxDecoration(
+                        color: indicatorColor,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.surface,
+                          width: 1.5,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(width: 10),
               Expanded(
@@ -4267,10 +5009,7 @@ class _ServerMemberRow extends StatelessWidget {
         position.dy,
       ),
       items: const [
-        PopupMenuItem<String>(
-          value: 'dm',
-          child: Text('Send direct message'),
-        ),
+        PopupMenuItem<String>(value: 'dm', child: Text('Send direct message')),
       ],
     );
     if (selection == 'dm') {
@@ -4303,8 +5042,10 @@ class TextChannelView extends StatefulWidget {
     required this.canSendMessages,
     required this.canManageMessages,
     required this.use24HourTime,
+    required this.showTimestamps,
     required this.motionDuration,
     required this.animateMessages,
+    required this.onMarkRead,
     required this.onStartDirectMessage,
   });
 
@@ -4314,8 +5055,10 @@ class TextChannelView extends StatefulWidget {
   final bool canSendMessages;
   final bool canManageMessages;
   final bool use24HourTime;
+  final bool showTimestamps;
   final Duration motionDuration;
   final bool animateMessages;
+  final Future<void> Function(DateTime timestamp) onMarkRead;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4328,29 +5071,67 @@ class TextChannelView extends StatefulWidget {
 
 class _TextChannelViewState extends State<TextChannelView> {
   final TextEditingController _messageController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   ChannelMessage? _replyingTo;
+  List<OutgoingMessageAttachment> _draftAttachments =
+      <OutgoingMessageAttachment>[];
+  String? _lastMarkedReadMessageId;
+  List<ChannelMessage> _latestMessages = const <ChannelMessage>[];
+  bool _sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_handleScroll);
+  }
 
   @override
   void dispose() {
+    _scrollController.removeListener(_handleScroll);
     _messageController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
   Future<void> _send() async {
-    if (!widget.canSendMessages) {
+    if (!widget.canSendMessages || _sending) {
       return;
     }
     final text = _messageController.text;
-    _messageController.clear();
-    await widget.repository.sendChannelMessage(
-      channelId: widget.channel.id,
-      body: text,
-      replyToMessage: _replyingTo,
-    );
-    if (mounted) {
+    final attachments = List<OutgoingMessageAttachment>.from(_draftAttachments);
+    if (text.trim().isEmpty && attachments.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _sending = true;
+    });
+    try {
+      await widget.repository.sendChannelMessage(
+        channelId: widget.channel.id,
+        body: text,
+        replyToMessage: _replyingTo,
+        attachments: attachments,
+      );
+      if (!mounted) {
+        return;
+      }
       setState(() {
+        _messageController.clear();
         _replyingTo = null;
+        _draftAttachments = <OutgoingMessageAttachment>[];
       });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sending = false;
+        });
+      }
     }
   }
 
@@ -4362,28 +5143,74 @@ class _TextChannelViewState extends State<TextChannelView> {
   }
 
   Future<void> _sendGif() async {
-    if (!widget.canSendMessages || !widget.repository.hasGiphyApiKey) {
+    if (!widget.canSendMessages ||
+        !widget.repository.hasGiphyApiKey ||
+        _sending) {
       return;
     }
     final gif = await showDialog<GiphyGifResult>(
       context: context,
-      builder: (context) => _GiphyPickerDialog(
-        repository: widget.repository,
-      ),
+      builder: (context) => _GiphyPickerDialog(repository: widget.repository),
     );
     if (gif == null) {
       return;
     }
-    await widget.repository.sendChannelMessage(
-      channelId: widget.channel.id,
-      body: gif.gifUrl,
-      replyToMessage: _replyingTo,
-    );
-    if (mounted) {
+    setState(() {
+      _sending = true;
+    });
+    try {
+      await widget.repository.sendChannelMessage(
+        channelId: widget.channel.id,
+        body: gif.gifUrl,
+        replyToMessage: _replyingTo,
+        attachments: List<OutgoingMessageAttachment>.from(_draftAttachments),
+      );
+      if (!mounted) {
+        return;
+      }
       setState(() {
         _replyingTo = null;
+        _draftAttachments = <OutgoingMessageAttachment>[];
       });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sending = false;
+        });
+      }
     }
+  }
+
+  Future<void> _pickAttachments() async {
+    if (!widget.canSendMessages || _sending) {
+      return;
+    }
+    final attachments = await _pickComposerAttachments(
+      context,
+      existingCount: _draftAttachments.length,
+    );
+    if (!mounted || attachments.isEmpty) {
+      return;
+    }
+    setState(() {
+      _draftAttachments = <OutgoingMessageAttachment>[
+        ..._draftAttachments,
+        ...attachments,
+      ];
+    });
+  }
+
+  void _removeDraftAttachment(int index) {
+    setState(() {
+      _draftAttachments = List<OutgoingMessageAttachment>.from(
+        _draftAttachments,
+      )..removeAt(index);
+    });
   }
 
   Future<void> _deleteMessage(ChannelMessage message) async {
@@ -4393,7 +5220,9 @@ class _TextChannelViewState extends State<TextChannelView> {
   void _appendEmoji(String emoji) {
     final selection = _messageController.selection;
     final baseText = _messageController.text;
-    final insertionPoint = selection.isValid ? selection.start : baseText.length;
+    final insertionPoint = selection.isValid
+        ? selection.start
+        : baseText.length;
     final nextText = baseText.replaceRange(
       insertionPoint,
       selection.isValid ? selection.end : insertionPoint,
@@ -4401,10 +5230,50 @@ class _TextChannelViewState extends State<TextChannelView> {
     );
     _messageController.value = TextEditingValue(
       text: nextText,
-      selection: TextSelection.collapsed(
-        offset: insertionPoint + emoji.length,
-      ),
+      selection: TextSelection.collapsed(offset: insertionPoint + emoji.length),
     );
+  }
+
+  bool _isNearBottom() {
+    if (!_scrollController.hasClients ||
+        !_scrollController.position.hasContentDimensions) {
+      return true;
+    }
+    return _scrollController.position.extentAfter < 72;
+  }
+
+  void _handleScroll() {
+    if (!_isNearBottom() || _latestMessages.isEmpty) {
+      return;
+    }
+    final lastMessage = _latestMessages.last;
+    if (_lastMarkedReadMessageId == lastMessage.id) {
+      return;
+    }
+    _lastMarkedReadMessageId = lastMessage.id;
+    unawaited(widget.onMarkRead(lastMessage.createdAt));
+  }
+
+  void _syncViewport(List<ChannelMessage> messages) {
+    _latestMessages = messages;
+    final shouldStickToBottom = _isNearBottom();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      if (shouldStickToBottom && _scrollController.hasClients) {
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      }
+      if (!shouldStickToBottom || messages.isEmpty) {
+        return;
+      }
+      final lastMessage = messages.last;
+      if (_lastMarkedReadMessageId == lastMessage.id) {
+        return;
+      }
+      _lastMarkedReadMessageId = lastMessage.id;
+      unawaited(widget.onMarkRead(lastMessage.createdAt));
+    });
   }
 
   @override
@@ -4439,51 +5308,79 @@ class _TextChannelViewState extends State<TextChannelView> {
                     return const Center(child: CircularProgressIndicator());
                   }
                   final messages = snapshot.data!;
+                  _syncViewport(messages);
                   if (messages.isEmpty) {
                     return const Center(
                       child: Text('No messages yet. Start the conversation.'),
                     );
                   }
-                  return ListView.separated(
+                  return ListView.builder(
+                    controller: _scrollController,
                     itemCount: messages.length,
-                    separatorBuilder: (context, index) =>
-                        const SizedBox(height: 12),
                     itemBuilder: (context, index) {
                       final message = messages[index];
+                      final previousMessage = index == 0
+                          ? null
+                          : messages[index - 1];
+                      final groupedWithPrevious = _shouldGroupMessages(
+                        previousSenderId: previousMessage?.senderId,
+                        previousCreatedAt: previousMessage?.createdAt,
+                        senderId: message.senderId,
+                        createdAt: message.createdAt,
+                      );
                       final canDelete =
                           message.senderId == widget.currentUserId ||
                           widget.canManageMessages;
-                      return _AnimatedMessageTile(
-                        key: ValueKey<String>(message.id),
-                        animate: widget.animateMessages,
-                        duration: widget.motionDuration,
-                        child: _ChatMessageCard(
-                          senderId: message.senderId,
-                          senderDisplayName: message.senderDisplayName,
-                          body: message.body,
-                          createdAt: message.createdAt,
-                          use24HourTime: widget.use24HourTime,
-                          replyToBody: message.replyToBody,
-                          replyToSenderDisplayName:
-                              message.replyToSenderDisplayName,
-                          deleted: message.deleted,
-                          reactions: message.reactions,
-                          isOwnMessage: message.senderId == widget.currentUserId,
-                          canDelete: canDelete,
-                          onReply: () async {
-                            setState(() {
-                              _replyingTo = message;
-                            });
-                          },
-                          onToggleReaction: (emoji) => _toggleReaction(message, emoji),
-                          onDelete: canDelete ? () => _deleteMessage(message) : null,
-                          onOpenDirectMessage:
-                              message.senderId == widget.currentUserId
-                              ? null
-                              : () => widget.onStartDirectMessage(
-                                  userId: message.senderId,
-                                  displayName: message.senderDisplayName,
-                                ),
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          bottom: index == messages.length - 1
+                              ? 0
+                              : groupedWithPrevious
+                              ? 6
+                              : 12,
+                        ),
+                        child: _AnimatedMessageTile(
+                          key: ValueKey<String>(message.id),
+                          animate: widget.animateMessages,
+                          duration: widget.motionDuration,
+                          child: _ChatMessageCard(
+                            repository: widget.repository,
+                            senderId: message.senderId,
+                            senderDisplayName: message.senderDisplayName,
+                            senderAvatarPath: message.senderAvatarPath,
+                            body: message.body,
+                            attachments: message.attachments,
+                            createdAt: message.createdAt,
+                            use24HourTime: widget.use24HourTime,
+                            showTimestamp: widget.showTimestamps,
+                            showHeader: !groupedWithPrevious,
+                            compactGroup: groupedWithPrevious,
+                            replyToBody: message.replyToBody,
+                            replyToSenderDisplayName:
+                                message.replyToSenderDisplayName,
+                            deleted: message.deleted,
+                            reactions: message.reactions,
+                            isOwnMessage:
+                                message.senderId == widget.currentUserId,
+                            canDelete: canDelete,
+                            onReply: () async {
+                              setState(() {
+                                _replyingTo = message;
+                              });
+                            },
+                            onToggleReaction: (emoji) =>
+                                _toggleReaction(message, emoji),
+                            onDelete: canDelete
+                                ? () => _deleteMessage(message)
+                                : null,
+                            onOpenDirectMessage:
+                                message.senderId == widget.currentUserId
+                                ? null
+                                : () => widget.onStartDirectMessage(
+                                    userId: message.senderId,
+                                    displayName: message.senderDisplayName,
+                                  ),
+                          ),
                         ),
                       );
                     },
@@ -4491,6 +5388,13 @@ class _TextChannelViewState extends State<TextChannelView> {
                 },
               ),
             ),
+            if (_draftAttachments.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _ComposerAttachmentStrip(
+                attachments: _draftAttachments,
+                onRemove: _removeDraftAttachment,
+              ),
+            ],
             if (_replyingTo != null) ...[
               const SizedBox(height: 12),
               _ReplyBanner(
@@ -4507,7 +5411,7 @@ class _TextChannelViewState extends State<TextChannelView> {
             Row(
               children: [
                 IconButton.filledTonal(
-                  onPressed: widget.canSendMessages
+                  onPressed: widget.canSendMessages && !_sending
                       ? () async {
                           final emoji = await _showEmojiPickerDialog(context);
                           if (emoji != null && mounted) {
@@ -4519,8 +5423,17 @@ class _TextChannelViewState extends State<TextChannelView> {
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
+                  onPressed: widget.canSendMessages && !_sending
+                      ? _pickAttachments
+                      : null,
+                  icon: const Icon(Icons.attach_file),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
                   onPressed:
-                      widget.canSendMessages && widget.repository.hasGiphyApiKey
+                      widget.canSendMessages &&
+                          widget.repository.hasGiphyApiKey &&
+                          !_sending
                       ? _sendGif
                       : null,
                   icon: const Icon(Icons.gif_box_outlined),
@@ -4539,7 +5452,7 @@ class _TextChannelViewState extends State<TextChannelView> {
                     },
                     child: TextField(
                       controller: _messageController,
-                      enabled: widget.canSendMessages,
+                      enabled: widget.canSendMessages && !_sending,
                       keyboardType: TextInputType.multiline,
                       textInputAction: TextInputAction.newline,
                       minLines: 1,
@@ -4554,8 +5467,14 @@ class _TextChannelViewState extends State<TextChannelView> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton.icon(
-                  onPressed: widget.canSendMessages ? _send : null,
-                  icon: const Icon(Icons.send),
+                  onPressed: widget.canSendMessages && !_sending ? _send : null,
+                  icon: _sending
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.send),
                   label: const Text('Send'),
                 ),
               ],
@@ -4574,8 +5493,10 @@ class DirectMessageView extends StatefulWidget {
     required this.repository,
     required this.currentUserId,
     required this.use24HourTime,
+    required this.showTimestamps,
     required this.motionDuration,
     required this.animateMessages,
+    required this.onMarkRead,
     required this.onStartDirectMessage,
   });
 
@@ -4583,8 +5504,10 @@ class DirectMessageView extends StatefulWidget {
   final WorkspaceRepository repository;
   final String currentUserId;
   final bool use24HourTime;
+  final bool showTimestamps;
   final Duration motionDuration;
   final bool animateMessages;
+  final Future<void> Function() onMarkRead;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -4597,34 +5520,76 @@ class DirectMessageView extends StatefulWidget {
 
 class _DirectMessageViewState extends State<DirectMessageView> {
   final TextEditingController _messageController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   DirectMessage? _replyingTo;
+  List<OutgoingMessageAttachment> _draftAttachments =
+      <OutgoingMessageAttachment>[];
   String? _lastMarkedReadMessageId;
+  List<DirectMessage> _latestMessages = const <DirectMessage>[];
+  bool _sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_handleScroll);
+  }
 
   @override
   void dispose() {
+    _scrollController.removeListener(_handleScroll);
     _messageController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
   Future<void> _send() async {
+    if (_sending) {
+      return;
+    }
     final text = _messageController.text;
-    _messageController.clear();
-    await widget.repository.sendDirectMessage(
-      conversationId: widget.conversation.conversationId,
-      body: text,
-      replyToMessage: _replyingTo,
-    );
-    if (mounted) {
+    final attachments = List<OutgoingMessageAttachment>.from(_draftAttachments);
+    if (text.trim().isEmpty && attachments.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _sending = true;
+    });
+    try {
+      await widget.repository.sendDirectMessage(
+        conversationId: widget.conversation.conversationId,
+        body: text,
+        replyToMessage: _replyingTo,
+        attachments: attachments,
+      );
+      if (!mounted) {
+        return;
+      }
       setState(() {
+        _messageController.clear();
         _replyingTo = null;
+        _draftAttachments = <OutgoingMessageAttachment>[];
       });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sending = false;
+        });
+      }
     }
   }
 
   void _appendEmoji(String emoji) {
     final selection = _messageController.selection;
     final baseText = _messageController.text;
-    final insertionPoint = selection.isValid ? selection.start : baseText.length;
+    final insertionPoint = selection.isValid
+        ? selection.start
+        : baseText.length;
     final nextText = baseText.replaceRange(
       insertionPoint,
       selection.isValid ? selection.end : insertionPoint,
@@ -4637,45 +5602,116 @@ class _DirectMessageViewState extends State<DirectMessageView> {
   }
 
   Future<void> _sendGif() async {
-    if (!widget.repository.hasGiphyApiKey) {
+    if (!widget.repository.hasGiphyApiKey || _sending) {
       return;
     }
     final gif = await showDialog<GiphyGifResult>(
       context: context,
-      builder: (context) => _GiphyPickerDialog(
-        repository: widget.repository,
-      ),
+      builder: (context) => _GiphyPickerDialog(repository: widget.repository),
     );
     if (gif == null) {
       return;
     }
-    await widget.repository.sendDirectMessage(
-      conversationId: widget.conversation.conversationId,
-      body: gif.gifUrl,
-      replyToMessage: _replyingTo,
-    );
-    if (mounted) {
+    setState(() {
+      _sending = true;
+    });
+    try {
+      await widget.repository.sendDirectMessage(
+        conversationId: widget.conversation.conversationId,
+        body: gif.gifUrl,
+        replyToMessage: _replyingTo,
+        attachments: List<OutgoingMessageAttachment>.from(_draftAttachments),
+      );
+      if (!mounted) {
+        return;
+      }
       setState(() {
         _replyingTo = null;
+        _draftAttachments = <OutgoingMessageAttachment>[];
       });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sending = false;
+        });
+      }
     }
   }
 
-  void _markReadIfNeeded(List<DirectMessage> messages) {
-    if (messages.isEmpty) {
+  Future<void> _pickAttachments() async {
+    if (_sending) {
       return;
     }
-    final lastMessage = messages.last;
+    final attachments = await _pickComposerAttachments(
+      context,
+      existingCount: _draftAttachments.length,
+    );
+    if (!mounted || attachments.isEmpty) {
+      return;
+    }
+    setState(() {
+      _draftAttachments = <OutgoingMessageAttachment>[
+        ..._draftAttachments,
+        ...attachments,
+      ];
+    });
+  }
+
+  void _removeDraftAttachment(int index) {
+    setState(() {
+      _draftAttachments = List<OutgoingMessageAttachment>.from(
+        _draftAttachments,
+      )..removeAt(index);
+    });
+  }
+
+  bool _isNearBottom() {
+    if (!_scrollController.hasClients ||
+        !_scrollController.position.hasContentDimensions) {
+      return true;
+    }
+    return _scrollController.position.extentAfter < 72;
+  }
+
+  void _handleScroll() {
+    if (!_isNearBottom() || _latestMessages.isEmpty) {
+      return;
+    }
+    final lastMessage = _latestMessages.last;
     if (lastMessage.senderId == widget.currentUserId ||
         _lastMarkedReadMessageId == lastMessage.id) {
       return;
     }
     _lastMarkedReadMessageId = lastMessage.id;
-    unawaited(
-      widget.repository.markDirectConversationRead(
-        widget.conversation.conversationId,
-      ),
-    );
+    unawaited(widget.onMarkRead());
+  }
+
+  void _syncViewport(List<DirectMessage> messages) {
+    _latestMessages = messages;
+    final shouldStickToBottom = _isNearBottom();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      if (shouldStickToBottom && _scrollController.hasClients) {
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      }
+      if (!shouldStickToBottom || messages.isEmpty) {
+        return;
+      }
+      final lastMessage = messages.last;
+      if (lastMessage.senderId == widget.currentUserId ||
+          _lastMarkedReadMessageId == lastMessage.id) {
+        return;
+      }
+      _lastMarkedReadMessageId = lastMessage.id;
+      unawaited(widget.onMarkRead());
+    });
   }
 
   @override
@@ -4692,9 +5728,26 @@ class _DirectMessageViewState extends State<DirectMessageView> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              widget.conversation.otherDisplayName,
-              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
+            Row(
+              children: [
+                _UserAvatar(
+                  displayName: widget.conversation.otherDisplayName,
+                  avatarUrl: widget.repository.publicProfileAvatarUrl(
+                    widget.conversation.otherAvatarPath,
+                  ),
+                  size: 42,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    widget.conversation.otherDisplayName,
+                    style: const TextStyle(
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 4),
             Text(
@@ -4715,59 +5768,85 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                     return const Center(child: CircularProgressIndicator());
                   }
                   final messages = snapshot.data!;
-                  _markReadIfNeeded(messages);
+                  _syncViewport(messages);
                   if (messages.isEmpty) {
                     return const Center(
                       child: Text('No direct messages yet. Say hello.'),
                     );
                   }
-                  return ListView.separated(
+                  return ListView.builder(
+                    controller: _scrollController,
                     itemCount: messages.length,
-                    separatorBuilder: (context, index) =>
-                        const SizedBox(height: 12),
                     itemBuilder: (context, index) {
                       final message = messages[index];
-                      final canDelete = message.senderId == widget.currentUserId;
-                      return _AnimatedMessageTile(
-                        key: ValueKey<String>(message.id),
-                        animate: widget.animateMessages,
-                        duration: widget.motionDuration,
-                        child: _ChatMessageCard(
-                          senderId: message.senderId,
-                          senderDisplayName: message.senderDisplayName,
-                          body: message.body,
-                          createdAt: message.createdAt,
-                          use24HourTime: widget.use24HourTime,
-                          replyToBody: message.replyToBody,
-                          replyToSenderDisplayName:
-                              message.replyToSenderDisplayName,
-                          deleted: message.deleted,
-                          reactions: message.reactions,
-                          isOwnMessage: message.senderId == widget.currentUserId,
-                          canDelete: canDelete,
-                          onReply: () async {
-                            setState(() {
-                              _replyingTo = message;
-                            });
-                          },
-                          onToggleReaction: (emoji) async {
-                            await widget.repository.toggleDirectMessageReaction(
-                              messageId: message.id,
-                              emoji: emoji,
-                            );
-                          },
-                          onDelete: canDelete
-                              ? () => widget.repository.deleteDirectMessage(
-                                  message.id,
-                                )
-                              : null,
-                          onOpenDirectMessage:
-                              message.senderId == widget.currentUserId
-                              ? null
-                              : () => widget.onStartDirectMessage(
-                                  userId: message.senderId,
-                                  displayName: message.senderDisplayName,
-                                ),
+                      final previousMessage = index == 0
+                          ? null
+                          : messages[index - 1];
+                      final groupedWithPrevious = _shouldGroupMessages(
+                        previousSenderId: previousMessage?.senderId,
+                        previousCreatedAt: previousMessage?.createdAt,
+                        senderId: message.senderId,
+                        createdAt: message.createdAt,
+                      );
+                      final canDelete =
+                          message.senderId == widget.currentUserId;
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          bottom: index == messages.length - 1
+                              ? 0
+                              : groupedWithPrevious
+                              ? 6
+                              : 12,
+                        ),
+                        child: _AnimatedMessageTile(
+                          key: ValueKey<String>(message.id),
+                          animate: widget.animateMessages,
+                          duration: widget.motionDuration,
+                          child: _ChatMessageCard(
+                            repository: widget.repository,
+                            senderId: message.senderId,
+                            senderDisplayName: message.senderDisplayName,
+                            senderAvatarPath: message.senderAvatarPath,
+                            body: message.body,
+                            attachments: message.attachments,
+                            createdAt: message.createdAt,
+                            use24HourTime: widget.use24HourTime,
+                            showTimestamp: widget.showTimestamps,
+                            showHeader: !groupedWithPrevious,
+                            compactGroup: groupedWithPrevious,
+                            replyToBody: message.replyToBody,
+                            replyToSenderDisplayName:
+                                message.replyToSenderDisplayName,
+                            deleted: message.deleted,
+                            reactions: message.reactions,
+                            isOwnMessage:
+                                message.senderId == widget.currentUserId,
+                            canDelete: canDelete,
+                            onReply: () async {
+                              setState(() {
+                                _replyingTo = message;
+                              });
+                            },
+                            onToggleReaction: (emoji) async {
+                              await widget.repository
+                                  .toggleDirectMessageReaction(
+                                    messageId: message.id,
+                                    emoji: emoji,
+                                  );
+                            },
+                            onDelete: canDelete
+                                ? () => widget.repository.deleteDirectMessage(
+                                    message.id,
+                                  )
+                                : null,
+                            onOpenDirectMessage:
+                                message.senderId == widget.currentUserId
+                                ? null
+                                : () => widget.onStartDirectMessage(
+                                    userId: message.senderId,
+                                    displayName: message.senderDisplayName,
+                                  ),
+                          ),
                         ),
                       );
                     },
@@ -4775,6 +5854,13 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                 },
               ),
             ),
+            if (_draftAttachments.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _ComposerAttachmentStrip(
+                attachments: _draftAttachments,
+                onRemove: _removeDraftAttachment,
+              ),
+            ],
             if (_replyingTo != null) ...[
               const SizedBox(height: 12),
               _ReplyBanner(
@@ -4791,17 +5877,26 @@ class _DirectMessageViewState extends State<DirectMessageView> {
             Row(
               children: [
                 IconButton.filledTonal(
-                  onPressed: () async {
-                    final emoji = await _showEmojiPickerDialog(context);
-                    if (emoji != null && mounted) {
-                      _appendEmoji(emoji);
-                    }
-                  },
+                  onPressed: _sending
+                      ? null
+                      : () async {
+                          final emoji = await _showEmojiPickerDialog(context);
+                          if (emoji != null && mounted) {
+                            _appendEmoji(emoji);
+                          }
+                        },
                   icon: const Icon(Icons.sentiment_satisfied_alt),
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
-                  onPressed: widget.repository.hasGiphyApiKey ? _sendGif : null,
+                  onPressed: _sending ? null : _pickAttachments,
+                  icon: const Icon(Icons.attach_file),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  onPressed: widget.repository.hasGiphyApiKey && !_sending
+                      ? _sendGif
+                      : null,
                   icon: const Icon(Icons.gif_box_outlined),
                 ),
                 const SizedBox(width: 12),
@@ -4818,6 +5913,7 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                     },
                     child: TextField(
                       controller: _messageController,
+                      enabled: !_sending,
                       keyboardType: TextInputType.multiline,
                       textInputAction: TextInputAction.newline,
                       minLines: 1,
@@ -4830,8 +5926,14 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton.icon(
-                  onPressed: _send,
-                  icon: const Icon(Icons.send),
+                  onPressed: _sending ? null : _send,
+                  icon: _sending
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.send),
                   label: const Text('Send'),
                 ),
               ],
@@ -4845,11 +5947,17 @@ class _DirectMessageViewState extends State<DirectMessageView> {
 
 class _ChatMessageCard extends StatefulWidget {
   const _ChatMessageCard({
+    required this.repository,
     required this.senderId,
     required this.senderDisplayName,
+    required this.senderAvatarPath,
     required this.body,
+    required this.attachments,
     required this.createdAt,
     required this.use24HourTime,
+    required this.showTimestamp,
+    required this.showHeader,
+    required this.compactGroup,
     required this.replyToBody,
     required this.replyToSenderDisplayName,
     required this.deleted,
@@ -4862,11 +5970,17 @@ class _ChatMessageCard extends StatefulWidget {
     this.onOpenDirectMessage,
   });
 
+  final WorkspaceRepository repository;
   final String senderId;
   final String senderDisplayName;
+  final String? senderAvatarPath;
   final String body;
+  final List<MessageAttachment> attachments;
   final DateTime createdAt;
   final bool use24HourTime;
+  final bool showTimestamp;
+  final bool showHeader;
+  final bool compactGroup;
   final String? replyToBody;
   final String? replyToSenderDisplayName;
   final bool deleted;
@@ -4888,6 +6002,13 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final trimmedBody = widget.body.trim();
+    final gifUrl = _gifUrl(widget.body);
+    final showTextBody =
+        !widget.deleted && gifUrl == null && trimmedBody.isNotEmpty;
+    final senderAvatarUrl = widget.repository.publicProfileAvatarUrl(
+      widget.senderAvatarPath,
+    );
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
@@ -4896,149 +6017,203 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
           unawaited(_showMessageMenu(context, details.globalPosition));
         },
         child: Container(
-          padding: const EdgeInsets.all(14),
+          padding: EdgeInsets.fromLTRB(
+            14,
+            widget.compactGroup ? 10 : 14,
+            14,
+            14,
+          ),
           decoration: BoxDecoration(
             color: palette.panelStrong,
             borderRadius: BorderRadius.circular(18),
           ),
-          child: Column(
+          child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Wrap(
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      spacing: 8,
-                      children: [
-                        Text(
-                          widget.senderDisplayName,
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                        Text(
-                          _formatTime(
-                            widget.createdAt,
-                            use24HourTime: widget.use24HourTime,
-                          ),
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  AnimatedOpacity(
-                    opacity: _hovered ? 1 : 0.18,
-                    duration: const Duration(milliseconds: 140),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        IconButton(
-                          onPressed: widget.onReply,
-                          icon: const Icon(Icons.reply, size: 18),
-                          visualDensity: VisualDensity.compact,
-                        ),
-                        IconButton(
-                          onPressed: () async {
-                            final emoji = await _showEmojiPickerDialog(context);
-                            if (emoji != null) {
-                              await widget.onToggleReaction(emoji);
-                            }
-                          },
-                          icon: const Icon(Icons.emoji_emotions_outlined, size: 18),
-                          visualDensity: VisualDensity.compact,
-                        ),
-                        if (widget.canDelete)
-                          IconButton(
-                            onPressed: widget.onDelete,
-                            icon: const Icon(Icons.delete_outline, size: 18),
-                            visualDensity: VisualDensity.compact,
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
+              SizedBox(
+                width: 42,
+                child: widget.showHeader
+                    ? _UserAvatar(
+                        displayName: widget.senderDisplayName,
+                        avatarUrl: senderAvatarUrl,
+                        size: 36,
+                      )
+                    : const SizedBox.shrink(),
               ),
-              if (widget.replyToBody != null &&
-                  widget.replyToBody!.trim().isNotEmpty) ...[
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
-                    color: palette.panel.withAlpha(180),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        widget.replyToSenderDisplayName ?? 'Reply',
-                        style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                          fontWeight: FontWeight.w700,
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: widget.showHeader
+                              ? Wrap(
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  spacing: 8,
+                                  children: [
+                                    Text(
+                                      widget.senderDisplayName,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    if (widget.showTimestamp)
+                                      Text(
+                                        _formatTime(
+                                          widget.createdAt,
+                                          use24HourTime: widget.use24HourTime,
+                                        ),
+                                        style: TextStyle(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                        ),
+                                      ),
+                                  ],
+                                )
+                              : const SizedBox.shrink(),
+                        ),
+                        AnimatedOpacity(
+                          opacity: _hovered ? 1 : 0.18,
+                          duration: const Duration(milliseconds: 140),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                onPressed: widget.onReply,
+                                icon: const Icon(Icons.reply, size: 18),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                              IconButton(
+                                onPressed: () async {
+                                  final emoji = await _showEmojiPickerDialog(
+                                    context,
+                                  );
+                                  if (emoji != null) {
+                                    await widget.onToggleReaction(emoji);
+                                  }
+                                },
+                                icon: const Icon(
+                                  Icons.emoji_emotions_outlined,
+                                  size: 18,
+                                ),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                              if (widget.canDelete)
+                                IconButton(
+                                  onPressed: widget.onDelete,
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                    size: 18,
+                                  ),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (widget.showHeader) const SizedBox(height: 8),
+                    if (widget.replyToBody != null &&
+                        widget.replyToBody!.trim().isNotEmpty) ...[
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: palette.panel.withAlpha(180),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              widget.replyToSenderDisplayName ?? 'Reply',
+                              style: Theme.of(context).textTheme.labelMedium
+                                  ?.copyWith(fontWeight: FontWeight.w700),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              widget.replyToBody!,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
                         ),
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        widget.replyToBody!,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
+                      const SizedBox(height: 8),
                     ],
-                  ),
-                ),
-              ],
-              const SizedBox(height: 8),
-              if (_gifUrl(widget.body) case final gifUrl?) ...[
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(
-                      maxWidth: 360,
-                      maxHeight: 260,
-                    ),
-                    child: Image.network(
-                      gifUrl,
-                      fit: BoxFit.cover,
-                      errorBuilder: (context, error, stackTrace) => Text(
-                        widget.body,
+                    if (gifUrl case final gifUrl?) ...[
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(16),
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(
+                            maxWidth: 360,
+                            maxHeight: 260,
+                          ),
+                          child: Image.network(
+                            gifUrl,
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) =>
+                                Text(widget.body),
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
-                ),
-              ] else
-                Text(
-                  widget.deleted ? 'Message deleted.' : widget.body,
-                  style: widget.deleted
-                      ? Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    ] else if (widget.deleted)
+                      Text(
+                        'Message deleted.',
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                           fontStyle: FontStyle.italic,
                           color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        )
-                      : null,
-                ),
-              if (widget.reactions.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: widget.reactions
-                      .map(
-                        (reaction) => FilterChip(
-                          label: Text('${reaction.emoji} ${reaction.count}'),
-                          selected: reaction.includes(
-                            Supabase.instance.client.auth.currentUser?.id ?? '',
-                          ),
-                          onSelected: (_) {
-                            unawaited(widget.onToggleReaction(reaction.emoji));
-                          },
                         ),
                       )
-                      .toList(),
+                    else if (showTextBody)
+                      Text(widget.body),
+                    if (!widget.deleted && widget.attachments.isNotEmpty) ...[
+                      if (gifUrl != null || showTextBody)
+                        const SizedBox(height: 10),
+                      _MessageAttachmentList(
+                        repository: widget.repository,
+                        attachments: widget.attachments,
+                      ),
+                    ],
+                    if (widget.reactions.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: widget.reactions
+                            .map(
+                              (reaction) => FilterChip(
+                                label: Text(
+                                  '${reaction.emoji} ${reaction.count}',
+                                ),
+                                selected: reaction.includes(
+                                  Supabase
+                                          .instance
+                                          .client
+                                          .auth
+                                          .currentUser
+                                          ?.id ??
+                                      '',
+                                ),
+                                onSelected: (_) {
+                                  unawaited(
+                                    widget.onToggleReaction(reaction.emoji),
+                                  );
+                                },
+                              ),
+                            )
+                            .toList(),
+                      ),
+                    ],
+                  ],
                 ),
-              ],
+              ),
             ],
           ),
         ),
@@ -5048,14 +6223,8 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
 
   Future<void> _showMessageMenu(BuildContext context, Offset position) async {
     final items = <PopupMenuEntry<String>>[
-      const PopupMenuItem<String>(
-        value: 'reply',
-        child: Text('Reply'),
-      ),
-      const PopupMenuItem<String>(
-        value: 'react',
-        child: Text('Add reaction'),
-      ),
+      const PopupMenuItem<String>(value: 'reply', child: Text('Reply')),
+      const PopupMenuItem<String>(value: 'react', child: Text('Add reaction')),
     ];
     if (!widget.isOwnMessage && widget.onOpenDirectMessage != null) {
       items.add(
@@ -5114,7 +6283,9 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
     final host = uri.host.toLowerCase();
     final path = uri.path.toLowerCase();
     final isGif =
-        path.endsWith('.gif') || path.contains('/media/') || host.contains('giphy');
+        path.endsWith('.gif') ||
+        path.contains('/media/') ||
+        host.contains('giphy');
     return isGif ? trimmed : null;
   }
 }
@@ -5148,16 +6319,12 @@ class _ReplyBanner extends StatelessWidget {
               children: [
                 Text(
                   'Replying to $senderDisplayName',
-                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w700),
                 ),
                 const SizedBox(height: 4),
-                Text(
-                  body,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                Text(body, maxLines: 1, overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
@@ -5170,6 +6337,410 @@ class _ReplyBanner extends StatelessWidget {
       ),
     );
   }
+}
+
+class _ComposerAttachmentStrip extends StatelessWidget {
+  const _ComposerAttachmentStrip({
+    required this.attachments,
+    required this.onRemove,
+  });
+
+  final List<OutgoingMessageAttachment> attachments;
+  final void Function(int index) onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: palette.panelStrong,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: palette.border),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (var index = 0; index < attachments.length; index++)
+            InputChip(
+              avatar: Icon(
+                _attachmentKindIcon(attachments[index].kind),
+                size: 16,
+              ),
+              label: Text(
+                '${attachments[index].fileName} (${_formatBytes(attachments[index].sizeBytes)})',
+                overflow: TextOverflow.ellipsis,
+              ),
+              onDeleted: () => onRemove(index),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MessageAttachmentList extends StatelessWidget {
+  const _MessageAttachmentList({
+    required this.repository,
+    required this.attachments,
+  });
+
+  final WorkspaceRepository repository;
+  final List<MessageAttachment> attachments;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (var index = 0; index < attachments.length; index++) ...[
+          _MessageAttachmentTile(
+            repository: repository,
+            attachment: attachments[index],
+          ),
+          if (index != attachments.length - 1) const SizedBox(height: 10),
+        ],
+      ],
+    );
+  }
+}
+
+class _MessageAttachmentTile extends StatelessWidget {
+  const _MessageAttachmentTile({
+    required this.repository,
+    required this.attachment,
+  });
+
+  final WorkspaceRepository repository;
+  final MessageAttachment attachment;
+
+  @override
+  Widget build(BuildContext context) {
+    final attachmentUrl = repository.publicMessageAttachmentUrl(
+      attachment.path,
+    );
+    if (attachmentUrl == null) {
+      return const SizedBox.shrink();
+    }
+
+    if (attachment.isImage) {
+      return InkWell(
+        onTap: () => _copyAttachmentLink(
+          context,
+          fileName: attachment.fileName,
+          url: attachmentUrl,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(16),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420, maxHeight: 280),
+            child: Stack(
+              alignment: Alignment.bottomRight,
+              children: [
+                Image.network(
+                  attachmentUrl,
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) =>
+                      _AttachmentFileCard(
+                        attachment: attachment,
+                        onCopyLink: () => _copyAttachmentLink(
+                          context,
+                          fileName: attachment.fileName,
+                          url: attachmentUrl,
+                        ),
+                      ),
+                ),
+                Container(
+                  margin: const EdgeInsets.all(10),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withAlpha(170),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    'Copy link',
+                    style: Theme.of(
+                      context,
+                    ).textTheme.labelMedium?.copyWith(color: Colors.white),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return _AttachmentFileCard(
+      attachment: attachment,
+      onCopyLink: () => _copyAttachmentLink(
+        context,
+        fileName: attachment.fileName,
+        url: attachmentUrl,
+      ),
+    );
+  }
+}
+
+class _AttachmentFileCard extends StatelessWidget {
+  const _AttachmentFileCard({
+    required this.attachment,
+    required this.onCopyLink,
+  });
+
+  final MessageAttachment attachment;
+  final VoidCallback onCopyLink;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 420),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: palette.panel.withAlpha(180),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: palette.border),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: palette.panelAccent,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            alignment: Alignment.center,
+            child: Icon(_attachmentKindIcon(attachment.kind), size: 18),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  attachment.fileName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _formatBytes(attachment.sizeBytes),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          TextButton.icon(
+            onPressed: onCopyLink,
+            icon: const Icon(Icons.link, size: 16),
+            label: const Text('Copy link'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<List<OutgoingMessageAttachment>> _pickComposerAttachments(
+  BuildContext context, {
+  required int existingCount,
+}) async {
+  const maxAttachments = 8;
+  const maxBytesPerAttachment = 25 * 1024 * 1024;
+
+  final remainingSlots = maxAttachments - existingCount;
+  if (remainingSlots <= 0) {
+    showAppToast(context, 'You can attach up to $maxAttachments files.');
+    return const <OutgoingMessageAttachment>[];
+  }
+
+  final result = await FilePicker.platform.pickFiles(
+    allowMultiple: true,
+    withData: true,
+    type: FileType.any,
+  );
+  if (result == null || !context.mounted) {
+    return const <OutgoingMessageAttachment>[];
+  }
+
+  final attachments = <OutgoingMessageAttachment>[];
+  var unreadableCount = 0;
+  for (final file in result.files.take(remainingSlots)) {
+    final bytes = file.bytes;
+    if (bytes == null || bytes.isEmpty) {
+      unreadableCount++;
+      continue;
+    }
+    if (bytes.lengthInBytes > maxBytesPerAttachment) {
+      showAppToast(
+        context,
+        '${file.name} is larger than ${_formatBytes(maxBytesPerAttachment)}.',
+        tone: AppToastTone.error,
+      );
+      continue;
+    }
+    attachments.add(
+      OutgoingMessageAttachment(
+        fileName: file.name,
+        bytes: bytes,
+        kind: _attachmentKindForFileName(file.name),
+        contentType: _contentTypeForFileName(file.name),
+      ),
+    );
+  }
+
+  if (result.files.length > remainingSlots) {
+    showAppToast(
+      context,
+      'Only the first $remainingSlots additional files were added.',
+    );
+  } else if (unreadableCount > 0 && attachments.isEmpty) {
+    showAppToast(
+      context,
+      'Unable to read the selected file(s).',
+      tone: AppToastTone.error,
+    );
+  }
+
+  return attachments;
+}
+
+Future<void> _copyAttachmentLink(
+  BuildContext context, {
+  required String fileName,
+  required String url,
+}) async {
+  await Clipboard.setData(ClipboardData(text: url));
+  if (!context.mounted) {
+    return;
+  }
+  showAppToast(context, 'Copied link for $fileName.');
+}
+
+MessageAttachmentKind _attachmentKindForFileName(String fileName) {
+  switch (_fileExtension(fileName)) {
+    case '.png':
+    case '.jpg':
+    case '.jpeg':
+    case '.gif':
+    case '.webp':
+    case '.bmp':
+    case '.svg':
+      return MessageAttachmentKind.image;
+    case '.mp4':
+    case '.mov':
+    case '.webm':
+      return MessageAttachmentKind.video;
+    case '.mp3':
+    case '.wav':
+    case '.ogg':
+    case '.m4a':
+      return MessageAttachmentKind.audio;
+    default:
+      return MessageAttachmentKind.file;
+  }
+}
+
+String? _contentTypeForFileName(String fileName) {
+  switch (_fileExtension(fileName)) {
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.gif':
+      return 'image/gif';
+    case '.webp':
+      return 'image/webp';
+    case '.bmp':
+      return 'image/bmp';
+    case '.svg':
+      return 'image/svg+xml';
+    case '.mp4':
+      return 'video/mp4';
+    case '.mov':
+      return 'video/quicktime';
+    case '.webm':
+      return 'video/webm';
+    case '.mp3':
+      return 'audio/mpeg';
+    case '.wav':
+      return 'audio/wav';
+    case '.ogg':
+      return 'audio/ogg';
+    case '.m4a':
+      return 'audio/mp4';
+    case '.pdf':
+      return 'application/pdf';
+    case '.txt':
+      return 'text/plain';
+    case '.json':
+      return 'application/json';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+String _fileExtension(String fileName) {
+  final separatorIndex = fileName.lastIndexOf('.');
+  if (separatorIndex <= 0 || separatorIndex == fileName.length - 1) {
+    return '';
+  }
+  return fileName.substring(separatorIndex).toLowerCase();
+}
+
+IconData _attachmentKindIcon(MessageAttachmentKind kind) {
+  switch (kind) {
+    case MessageAttachmentKind.image:
+      return Icons.image_outlined;
+    case MessageAttachmentKind.video:
+      return Icons.movie_outlined;
+    case MessageAttachmentKind.audio:
+      return Icons.audio_file_outlined;
+    case MessageAttachmentKind.file:
+      return Icons.insert_drive_file_outlined;
+  }
+}
+
+String _formatBytes(int bytes) {
+  if (bytes < 1024) {
+    return '$bytes B';
+  }
+  if (bytes < 1024 * 1024) {
+    return '${(bytes / 1024).toStringAsFixed(bytes < 10 * 1024 ? 1 : 0)} KB';
+  }
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB';
+}
+
+String _messageActivityPreview({
+  required String body,
+  required List<MessageAttachment> attachments,
+  required bool deleted,
+}) {
+  if (deleted) {
+    return 'Message deleted.';
+  }
+  final normalizedBody = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalizedBody.isNotEmpty) {
+    return normalizedBody.length <= 120
+        ? normalizedBody
+        : '${normalizedBody.substring(0, 117)}...';
+  }
+  if (attachments.isEmpty) {
+    return 'New activity in ChitChat.';
+  }
+  return attachments.length == 1
+      ? 'Sent an attachment.'
+      : 'Sent ${attachments.length} attachments.';
 }
 
 Future<String?> _showEmojiPickerDialog(BuildContext context) async {
@@ -5313,9 +6884,9 @@ class _GiphyPickerDialogState extends State<_GiphyPickerDialog> {
                           decoration: BoxDecoration(
                             borderRadius: BorderRadius.circular(16),
                             border: Border.all(
-                              color: Theme.of(context)
-                                  .extension<AppThemePalette>()!
-                                  .border,
+                              color: Theme.of(
+                                context,
+                              ).extension<AppThemePalette>()!.border,
                             ),
                           ),
                           child: ClipRRect(
@@ -5328,7 +6899,9 @@ class _GiphyPickerDialogState extends State<_GiphyPickerDialog> {
                                   fit: BoxFit.cover,
                                   errorBuilder: (context, error, stackTrace) =>
                                       const Center(
-                                        child: Icon(Icons.broken_image_outlined),
+                                        child: Icon(
+                                          Icons.broken_image_outlined,
+                                        ),
                                       ),
                                 ),
                                 Positioned(
@@ -5348,7 +6921,9 @@ class _GiphyPickerDialogState extends State<_GiphyPickerDialog> {
                                       gif.title.isEmpty ? 'GIF' : gif.title,
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(color: Colors.white),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -6119,71 +7694,12 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                   Wrap(
                     spacing: 10,
                     runSpacing: 10,
+                    crossAxisAlignment: WrapCrossAlignment.center,
                     children: [
-                      IconButton.filledTonal(
-                        onPressed: voiceController.toggleMute,
-                        icon: Icon(
-                          voiceController.muted ? Icons.mic_off : Icons.mic,
-                        ),
-                      ),
-                      IconButton.filledTonal(
-                        onPressed: voiceController.toggleDeafen,
-                        icon: Icon(
-                          voiceController.deafened
-                              ? Icons.hearing_disabled
-                              : Icons.hearing,
-                        ),
-                      ),
-                      IconButton.filledTonal(
-                        onPressed: widget.canStreamCamera
-                            ? (voiceController.shareKind == ShareKind.camera
-                                  ? voiceController.stopVisualShare
-                                  : voiceController.startCameraShare)
-                            : null,
-                        icon: Icon(
-                          voiceController.shareKind == ShareKind.camera
-                              ? Icons.videocam_off
-                              : Icons.videocam,
-                        ),
-                      ),
-                      IconButton.filledTonal(
-                        onPressed:
-                            widget.canShareScreen && WebRTC.platformIsDesktop
-                            ? () async {
-                                if (voiceController.shareKind ==
-                                    ShareKind.screen) {
-                                  await voiceController.stopVisualShare();
-                                  return;
-                                }
-                                final selection =
-                                    await showDialog<_ScreenShareSelection>(
-                                      context: context,
-                                      builder: (context) =>
-                                          ScreenSourcePickerDialog(
-                                            controller: voiceController,
-                                          ),
-                                    );
-                                if (selection != null) {
-                                  await voiceController.startScreenShare(
-                                    selection.source,
-                                    maxWidth: selection.preset.width,
-                                    maxHeight: selection.preset.height,
-                                    frameRate: selection.preset.frameRate,
-                                    captureSystemAudio:
-                                        selection.captureSystemAudio,
-                                  );
-                                }
-                              }
-                            : null,
-                        icon: Icon(
-                          voiceController.shareKind == ShareKind.screen
-                              ? Icons.stop_screen_share
-                              : Icons.screen_share,
-                        ),
-                      ),
-                      IconButton.filled(
-                        onPressed: widget.onLeaveCall,
-                        icon: const Icon(Icons.call_end),
+                      Chip(label: Text(voiceController.status)),
+                      Text(
+                        'Call controls live in the channel dock.',
+                        style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ],
                   ),
@@ -6974,6 +8490,160 @@ class _CreateServerDialogResult {
   final bool isPublic;
 }
 
+class _StartDirectMessageDialog extends StatefulWidget {
+  const _StartDirectMessageDialog({required this.members});
+
+  final List<ServerMember> members;
+
+  @override
+  State<_StartDirectMessageDialog> createState() =>
+      _StartDirectMessageDialogState();
+}
+
+class _StartDirectMessageDialogState extends State<_StartDirectMessageDialog> {
+  final TextEditingController _queryController = TextEditingController();
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final query = _queryController.text.trim().toLowerCase();
+    final filteredMembers = widget.members
+        .where(
+          (member) =>
+              query.isEmpty ||
+              member.displayName.toLowerCase().contains(query) ||
+              member.userId.toLowerCase().contains(query),
+        )
+        .toList();
+
+    return Dialog(
+      insetPadding: const EdgeInsets.all(40),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 520, maxHeight: 620),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Start direct message',
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _queryController,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'Search members',
+                  prefixIcon: Icon(Icons.search),
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: 16),
+              Expanded(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: palette.panelMuted,
+                    borderRadius: BorderRadius.circular(22),
+                    border: Border.all(color: palette.border),
+                  ),
+                  child: filteredMembers.isEmpty
+                      ? const Center(
+                          child: Text('No members matched that search.'),
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.all(14),
+                          itemCount: filteredMembers.length,
+                          separatorBuilder: (context, index) =>
+                              const SizedBox(height: 10),
+                          itemBuilder: (context, index) {
+                            final member = filteredMembers[index];
+                            return InkWell(
+                              onTap: () => Navigator.of(context).pop(member),
+                              borderRadius: BorderRadius.circular(18),
+                              child: Ink(
+                                padding: const EdgeInsets.all(14),
+                                decoration: BoxDecoration(
+                                  color: palette.panelStrong,
+                                  borderRadius: BorderRadius.circular(18),
+                                  border: Border.all(color: palette.border),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      width: 38,
+                                      height: 38,
+                                      decoration: BoxDecoration(
+                                        color: palette.panelAccent,
+                                        shape: BoxShape.circle,
+                                      ),
+                                      alignment: Alignment.center,
+                                      child: Text(
+                                        member.displayName.characters.first
+                                            .toUpperCase(),
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            member.displayName,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            member.userId,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: Theme.of(
+                                              context,
+                                            ).textTheme.bodySmall,
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _CreateServerDialog extends StatefulWidget {
   const _CreateServerDialog();
 
@@ -7055,10 +8725,7 @@ class _CreateServerDialogState extends State<_CreateServerDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('Create'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('Create')),
       ],
     );
   }
@@ -7143,17 +8810,17 @@ class _ServerDiscoveryDialogState extends State<_ServerDiscoveryDialog> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Join request sent to ${server.name}.')),
+      showAppToast(
+        context,
+        'Join request sent to ${server.name}.',
+        tone: AppToastTone.success,
       );
       await _loadResults();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
 
@@ -7220,10 +8887,12 @@ class _ServerDiscoveryDialogState extends State<_ServerDiscoveryDialog> {
                   child: _loading
                       ? const Center(child: CircularProgressIndicator())
                       : _error != null
-                      ? Center(child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Text(_error!, textAlign: TextAlign.center),
-                        ))
+                      ? Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Text(_error!, textAlign: TextAlign.center),
+                          ),
+                        )
                       : _results.isEmpty
                       ? const Center(
                           child: Text('No servers matched your search.'),
@@ -7301,7 +8970,9 @@ class _ServerDiscoveryDialogState extends State<_ServerDiscoveryDialog> {
                                             ),
                                           ],
                                         ),
-                                        if (server.description.trim().isNotEmpty)
+                                        if (server.description
+                                            .trim()
+                                            .isNotEmpty)
                                           Padding(
                                             padding: const EdgeInsets.only(
                                               top: 8,
@@ -7458,6 +9129,21 @@ class _EmptyState extends StatelessWidget {
       ),
     );
   }
+}
+
+bool _shouldGroupMessages({
+  required String? previousSenderId,
+  required DateTime? previousCreatedAt,
+  required String senderId,
+  required DateTime createdAt,
+}) {
+  if (previousSenderId == null || previousCreatedAt == null) {
+    return false;
+  }
+  if (previousSenderId != senderId) {
+    return false;
+  }
+  return createdAt.difference(previousCreatedAt) < const Duration(minutes: 5);
 }
 
 String _formatTime(DateTime timestamp, {bool use24HourTime = false}) {
