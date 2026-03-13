@@ -7,7 +7,9 @@
       "Bash(find /c/Users/jacob/AppData/Local/Pub/Cache/hosted/pub.dev/flutter_webrtc-1.3.1 -name *.cc -o -name *.cpp -o -name *.h)",
       "Bash(curl -s https://pub.dev/api/packages/flutter_webrtc)",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); versions=[v[''''version''''] for v in d.get\\(''''versions'''',[]\\)]; print\\(''''\\\\n''''.join\\(versions[:10]\\)\\)\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(flutter pub:*)",
+      "Bash(flutter build:*)"
     ]
   }
 }

@@ -48,6 +48,10 @@ dependencies:
   livekit_client: ^2.5.0+hotfix.3
   local_notifier: ^0.1.6
 
+dependency_overrides:
+  flutter_webrtc:
+    path: flutter_webrtc_fork
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
