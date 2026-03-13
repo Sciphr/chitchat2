@@ -47,6 +47,15 @@ class ScreenShareService {
         'echoCancellation': noiseCancellation,
         'noiseSuppression': noiseCancellation,
         'autoGainControl': false,
+        'highpassFilter': noiseCancellation,
+        // Chromium-specific constraints: enable the RNN-based NS pipeline
+        // which handles transient noise (typing, etc.) much better than the
+        // standard spectral model.
+        'googNoiseSuppression': noiseCancellation,
+        'googNoiseSuppression2': noiseCancellation,
+        'googHighpassFilter': noiseCancellation,
+        'googEchoCancellation': noiseCancellation,
+        'googEchoCancellation2': noiseCancellation,
       },
       'video': false,
     });
@@ -396,8 +405,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
       await _syncRoomState();
       await _trackPresence();
       _status = isCameraSharing
-          ? 'Camera and screen share live with audio.'
-          : 'Screen share live at ${maxHeight}p/${frameRate}fps with audio.';
+          ? 'Camera and screen share live.'
+          : 'Screen share live at ${maxHeight}p/${frameRate}fps.';
     } catch (error) {
       _status = 'Unable to start screen share: $error';
     } finally {
@@ -649,6 +658,9 @@ class VoiceChannelSessionController extends ChangeNotifier {
     noiseSuppression: preferences.noiseCancellation,
     echoCancellation: preferences.noiseCancellation,
     autoGainControl: false,
+    highPassFilter: preferences.noiseCancellation,
+    typingNoiseDetection: preferences.noiseCancellation,
+    voiceIsolation: preferences.noiseCancellation,
     stopAudioCaptureOnMute: false,
   );
 

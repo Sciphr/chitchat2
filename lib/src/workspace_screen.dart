@@ -8507,8 +8507,7 @@ class _VoiceChannelViewState extends State<VoiceChannelView> {
                 if (joinedInThisChannel)
                   Positioned(
                     right: widget.fullscreenMode ? 16 : 10,
-                    top: widget.fullscreenMode ? 16 : null,
-                    bottom: widget.fullscreenMode ? null : 10,
+                    bottom: 10,
                     child: IconButton.filledTonal(
                       onPressed: widget.fullscreenMode
                           ? () => Navigator.of(context).pop()
