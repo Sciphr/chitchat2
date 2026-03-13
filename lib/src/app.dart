@@ -832,12 +832,34 @@ class _DesktopUpdateButton extends StatelessWidget {
   final Size buttonSize;
 
   Future<void> _handlePressed(BuildContext context) async {
-    UpdateActionResult result;
     if (updateController.hasUpdate) {
-      result = await updateController.installUpdate();
-    } else {
-      result = await updateController.checkForUpdates();
+      final version = updateController.latestVersion ?? 'a newer version';
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Update available'),
+          content: Text(
+            'Version $version is ready to install.\n\n'
+            'The app will close, install the update, then relaunch automatically.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Later'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Install now'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+      await updateController.installUpdate();
+      return;
     }
+
+    final result = await updateController.checkForUpdates();
 
     if (!context.mounted) {
       return;
@@ -867,11 +889,7 @@ class _DesktopUpdateButton extends StatelessWidget {
       case UpdateActionResult.installing:
         showAppToast(context, 'Update check already in progress.');
       case UpdateActionResult.startedInstaller:
-        showAppToast(
-          context,
-          'Installer launched. Follow the update prompt to continue.',
-          tone: AppToastTone.success,
-        );
+        break;
     }
   }
 

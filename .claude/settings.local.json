@@ -9,7 +9,9 @@
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); versions=[v[''''version''''] for v in d.get\\(''''versions'''',[]\\)]; print\\(''''\\\\n''''.join\\(versions[:10]\\)\\)\")",
       "WebSearch",
       "Bash(flutter pub:*)",
-      "Bash(flutter build:*)"
+      "Bash(flutter build:*)",
+      "Bash(cat /d/chitchat2/.github/workflows/*.yml)",
+      "Bash(xargs ls:*)"
     ]
   }
 }

@@ -59,7 +59,7 @@ class AppUpdateController extends ChangeNotifier {
     _currentVersion = packageInfo.version;
     notifyListeners();
 
-    unawaited(checkForUpdates(autoInstallIfAvailable: true));
+    unawaited(checkForUpdates());
     _backgroundTimer = Timer.periodic(const Duration(hours: 2), (_) {
       unawaited(checkForUpdates());
     });
