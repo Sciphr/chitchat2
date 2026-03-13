@@ -152,41 +152,147 @@ class _ChatAppState extends State<ChatApp> {
   }
 }
 
-class _AppShell extends StatelessWidget {
+class _AppShell extends StatefulWidget {
   const _AppShell({required this.bootstrap, required this.preferences});
 
   final AppBootstrap bootstrap;
   final AppPreferences preferences;
 
   @override
-  Widget build(BuildContext context) {
-    if (!bootstrap.isConfigured) {
-      return _SetupScreen(
-        message: bootstrap.message,
-        hasInitializationError: bootstrap.hasInitializationError,
-      );
-    }
+  State<_AppShell> createState() => _AppShellState();
+}
 
+class _AppShellState extends State<_AppShell> with WidgetsBindingObserver {
+  SupabaseClient? _client;
+  AuthService? _authService;
+  WorkspaceRepository? _workspaceRepository;
+  StreamSubscription<AuthState>? _authSubscription;
+  bool _authReady = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (!widget.bootstrap.isConfigured) {
+      return;
+    }
     final client = Supabase.instance.client;
     final authService = AuthService(client);
-    final workspaceRepository = WorkspaceRepository(
+    _client = client;
+    _authService = authService;
+    _workspaceRepository = WorkspaceRepository(
       client: client,
       authService: authService,
     );
+    _authSubscription = authService.authChanges.listen((authState) {
+      unawaited(_applyRealtimeAuth(authState.session));
+      if (mounted) {
+        setState(() {});
+      }
+    });
+    unawaited(_initializeAuth());
+  }
 
-    return StreamBuilder<AuthState>(
-      stream: authService.authChanges,
-      builder: (context, snapshot) {
-        final session = snapshot.data?.session ?? client.auth.currentSession;
-        if (session == null) {
-          return SignInScreen(authService: authService);
-        }
-        return WorkspaceScreen(
-          authService: authService,
-          workspaceRepository: workspaceRepository,
-          preferences: preferences,
-        );
-      },
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _authSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_ensureFreshSession());
+    }
+  }
+
+  Future<void> _initializeAuth() async {
+    await _ensureFreshSession();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _authReady = true;
+    });
+  }
+
+  Future<void> _ensureFreshSession() async {
+    final client = _client;
+    if (client == null) {
+      return;
+    }
+    final session = client.auth.currentSession;
+    if (session == null) {
+      await _applyRealtimeAuth(null);
+      return;
+    }
+    if (!_sessionNeedsRefresh(session)) {
+      await _applyRealtimeAuth(session);
+      return;
+    }
+    try {
+      final response = await client.auth.refreshSession();
+      await _applyRealtimeAuth(response.session ?? client.auth.currentSession);
+    } catch (_) {
+      await client.auth.signOut();
+      await _applyRealtimeAuth(null);
+    }
+  }
+
+  Future<void> _applyRealtimeAuth(Session? session) async {
+    final client = _client;
+    if (client == null) {
+      return;
+    }
+    try {
+      await client.realtime.setAuth(session?.accessToken);
+    } catch (_) {
+      // Realtime auth will be retried on the next auth event or resume.
+    }
+  }
+
+  bool _sessionNeedsRefresh(Session session) {
+    final expiresAt = session.expiresAt;
+    if (expiresAt == null) {
+      return false;
+    }
+    final expiresAtUtc = DateTime.fromMillisecondsSinceEpoch(
+      expiresAt * 1000,
+      isUtc: true,
+    );
+    return DateTime.now().toUtc().isAfter(
+      expiresAtUtc.subtract(const Duration(minutes: 1)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.bootstrap.isConfigured) {
+      return _SetupScreen(
+        message: widget.bootstrap.message,
+        hasInitializationError: widget.bootstrap.hasInitializationError,
+      );
+    }
+
+    if (!_authReady) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final client = _client;
+    final authService = _authService;
+    final workspaceRepository = _workspaceRepository;
+    if (client == null || authService == null || workspaceRepository == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    final session = client.auth.currentSession;
+    if (session == null) {
+      return SignInScreen(authService: authService);
+    }
+    return WorkspaceScreen(
+      authService: authService,
+      workspaceRepository: workspaceRepository,
+      preferences: widget.preferences,
     );
   }
 }

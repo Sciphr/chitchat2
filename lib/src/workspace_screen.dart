@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
 import 'app_preferences.dart';
 import 'app_toast.dart';
@@ -65,6 +66,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   RealtimeChannel? _serverPresenceChannel;
   RealtimeChannel? _serverRosterChannel;
   RealtimeChannel? _serverStructureChannel;
+  RealtimeChannel? _serverJoinRequestsChannel;
   RealtimeChannel? _workspaceDirectoryChannel;
   final Map<String, RealtimeChannel> _voicePresenceChannels =
       <String, RealtimeChannel>{};
@@ -81,6 +83,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   Map<String, int> _channelUnreadCounts = const <String, int>{};
   Map<String, int> _lastChannelUnreadCounts = const <String, int>{};
   Map<String, int> _lastDirectUnreadCounts = const <String, int>{};
+  int _pendingJoinRequestCount = 0;
   String? _currentUserAvatarPath;
 
   @override
@@ -103,6 +106,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     }
     unawaited(_closeServerRosterChannel());
     unawaited(_closeServerStructureChannel());
+    unawaited(_closeServerJoinRequestsChannel());
     unawaited(_closeWorkspaceDirectoryChannel());
     unawaited(_closeServerPresenceChannel(resetUi: false));
     unawaited(_closeVoicePresenceChannels(resetUi: false));
@@ -351,6 +355,14 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     _serverStructureChannel = null;
     if (structureChannel != null) {
       await Supabase.instance.client.removeChannel(structureChannel);
+    }
+  }
+
+  Future<void> _closeServerJoinRequestsChannel() async {
+    final joinRequestsChannel = _serverJoinRequestsChannel;
+    _serverJoinRequestsChannel = null;
+    if (joinRequestsChannel != null) {
+      await Supabase.instance.client.removeChannel(joinRequestsChannel);
     }
   }
 
@@ -791,6 +803,148 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     return 'Member presence unavailable right now.';
   }
 
+  bool _canReviewJoinRequestsForServer({
+    required ServerSummary server,
+    ServerAccess? access,
+  }) {
+    if (server.ownerId == widget.authService.userId) {
+      return true;
+    }
+    final effectiveAccess = access ?? _serverAccess;
+    if (effectiveAccess == null) {
+      return false;
+    }
+    return effectiveAccess.hasPermission(ServerPermission.inviteMembers) ||
+        effectiveAccess.hasPermission(ServerPermission.manageServer);
+  }
+
+  Future<void> _loadPendingJoinRequestCount(ServerSummary server) async {
+    if (!_canReviewJoinRequestsForServer(server: server)) {
+      if (mounted &&
+          _selectedServer?.id == server.id &&
+          _pendingJoinRequestCount != 0) {
+        setState(() {
+          _pendingJoinRequestCount = 0;
+        });
+      }
+      return;
+    }
+
+    try {
+      final requests = await widget.workspaceRepository.fetchServerJoinRequests(
+        server.id,
+      );
+      if (!mounted ||
+          _selectedServer?.id != server.id ||
+          !_canReviewJoinRequestsForServer(server: server)) {
+        return;
+      }
+      final nextCount = requests.length;
+      if (_pendingJoinRequestCount == nextCount) {
+        return;
+      }
+      setState(() {
+        _pendingJoinRequestCount = nextCount;
+      });
+    } catch (error) {
+      if (_selectedServer?.id == server.id) {
+        debugPrint(
+          'Pending join request count failed for ${server.id}: $error',
+        );
+      }
+    }
+  }
+
+  Future<void> _subscribeServerJoinRequests(ServerSummary server) async {
+    await _closeServerJoinRequestsChannel();
+    if (!mounted ||
+        _selectedServer?.id != server.id ||
+        !_canReviewJoinRequestsForServer(server: server)) {
+      return;
+    }
+
+    final client = Supabase.instance.client;
+    final completer = Completer<void>();
+    final realtimeChannel = client
+        .channel('server-join-requests:${server.id}')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'server_join_requests',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'server_id',
+            value: server.id,
+          ),
+          callback: (_) {
+            if (_selectedServer?.id == server.id) {
+              unawaited(_loadPendingJoinRequestCount(server));
+            }
+          },
+        );
+
+    realtimeChannel.subscribe((status, [error]) {
+      if (completer.isCompleted) {
+        return;
+      }
+      switch (status) {
+        case RealtimeSubscribeStatus.subscribed:
+          completer.complete();
+        case RealtimeSubscribeStatus.channelError:
+          completer.completeError(
+            StateError(
+              'Realtime join request error'
+              '${error == null ? '' : ': $error'}',
+            ),
+          );
+        case RealtimeSubscribeStatus.closed:
+          completer.completeError(
+            StateError('Realtime join request channel closed.'),
+          );
+        case RealtimeSubscribeStatus.timedOut:
+          completer.completeError(
+            StateError('Realtime join request channel timed out.'),
+          );
+      }
+    });
+
+    try {
+      await completer.future;
+      if (!mounted ||
+          _selectedServer?.id != server.id ||
+          !_canReviewJoinRequestsForServer(server: server)) {
+        await client.removeChannel(realtimeChannel);
+        return;
+      }
+      _serverJoinRequestsChannel = realtimeChannel;
+    } catch (error) {
+      await client.removeChannel(realtimeChannel);
+      if (_selectedServer?.id == server.id) {
+        debugPrint('Join request subscription failed for ${server.id}: $error');
+      }
+    }
+  }
+
+  Future<void> _syncServerJoinRequestIndicators({
+    required ServerSummary server,
+    ServerAccess? access,
+  }) async {
+    if (!_canReviewJoinRequestsForServer(server: server, access: access)) {
+      await _closeServerJoinRequestsChannel();
+      if (mounted &&
+          _selectedServer?.id == server.id &&
+          _pendingJoinRequestCount != 0) {
+        setState(() {
+          _pendingJoinRequestCount = 0;
+        });
+      }
+      return;
+    }
+
+    await _loadPendingJoinRequestCount(server);
+    await _subscribeServerJoinRequests(server);
+  }
+
   Future<void> _syncVoicePresenceSubscriptions(
     String serverId,
     List<ChannelSummary> channels,
@@ -1088,6 +1242,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     setState(() {
       _previewVoiceController = controller;
     });
+    controller.prewarmJoin();
   }
 
   Future<void> _joinSelectedVoiceChannel() async {
@@ -1235,6 +1390,74 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     setState(() {
       _servers = nextServers;
     });
+  }
+
+  void _applyServerSettingsState({
+    required ServerSummary server,
+    required List<ServerRole> roles,
+    required List<ServerMember> members,
+  }) {
+    if (!mounted || _selectedServer?.id != server.id) {
+      return;
+    }
+    final nextAccess = _deriveServerAccessFromRoster(
+      server: server,
+      roles: roles,
+      members: members,
+    );
+    final nextServers =
+        _servers.where((existing) => existing.id != server.id).followedBy(
+            <ServerSummary>[server],
+          ).toList()
+          ..sort((left, right) => left.createdAt.compareTo(right.createdAt));
+    setState(() {
+      _servers = nextServers;
+      _selectedServer = server;
+      _serverRoles = roles;
+      _serverMembers = members;
+      _serverAccess = nextAccess;
+      _memberRosterError = null;
+      _loadingMemberRoster = false;
+      _loadingServerAccess = false;
+    });
+    _syncServerPresence();
+    unawaited(
+      _syncServerJoinRequestIndicators(server: server, access: nextAccess),
+    );
+  }
+
+  ServerAccess _deriveServerAccessFromRoster({
+    required ServerSummary server,
+    required List<ServerRole> roles,
+    required List<ServerMember> members,
+  }) {
+    if (server.ownerId == widget.authService.userId) {
+      return ServerAccess(
+        isOwner: true,
+        permissions: ServerPermission.values.toSet(),
+      );
+    }
+    ServerMember? currentMember;
+    for (final member in members) {
+      if (member.userId == widget.authService.userId) {
+        currentMember = member;
+        break;
+      }
+    }
+    if (currentMember == null) {
+      return const ServerAccess(
+        isOwner: false,
+        permissions: <ServerPermission>{},
+      );
+    }
+    final roleById = {for (final role in roles) role.id: role};
+    final permissions = <ServerPermission>{};
+    for (final roleId in currentMember.roleIds) {
+      permissions.addAll(
+        roleById[roleId]?.permissions ?? const <ServerPermission>{},
+      );
+    }
+    return ServerAccess(isOwner: false, permissions: permissions);
   }
 
   Future<void> _initializeWorkspace() async {
@@ -1482,6 +1705,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     await _selectChannel(null);
     await _closeServerRosterChannel();
     await _closeServerStructureChannel();
+    await _closeServerJoinRequestsChannel();
     await _closeServerPresenceChannel();
     await _closeVoicePresenceChannels();
     _selectedServer = server;
@@ -1494,6 +1718,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     _channelMessagesById = const <String, List<ChannelMessage>>{};
     _channelUnreadCounts = const <String, int>{};
     _serverAccess = null;
+    _pendingJoinRequestCount = 0;
     _memberRosterError = null;
     _loadingMemberRoster = server != null;
     _loadingServerAccess = server != null;
@@ -1617,6 +1842,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         _serverAccess = access;
         _loadingServerAccess = false;
       });
+      await _syncServerJoinRequestIndicators(server: server, access: access);
     } catch (error) {
       if (!mounted || _selectedServer?.id != server.id) {
         return;
@@ -1934,19 +2160,36 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       return;
     }
 
+    final previousCategories = List<ChannelCategorySummary>.from(_categories);
+    setState(() {
+      _categories = [
+        for (final c in _categories)
+          if (c.id == category.id)
+            ChannelCategorySummary(
+              id: c.id,
+              serverId: c.serverId,
+              name: result.trim(),
+              position: c.position,
+              createdBy: c.createdBy,
+              createdAt: c.createdAt,
+            )
+          else
+            c,
+      ];
+    });
+
     try {
       await widget.workspaceRepository.renameChannelCategory(
         categoryId: category.id,
-        name: result,
+        name: result.trim(),
       );
-      final selectedServer = _selectedServer;
-      if (selectedServer != null) {
-        await _loadChannels(selectedServer.id);
-      }
     } catch (error) {
       if (!mounted) {
         return;
       }
+      setState(() {
+        _categories = previousCategories;
+      });
       showAppToast(context, error.toString(), tone: AppToastTone.error);
     }
   }
@@ -2165,7 +2408,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       return;
     }
 
-    final shouldRefresh = await showDialog<bool>(
+    await showDialog<void>(
       context: context,
       builder: (context) => ServerSettingsDialog(
         server: selectedServer,
@@ -2175,33 +2418,22 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
         onCreateChannel: _promptCreateChannel,
         onCreateCategory: _promptCreateCategory,
         onPickServerAvatar: _pickServerAvatar,
+        onStateChanged: ({required server, required roles, required members}) =>
+            _applyServerSettingsState(
+              server: server,
+              roles: roles,
+              members: members,
+            ),
+        onPendingJoinRequestsChanged: (pendingJoinRequestCount) {
+          if (!mounted || _selectedServer?.id != selectedServer.id) {
+            return;
+          }
+          setState(() {
+            _pendingJoinRequestCount = pendingJoinRequestCount;
+          });
+        },
       ),
     );
-
-    if (!mounted ||
-        _selectedServer?.id != selectedServer.id ||
-        shouldRefresh != true) {
-      return;
-    }
-    await _loadServers();
-    if (!mounted) {
-      return;
-    }
-    ServerSummary? refreshedServer = selectedServer;
-    for (final server in _servers) {
-      if (server.id == selectedServer.id) {
-        refreshedServer = server;
-        break;
-      }
-    }
-    if (refreshedServer != null) {
-      setState(() {
-        _selectedServer = refreshedServer;
-      });
-    }
-    await _loadServerAccess(refreshedServer ?? selectedServer);
-    await _loadChannels((refreshedServer ?? selectedServer).id);
-    await _loadServerRoster(refreshedServer ?? selectedServer);
   }
 
   Future<void> _openUserSettings() async {
@@ -2347,6 +2579,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 loadingAccess: _loadingServerAccess,
                 error: _channelError,
                 access: _serverAccess,
+                pendingJoinRequestCount: _pendingJoinRequestCount,
                 selectedChannelId: _selectedChannel?.id,
                 channelUnreadCounts: _channelUnreadCounts,
                 voiceParticipantsByChannel: voiceParticipantsByChannel,
@@ -2384,6 +2617,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                   loadingAccess: _loadingServerAccess,
                   error: _channelError,
                   access: _serverAccess,
+                  pendingJoinRequestCount: _pendingJoinRequestCount,
                   selectedChannelId: _selectedChannel?.id,
                   channelUnreadCounts: _channelUnreadCounts,
                   voiceParticipantsByChannel: voiceParticipantsByChannel,
@@ -2436,6 +2670,10 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                           displayName: displayName,
                         ),
               );
+        final senderNameColorsByUserId = _primaryRoleColorsByUserId(
+          _serverRoles,
+          _serverMembers,
+        );
 
         final content = _showDirectMessages
             ? selectedDirectConversation == null
@@ -2494,6 +2732,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                       ServerPermission.manageMessages,
                     ) ??
                     false,
+                senderNameColorsByUserId: senderNameColorsByUserId,
                 use24HourTime: widget.preferences.use24HourTime,
                 showTimestamps: widget.preferences.showMessageTimestamps,
                 motionDuration: widget.preferences.motionDuration,
@@ -3356,22 +3595,20 @@ class _WorkspaceRailTile extends StatelessWidget {
         width: 64,
         height: 64,
         decoration: BoxDecoration(
-          color: selected
-              ? Theme.of(context).colorScheme.primary
-              : palette.panelStrong,
+          color: selected ? palette.panelAccent : palette.panelStrong,
           borderRadius: BorderRadius.circular(18),
           border: Border.all(
             color: selected
-                ? Theme.of(context).colorScheme.secondary
+                ? Theme.of(context).colorScheme.primary
                 : palette.border,
-            width: selected ? 4 : 1.5,
+            width: selected ? 2 : 1.5,
           ),
           boxShadow: selected
               ? [
                   BoxShadow(
-                    color: Theme.of(context).colorScheme.primary.withAlpha(120),
-                    blurRadius: 20,
-                    spreadRadius: 3,
+                    color: Theme.of(context).colorScheme.primary.withAlpha(80),
+                    blurRadius: 14,
+                    spreadRadius: 1,
                   ),
                 ]
               : const [],
@@ -3385,7 +3622,7 @@ class _WorkspaceRailTile extends StatelessWidget {
                   icon,
                   size: 28,
                   color: selected
-                      ? Theme.of(context).colorScheme.onPrimary
+                      ? Theme.of(context).colorScheme.primary
                       : Theme.of(context).colorScheme.onSurface,
                 ),
               ),
@@ -3398,7 +3635,7 @@ class _WorkspaceRailTile extends StatelessWidget {
                 child: Container(
                   width: 6,
                   decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.secondary,
+                    color: Theme.of(context).colorScheme.primary,
                     borderRadius: BorderRadius.circular(999),
                   ),
                 ),
@@ -3723,6 +3960,7 @@ class _ChannelSidebar extends StatefulWidget {
     required this.loadingAccess,
     required this.error,
     required this.access,
+    required this.pendingJoinRequestCount,
     required this.selectedChannelId,
     required this.channelUnreadCounts,
     required this.voiceParticipantsByChannel,
@@ -3752,6 +3990,7 @@ class _ChannelSidebar extends StatefulWidget {
   final bool loadingAccess;
   final String? error;
   final ServerAccess? access;
+  final int pendingJoinRequestCount;
   final String? selectedChannelId;
   final Map<String, int> channelUnreadCounts;
   final Map<String, List<VoiceParticipant>> voiceParticipantsByChannel;
@@ -3818,6 +4057,11 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
     final isOwner =
         selectedServer?.ownerId ==
         Supabase.instance.client.auth.currentUser?.id;
+    final canReviewJoinRequests =
+        isOwner ||
+        (serverAccess?.hasPermission(ServerPermission.inviteMembers) ??
+            false) ||
+        (serverAccess?.hasPermission(ServerPermission.manageServer) ?? false);
     final canOpenSettings =
         (!widget.loadingAccess && isOwner) ||
         (serverAccess?.hasPermission(ServerPermission.inviteMembers) ??
@@ -3885,20 +4129,33 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
                         const SizedBox(height: 12),
                         Align(
                           alignment: Alignment.centerLeft,
-                          child: FilledButton.tonalIcon(
+                          child: FilledButton.tonal(
                             onPressed: canOpenSettings
                                 ? widget.onOpenSettings
                                 : null,
-                            icon: widget.loadingAccess
-                                ? const SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : const Icon(Icons.settings),
-                            label: const Text('Server settings'),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                widget.loadingAccess
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Icon(Icons.settings, size: 18),
+                                const SizedBox(width: 8),
+                                const Text('Server settings'),
+                                if (canReviewJoinRequests &&
+                                    widget.pendingJoinRequestCount > 0) ...[
+                                  const SizedBox(width: 8),
+                                  _UnreadBadge(
+                                    count: widget.pendingJoinRequestCount,
+                                  ),
+                                ],
+                              ],
+                            ),
                           ),
                         ),
                         const SizedBox(height: 16),
@@ -4895,12 +5152,11 @@ class _ServerMembersPanel extends StatelessWidget {
   }
 
   List<_ServerMemberRoleGroup> _groupMembersByRole() {
-    final roleOrder = {
-      for (var index = 0; index < roles.length; index++) roles[index].id: index,
-    };
+    final roleOrder = _roleOrderMap(roles);
     final roleById = {for (final role in roles) role.id: role};
     final membersByRoleName = <String, List<ServerMember>>{};
     final roleNameOrder = <String, int>{};
+    final roleColorsByName = <String, Color?>{};
 
     for (final member in members) {
       final primaryRole = _primaryRoleForMember(member, roleById, roleOrder);
@@ -4908,6 +5164,10 @@ class _ServerMembersPanel extends StatelessWidget {
       membersByRoleName
           .putIfAbsent(roleName, () => <ServerMember>[])
           .add(member);
+      roleColorsByName.putIfAbsent(
+        roleName,
+        () => _roleColorFromHex(primaryRole?.colorHex),
+      );
       roleNameOrder.putIfAbsent(
         roleName,
         () => primaryRole == null
@@ -4931,6 +5191,7 @@ class _ServerMembersPanel extends StatelessWidget {
                   right.displayName.toLowerCase(),
                 );
               }),
+            roleColor: roleColorsByName[entry.key],
             order: roleNameOrder[entry.key] ?? 1 << 20,
           ),
         )
@@ -4946,42 +5207,6 @@ class _ServerMembersPanel extends StatelessWidget {
       );
     });
     return groups;
-  }
-
-  ServerRole? _primaryRoleForMember(
-    ServerMember member,
-    Map<String, ServerRole> roleById,
-    Map<String, int> roleOrder,
-  ) {
-    final assignedRoles = member.roleIds
-        .map((roleId) => roleById[roleId])
-        .whereType<ServerRole>()
-        .toList();
-    if (assignedRoles.isEmpty) {
-      return null;
-    }
-    assignedRoles.sort(
-      (left, right) => _roleSortScore(
-        left,
-        roleOrder,
-      ).compareTo(_roleSortScore(right, roleOrder)),
-    );
-    return assignedRoles.first;
-  }
-
-  int _roleSortScore(ServerRole role, Map<String, int> roleOrder) {
-    final normalizedName = role.name.toLowerCase();
-    if (normalizedName == 'owner') {
-      return -3000;
-    }
-    if (normalizedName == 'admin') {
-      return -2000;
-    }
-    if (normalizedName == 'member') {
-      return 9000;
-    }
-    final index = roleOrder[role.id] ?? 0;
-    return role.isSystem ? 1000 + index : index;
   }
 }
 
@@ -5021,6 +5246,7 @@ class _ServerMemberRoleSection extends StatelessWidget {
           style: Theme.of(context).textTheme.labelLarge?.copyWith(
             letterSpacing: 1.0,
             fontWeight: FontWeight.w700,
+            color: group.roleColor,
           ),
         ),
         const SizedBox(height: 10),
@@ -5030,6 +5256,7 @@ class _ServerMemberRoleSection extends StatelessWidget {
             online: true,
             isCurrentUser: member.userId == currentUserId,
             avatarUrl: avatarUrlForPath(member.avatarPath),
+            roleColor: group.roleColor,
             onStartDirectMessage: onStartDirectMessage,
           ),
         ),
@@ -5041,6 +5268,7 @@ class _ServerMemberRoleSection extends StatelessWidget {
             online: false,
             isCurrentUser: member.userId == currentUserId,
             avatarUrl: avatarUrlForPath(member.avatarPath),
+            roleColor: group.roleColor,
             onStartDirectMessage: onStartDirectMessage,
           ),
         ),
@@ -5049,12 +5277,13 @@ class _ServerMemberRoleSection extends StatelessWidget {
   }
 }
 
-class _ServerMemberRow extends StatelessWidget {
+class _ServerMemberRow extends StatefulWidget {
   const _ServerMemberRow({
     required this.member,
     required this.online,
     required this.isCurrentUser,
     required this.avatarUrl,
+    required this.roleColor,
     required this.onStartDirectMessage,
   });
 
@@ -5062,6 +5291,7 @@ class _ServerMemberRow extends StatelessWidget {
   final bool online;
   final bool isCurrentUser;
   final String? avatarUrl;
+  final Color? roleColor;
   final Future<void> Function({
     required String userId,
     required String displayName,
@@ -5069,88 +5299,176 @@ class _ServerMemberRow extends StatelessWidget {
   onStartDirectMessage;
 
   @override
+  State<_ServerMemberRow> createState() => _ServerMemberRowState();
+}
+
+class _ServerMemberRowState extends State<_ServerMemberRow> {
+  static MenuController? _activeMenuController;
+
+  final MenuController _menuController = MenuController();
+  bool _hovering = false;
+  bool _menuOpen = false;
+
+  bool get _interactive => !widget.isCurrentUser;
+
+  @override
+  void dispose() {
+    if (identical(_activeMenuController, _menuController)) {
+      _activeMenuController = null;
+    }
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     const onlineIndicatorColor = Color(0xFF34C759);
     const offlineIndicatorColor = Color(0xFF8E97A6);
-    final indicatorColor = online
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final indicatorColor = widget.online
         ? onlineIndicatorColor
         : offlineIndicatorColor;
-    return Builder(
-      builder: (context) => GestureDetector(
-        onSecondaryTapDown: isCurrentUser
-            ? null
-            : (details) {
-                unawaited(_showMemberMenu(context, details.globalPosition));
-              },
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Row(
-            children: [
-              Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  _UserAvatar(
-                    displayName: member.displayName,
-                    avatarUrl: avatarUrl,
-                    size: 30,
-                  ),
-                  Positioned(
-                    right: -1,
-                    bottom: -1,
-                    child: Container(
-                      width: 10,
-                      height: 10,
-                      decoration: BoxDecoration(
-                        color: indicatorColor,
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: Theme.of(context).colorScheme.surface,
-                          width: 1.5,
+    final highlighted = _interactive && (_hovering || _menuOpen);
+
+    return MenuAnchor(
+      controller: _menuController,
+      consumeOutsideTap: false,
+      onOpen: () {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _menuOpen = true;
+        });
+      },
+      onClose: () {
+        if (identical(_activeMenuController, _menuController)) {
+          _activeMenuController = null;
+        }
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _menuOpen = false;
+        });
+      },
+      menuChildren: [
+        MenuItemButton(
+          onPressed: _startDirectMessage,
+          leadingIcon: const Icon(Icons.chat_bubble_outline, size: 18),
+          child: const Text('Send direct message'),
+        ),
+      ],
+      builder: (context, controller, child) => MouseRegion(
+        cursor: _interactive
+            ? SystemMouseCursors.click
+            : SystemMouseCursors.basic,
+        onEnter: (_) {
+          if (!_interactive) {
+            return;
+          }
+          setState(() {
+            _hovering = true;
+          });
+        },
+        onExit: (_) {
+          if (!_interactive) {
+            return;
+          }
+          setState(() {
+            _hovering = false;
+          });
+        },
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _interactive ? _startDirectMessage : null,
+          onSecondaryTapDown: _interactive
+              ? (details) {
+                  final activeController = _activeMenuController;
+                  if (activeController != null &&
+                      !identical(activeController, _menuController) &&
+                      activeController.isOpen) {
+                    activeController.close();
+                  }
+                  if (_menuController.isOpen) {
+                    _menuController.close();
+                  }
+                  _menuController.open(position: details.localPosition);
+                  _activeMenuController = _menuController;
+                }
+              : null,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 140),
+            curve: Curves.easeOut,
+            margin: const EdgeInsets.symmetric(vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: highlighted
+                  ? palette.panelStrong.withAlpha(210)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: highlighted
+                    ? palette.border.withAlpha(150)
+                    : Colors.transparent,
+              ),
+            ),
+            child: Row(
+              children: [
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    _UserAvatar(
+                      displayName: widget.member.displayName,
+                      avatarUrl: widget.avatarUrl,
+                      size: 30,
+                    ),
+                    Positioned(
+                      right: -1,
+                      bottom: -1,
+                      child: Container(
+                        width: 10,
+                        height: 10,
+                        decoration: BoxDecoration(
+                          color: indicatorColor,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: Theme.of(context).colorScheme.surface,
+                            width: 1.5,
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                ],
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  isCurrentUser
-                      ? '${member.displayName} (you)'
-                      : member.displayName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    fontWeight: online ? FontWeight.w600 : FontWeight.w500,
+                  ],
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    widget.isCurrentUser
+                        ? '${widget.member.displayName} (you)'
+                        : widget.member.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: widget.roleColor,
+                      fontWeight: widget.online
+                          ? FontWeight.w600
+                          : FontWeight.w500,
+                    ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
     );
   }
 
-  Future<void> _showMemberMenu(BuildContext context, Offset position) async {
-    final selection = await showMenu<String>(
-      context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy,
-        position.dx,
-        position.dy,
-      ),
-      items: const [
-        PopupMenuItem<String>(value: 'dm', child: Text('Send direct message')),
-      ],
+  Future<void> _startDirectMessage() async {
+    await widget.onStartDirectMessage(
+      userId: widget.member.userId,
+      displayName: widget.member.displayName,
     );
-    if (selection == 'dm') {
-      await onStartDirectMessage(
-        userId: member.userId,
-        displayName: member.displayName,
-      );
-    }
   }
 }
 
@@ -5158,12 +5476,87 @@ class _ServerMemberRoleGroup {
   const _ServerMemberRoleGroup({
     required this.roleName,
     required this.members,
+    required this.roleColor,
     required this.order,
   });
 
   final String roleName;
   final List<ServerMember> members;
+  final Color? roleColor;
   final int order;
+}
+
+Map<String, int> _roleOrderMap(List<ServerRole> roles) {
+  return {
+    for (var index = 0; index < roles.length; index++) roles[index].id: index,
+  };
+}
+
+ServerRole? _primaryRoleForMember(
+  ServerMember member,
+  Map<String, ServerRole> roleById,
+  Map<String, int> roleOrder,
+) {
+  final assignedRoles = member.roleIds
+      .map((roleId) => roleById[roleId])
+      .whereType<ServerRole>()
+      .toList();
+  if (assignedRoles.isEmpty) {
+    return null;
+  }
+  assignedRoles.sort(
+    (left, right) => _roleSortScore(
+      left,
+      roleOrder,
+    ).compareTo(_roleSortScore(right, roleOrder)),
+  );
+  return assignedRoles.first;
+}
+
+int _roleSortScore(ServerRole role, Map<String, int> roleOrder) {
+  final normalizedName = role.name.toLowerCase();
+  if (_isProtectedOwnerRole(role)) {
+    return -3000;
+  }
+  if (normalizedName == 'admin') {
+    return -2000;
+  }
+  if (normalizedName == 'member') {
+    return 9000;
+  }
+  final index = roleOrder[role.id] ?? 0;
+  return role.isSystem ? 1000 + index : index;
+}
+
+bool _isProtectedOwnerRole(ServerRole role) {
+  return role.isSystem &&
+      role.permissions.length == ServerPermission.values.length &&
+      role.permissions.containsAll(ServerPermission.values);
+}
+
+Color? _roleColorFromHex(String? colorHex) {
+  final normalized = colorHex?.trim().toUpperCase() ?? '';
+  if (!RegExp(r'^#[0-9A-F]{6}$').hasMatch(normalized)) {
+    return null;
+  }
+  return Color(int.parse('FF${normalized.substring(1)}', radix: 16));
+}
+
+Map<String, Color> _primaryRoleColorsByUserId(
+  List<ServerRole> roles,
+  List<ServerMember> members,
+) {
+  final roleOrder = _roleOrderMap(roles);
+  final roleById = {for (final role in roles) role.id: role};
+  final roleColorsByUserId = <String, Color>{};
+  for (final member in members) {
+    final primaryRole = _primaryRoleForMember(member, roleById, roleOrder);
+    final roleColor = _roleColorFromHex(primaryRole?.colorHex);
+    if (roleColor != null) {
+      roleColorsByUserId[member.userId] = roleColor;
+    }
+  }
+  return roleColorsByUserId;
 }
 
 class TextChannelView extends StatefulWidget {
@@ -5174,6 +5567,7 @@ class TextChannelView extends StatefulWidget {
     required this.currentUserId,
     required this.canSendMessages,
     required this.canManageMessages,
+    required this.senderNameColorsByUserId,
     required this.use24HourTime,
     required this.showTimestamps,
     required this.motionDuration,
@@ -5187,6 +5581,7 @@ class TextChannelView extends StatefulWidget {
   final String currentUserId;
   final bool canSendMessages;
   final bool canManageMessages;
+  final Map<String, Color> senderNameColorsByUserId;
   final bool use24HourTime;
   final bool showTimestamps;
   final Duration motionDuration;
@@ -5202,6 +5597,43 @@ class TextChannelView extends StatefulWidget {
   State<TextChannelView> createState() => _TextChannelViewState();
 }
 
+const Uuid _messageIdGenerator = Uuid();
+
+class _OptimisticMessageMergeResult<T> {
+  const _OptimisticMessageMergeResult({
+    required this.messages,
+    required this.pendingIds,
+  });
+
+  final List<T> messages;
+  final Set<String> pendingIds;
+}
+
+String _replyPreviewText(String body) {
+  final normalized = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.length <= 140) {
+    return normalized;
+  }
+  return '${normalized.substring(0, 137)}...';
+}
+
+List<MessageAttachment> _optimisticMessageAttachments(
+  String _,
+  List<OutgoingMessageAttachment> attachments,
+) {
+  return attachments
+      .map(
+        (attachment) => MessageAttachment(
+          path: '',
+          fileName: attachment.fileName,
+          sizeBytes: attachment.sizeBytes,
+          kind: attachment.kind,
+          contentType: attachment.contentType,
+        ),
+      )
+      .toList(growable: false);
+}
+
 class _TextChannelViewState extends State<TextChannelView> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
@@ -5210,7 +5642,7 @@ class _TextChannelViewState extends State<TextChannelView> {
       <OutgoingMessageAttachment>[];
   String? _lastMarkedReadMessageId;
   List<ChannelMessage> _latestMessages = const <ChannelMessage>[];
-  bool _sending = false;
+  List<ChannelMessage> _optimisticMessages = const <ChannelMessage>[];
 
   @override
   void initState() {
@@ -5227,7 +5659,7 @@ class _TextChannelViewState extends State<TextChannelView> {
   }
 
   Future<void> _send() async {
-    if (!widget.canSendMessages || _sending) {
+    if (!widget.canSendMessages) {
       return;
     }
     final text = _messageController.text;
@@ -5236,36 +5668,42 @@ class _TextChannelViewState extends State<TextChannelView> {
       return;
     }
 
+    final messageId = _messageIdGenerator.v4();
+    final replyToMessage = _replyingTo;
+    final optimisticMessage = ChannelMessage(
+      id: messageId,
+      channelId: widget.channel.id,
+      body: text.trim(),
+      senderId: widget.currentUserId,
+      senderDisplayName: widget.repository.authService.displayName,
+      senderAvatarPath: null,
+      createdAt: DateTime.now(),
+      replyToMessageId: replyToMessage?.id,
+      replyToBody: replyToMessage == null
+          ? null
+          : _replyPreviewText(replyToMessage.body),
+      replyToSenderDisplayName: replyToMessage?.senderDisplayName,
+      attachments: _optimisticMessageAttachments(messageId, attachments),
+    );
+
     setState(() {
-      _sending = true;
+      _messageController.clear();
+      _replyingTo = null;
+      _draftAttachments = <OutgoingMessageAttachment>[];
+      _optimisticMessages = <ChannelMessage>[
+        ..._optimisticMessages,
+        optimisticMessage,
+      ];
     });
-    try {
-      await widget.repository.sendChannelMessage(
-        channelId: widget.channel.id,
+
+    unawaited(
+      _commitOptimisticChannelMessage(
+        messageId: messageId,
         body: text,
-        replyToMessage: _replyingTo,
+        replyToMessage: replyToMessage,
         attachments: attachments,
-      );
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _messageController.clear();
-        _replyingTo = null;
-        _draftAttachments = <OutgoingMessageAttachment>[];
-      });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      showAppToast(context, error.toString(), tone: AppToastTone.error);
-    } finally {
-      if (mounted) {
-        setState(() {
-          _sending = false;
-        });
-      }
-    }
+      ),
+    );
   }
 
   Future<void> _toggleReaction(ChannelMessage message, String emoji) async {
@@ -5276,9 +5714,7 @@ class _TextChannelViewState extends State<TextChannelView> {
   }
 
   Future<void> _sendGif() async {
-    if (!widget.canSendMessages ||
-        !widget.repository.hasGiphyApiKey ||
-        _sending) {
+    if (!widget.canSendMessages || !widget.repository.hasGiphyApiKey) {
       return;
     }
     final gif = await showDialog<GiphyGifResult>(
@@ -5288,39 +5724,12 @@ class _TextChannelViewState extends State<TextChannelView> {
     if (gif == null) {
       return;
     }
-    setState(() {
-      _sending = true;
-    });
-    try {
-      await widget.repository.sendChannelMessage(
-        channelId: widget.channel.id,
-        body: gif.gifUrl,
-        replyToMessage: _replyingTo,
-        attachments: List<OutgoingMessageAttachment>.from(_draftAttachments),
-      );
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _replyingTo = null;
-        _draftAttachments = <OutgoingMessageAttachment>[];
-      });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      showAppToast(context, error.toString(), tone: AppToastTone.error);
-    } finally {
-      if (mounted) {
-        setState(() {
-          _sending = false;
-        });
-      }
-    }
+    _messageController.text = gif.gifUrl;
+    await _send();
   }
 
   Future<void> _pickAttachments() async {
-    if (!widget.canSendMessages || _sending) {
+    if (!widget.canSendMessages) {
       return;
     }
     final attachments = await _pickComposerAttachments(
@@ -5409,6 +5818,68 @@ class _TextChannelViewState extends State<TextChannelView> {
     });
   }
 
+  Future<void> _commitOptimisticChannelMessage({
+    required String messageId,
+    required String body,
+    required ChannelMessage? replyToMessage,
+    required List<OutgoingMessageAttachment> attachments,
+  }) async {
+    try {
+      await widget.repository.sendChannelMessage(
+        messageId: messageId,
+        channelId: widget.channel.id,
+        body: body,
+        replyToMessage: replyToMessage,
+        attachments: attachments,
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _optimisticMessages = _optimisticMessages
+            .where((message) => message.id != messageId)
+            .toList(growable: false);
+      });
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    }
+  }
+
+  _OptimisticMessageMergeResult<ChannelMessage> _mergeOptimisticMessages(
+    List<ChannelMessage> persistedMessages,
+  ) {
+    final persistedIds = persistedMessages.map((message) => message.id).toSet();
+    final pendingMessages = _optimisticMessages
+        .where((message) => !persistedIds.contains(message.id))
+        .toList(growable: false);
+    if (pendingMessages.length != _optimisticMessages.length) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _optimisticMessages = pendingMessages;
+        });
+      });
+    }
+
+    final mergedMessages =
+        <ChannelMessage>[...persistedMessages, ...pendingMessages]..sort((
+          left,
+          right,
+        ) {
+          final createdAtComparison = left.createdAt.compareTo(right.createdAt);
+          if (createdAtComparison != 0) {
+            return createdAtComparison;
+          }
+          return left.id.compareTo(right.id);
+        });
+    return _OptimisticMessageMergeResult<ChannelMessage>(
+      messages: mergedMessages,
+      pendingIds: pendingMessages.map((message) => message.id).toSet(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
@@ -5440,7 +5911,10 @@ class _TextChannelViewState extends State<TextChannelView> {
                   if (!snapshot.hasData) {
                     return const Center(child: CircularProgressIndicator());
                   }
-                  final messages = snapshot.data!;
+                  final mergedMessages = _mergeOptimisticMessages(
+                    snapshot.data!,
+                  );
+                  final messages = mergedMessages.messages;
                   _syncViewport(messages);
                   if (messages.isEmpty) {
                     return const Center(
@@ -5480,6 +5954,8 @@ class _TextChannelViewState extends State<TextChannelView> {
                             repository: widget.repository,
                             senderId: message.senderId,
                             senderDisplayName: message.senderDisplayName,
+                            senderNameColor: widget
+                                .senderNameColorsByUserId[message.senderId],
                             senderAvatarPath: message.senderAvatarPath,
                             body: message.body,
                             attachments: message.attachments,
@@ -5495,6 +5971,9 @@ class _TextChannelViewState extends State<TextChannelView> {
                             reactions: message.reactions,
                             isOwnMessage:
                                 message.senderId == widget.currentUserId,
+                            pending: mergedMessages.pendingIds.contains(
+                              message.id,
+                            ),
                             canDelete: canDelete,
                             onReply: () async {
                               setState(() {
@@ -5544,7 +6023,7 @@ class _TextChannelViewState extends State<TextChannelView> {
             Row(
               children: [
                 IconButton.filledTonal(
-                  onPressed: widget.canSendMessages && !_sending
+                  onPressed: widget.canSendMessages
                       ? () async {
                           final emoji = await _showEmojiPickerDialog(context);
                           if (emoji != null && mounted) {
@@ -5556,17 +6035,13 @@ class _TextChannelViewState extends State<TextChannelView> {
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
-                  onPressed: widget.canSendMessages && !_sending
-                      ? _pickAttachments
-                      : null,
+                  onPressed: widget.canSendMessages ? _pickAttachments : null,
                   icon: const Icon(Icons.attach_file),
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
                   onPressed:
-                      widget.canSendMessages &&
-                          widget.repository.hasGiphyApiKey &&
-                          !_sending
+                      widget.canSendMessages && widget.repository.hasGiphyApiKey
                       ? _sendGif
                       : null,
                   icon: const Icon(Icons.gif_box_outlined),
@@ -5585,7 +6060,7 @@ class _TextChannelViewState extends State<TextChannelView> {
                     },
                     child: TextField(
                       controller: _messageController,
-                      enabled: widget.canSendMessages && !_sending,
+                      enabled: widget.canSendMessages,
                       keyboardType: TextInputType.multiline,
                       textInputAction: TextInputAction.newline,
                       minLines: 1,
@@ -5600,14 +6075,8 @@ class _TextChannelViewState extends State<TextChannelView> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton.icon(
-                  onPressed: widget.canSendMessages && !_sending ? _send : null,
-                  icon: _sending
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.send),
+                  onPressed: widget.canSendMessages ? _send : null,
+                  icon: const Icon(Icons.send),
                   label: const Text('Send'),
                 ),
               ],
@@ -5659,7 +6128,7 @@ class _DirectMessageViewState extends State<DirectMessageView> {
       <OutgoingMessageAttachment>[];
   String? _lastMarkedReadMessageId;
   List<DirectMessage> _latestMessages = const <DirectMessage>[];
-  bool _sending = false;
+  List<DirectMessage> _optimisticMessages = const <DirectMessage>[];
 
   @override
   void initState() {
@@ -5676,45 +6145,48 @@ class _DirectMessageViewState extends State<DirectMessageView> {
   }
 
   Future<void> _send() async {
-    if (_sending) {
-      return;
-    }
     final text = _messageController.text;
     final attachments = List<OutgoingMessageAttachment>.from(_draftAttachments);
     if (text.trim().isEmpty && attachments.isEmpty) {
       return;
     }
 
+    final messageId = _messageIdGenerator.v4();
+    final replyToMessage = _replyingTo;
+    final optimisticMessage = DirectMessage(
+      id: messageId,
+      conversationId: widget.conversation.conversationId,
+      body: text.trim(),
+      senderId: widget.currentUserId,
+      senderDisplayName: widget.repository.authService.displayName,
+      senderAvatarPath: null,
+      createdAt: DateTime.now(),
+      replyToMessageId: replyToMessage?.id,
+      replyToBody: replyToMessage == null
+          ? null
+          : _replyPreviewText(replyToMessage.body),
+      replyToSenderDisplayName: replyToMessage?.senderDisplayName,
+      attachments: _optimisticMessageAttachments(messageId, attachments),
+    );
+
     setState(() {
-      _sending = true;
+      _messageController.clear();
+      _replyingTo = null;
+      _draftAttachments = <OutgoingMessageAttachment>[];
+      _optimisticMessages = <DirectMessage>[
+        ..._optimisticMessages,
+        optimisticMessage,
+      ];
     });
-    try {
-      await widget.repository.sendDirectMessage(
-        conversationId: widget.conversation.conversationId,
+
+    unawaited(
+      _commitOptimisticDirectMessage(
+        messageId: messageId,
         body: text,
-        replyToMessage: _replyingTo,
+        replyToMessage: replyToMessage,
         attachments: attachments,
-      );
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _messageController.clear();
-        _replyingTo = null;
-        _draftAttachments = <OutgoingMessageAttachment>[];
-      });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      showAppToast(context, error.toString(), tone: AppToastTone.error);
-    } finally {
-      if (mounted) {
-        setState(() {
-          _sending = false;
-        });
-      }
-    }
+      ),
+    );
   }
 
   void _appendEmoji(String emoji) {
@@ -5735,7 +6207,7 @@ class _DirectMessageViewState extends State<DirectMessageView> {
   }
 
   Future<void> _sendGif() async {
-    if (!widget.repository.hasGiphyApiKey || _sending) {
+    if (!widget.repository.hasGiphyApiKey) {
       return;
     }
     final gif = await showDialog<GiphyGifResult>(
@@ -5745,41 +6217,11 @@ class _DirectMessageViewState extends State<DirectMessageView> {
     if (gif == null) {
       return;
     }
-    setState(() {
-      _sending = true;
-    });
-    try {
-      await widget.repository.sendDirectMessage(
-        conversationId: widget.conversation.conversationId,
-        body: gif.gifUrl,
-        replyToMessage: _replyingTo,
-        attachments: List<OutgoingMessageAttachment>.from(_draftAttachments),
-      );
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _replyingTo = null;
-        _draftAttachments = <OutgoingMessageAttachment>[];
-      });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      showAppToast(context, error.toString(), tone: AppToastTone.error);
-    } finally {
-      if (mounted) {
-        setState(() {
-          _sending = false;
-        });
-      }
-    }
+    _messageController.text = gif.gifUrl;
+    await _send();
   }
 
   Future<void> _pickAttachments() async {
-    if (_sending) {
-      return;
-    }
     final attachments = await _pickComposerAttachments(
       context,
       existingCount: _draftAttachments.length,
@@ -5847,6 +6289,68 @@ class _DirectMessageViewState extends State<DirectMessageView> {
     });
   }
 
+  Future<void> _commitOptimisticDirectMessage({
+    required String messageId,
+    required String body,
+    required DirectMessage? replyToMessage,
+    required List<OutgoingMessageAttachment> attachments,
+  }) async {
+    try {
+      await widget.repository.sendDirectMessage(
+        messageId: messageId,
+        conversationId: widget.conversation.conversationId,
+        body: body,
+        replyToMessage: replyToMessage,
+        attachments: attachments,
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _optimisticMessages = _optimisticMessages
+            .where((message) => message.id != messageId)
+            .toList(growable: false);
+      });
+      showAppToast(context, error.toString(), tone: AppToastTone.error);
+    }
+  }
+
+  _OptimisticMessageMergeResult<DirectMessage> _mergeOptimisticMessages(
+    List<DirectMessage> persistedMessages,
+  ) {
+    final persistedIds = persistedMessages.map((message) => message.id).toSet();
+    final pendingMessages = _optimisticMessages
+        .where((message) => !persistedIds.contains(message.id))
+        .toList(growable: false);
+    if (pendingMessages.length != _optimisticMessages.length) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _optimisticMessages = pendingMessages;
+        });
+      });
+    }
+
+    final mergedMessages =
+        <DirectMessage>[...persistedMessages, ...pendingMessages]..sort((
+          left,
+          right,
+        ) {
+          final createdAtComparison = left.createdAt.compareTo(right.createdAt);
+          if (createdAtComparison != 0) {
+            return createdAtComparison;
+          }
+          return left.id.compareTo(right.id);
+        });
+    return _OptimisticMessageMergeResult<DirectMessage>(
+      messages: mergedMessages,
+      pendingIds: pendingMessages.map((message) => message.id).toSet(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
@@ -5900,7 +6404,10 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                   if (!snapshot.hasData) {
                     return const Center(child: CircularProgressIndicator());
                   }
-                  final messages = snapshot.data!;
+                  final mergedMessages = _mergeOptimisticMessages(
+                    snapshot.data!,
+                  );
+                  final messages = mergedMessages.messages;
                   _syncViewport(messages);
                   if (messages.isEmpty) {
                     return const Center(
@@ -5939,6 +6446,7 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                             repository: widget.repository,
                             senderId: message.senderId,
                             senderDisplayName: message.senderDisplayName,
+                            senderNameColor: null,
                             senderAvatarPath: message.senderAvatarPath,
                             body: message.body,
                             attachments: message.attachments,
@@ -5954,6 +6462,9 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                             reactions: message.reactions,
                             isOwnMessage:
                                 message.senderId == widget.currentUserId,
+                            pending: mergedMessages.pendingIds.contains(
+                              message.id,
+                            ),
                             canDelete: canDelete,
                             onReply: () async {
                               setState(() {
@@ -6010,26 +6521,22 @@ class _DirectMessageViewState extends State<DirectMessageView> {
             Row(
               children: [
                 IconButton.filledTonal(
-                  onPressed: _sending
-                      ? null
-                      : () async {
-                          final emoji = await _showEmojiPickerDialog(context);
-                          if (emoji != null && mounted) {
-                            _appendEmoji(emoji);
-                          }
-                        },
+                  onPressed: () async {
+                    final emoji = await _showEmojiPickerDialog(context);
+                    if (emoji != null && mounted) {
+                      _appendEmoji(emoji);
+                    }
+                  },
                   icon: const Icon(Icons.sentiment_satisfied_alt),
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
-                  onPressed: _sending ? null : _pickAttachments,
+                  onPressed: _pickAttachments,
                   icon: const Icon(Icons.attach_file),
                 ),
                 const SizedBox(width: 8),
                 IconButton.filledTonal(
-                  onPressed: widget.repository.hasGiphyApiKey && !_sending
-                      ? _sendGif
-                      : null,
+                  onPressed: widget.repository.hasGiphyApiKey ? _sendGif : null,
                   icon: const Icon(Icons.gif_box_outlined),
                 ),
                 const SizedBox(width: 12),
@@ -6046,7 +6553,7 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                     },
                     child: TextField(
                       controller: _messageController,
-                      enabled: !_sending,
+                      enabled: true,
                       keyboardType: TextInputType.multiline,
                       textInputAction: TextInputAction.newline,
                       minLines: 1,
@@ -6059,14 +6566,8 @@ class _DirectMessageViewState extends State<DirectMessageView> {
                 ),
                 const SizedBox(width: 12),
                 FilledButton.icon(
-                  onPressed: _sending ? null : _send,
-                  icon: _sending
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.send),
+                  onPressed: _send,
+                  icon: const Icon(Icons.send),
                   label: const Text('Send'),
                 ),
               ],
@@ -6083,6 +6584,7 @@ class _ChatMessageCard extends StatefulWidget {
     required this.repository,
     required this.senderId,
     required this.senderDisplayName,
+    required this.senderNameColor,
     required this.senderAvatarPath,
     required this.body,
     required this.attachments,
@@ -6096,6 +6598,7 @@ class _ChatMessageCard extends StatefulWidget {
     required this.deleted,
     required this.reactions,
     required this.isOwnMessage,
+    required this.pending,
     required this.canDelete,
     required this.onReply,
     required this.onToggleReaction,
@@ -6106,6 +6609,7 @@ class _ChatMessageCard extends StatefulWidget {
   final WorkspaceRepository repository;
   final String senderId;
   final String senderDisplayName;
+  final Color? senderNameColor;
   final String? senderAvatarPath;
   final String body;
   final List<MessageAttachment> attachments;
@@ -6119,6 +6623,7 @@ class _ChatMessageCard extends StatefulWidget {
   final bool deleted;
   final List<MessageReactionSummary> reactions;
   final bool isOwnMessage;
+  final bool pending;
   final bool canDelete;
   final Future<void> Function() onReply;
   final Future<void> Function(String emoji) onToggleReaction;
@@ -6139,6 +6644,7 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
     final gifUrl = _gifUrl(widget.body);
     final showTextBody =
         !widget.deleted && gifUrl == null && trimmedBody.isNotEmpty;
+    final actionsEnabled = !widget.pending;
     final senderAvatarUrl = widget.repository.publicProfileAvatarUrl(
       widget.senderAvatarPath,
     );
@@ -6146,9 +6652,11 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
       child: GestureDetector(
-        onSecondaryTapDown: (details) {
-          unawaited(_showMessageMenu(context, details.globalPosition));
-        },
+        onSecondaryTapDown: actionsEnabled
+            ? (details) {
+                unawaited(_showMessageMenu(context, details.globalPosition));
+              }
+            : null,
         child: Container(
           padding: EdgeInsets.fromLTRB(
             14,
@@ -6185,11 +6693,13 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                               ? Wrap(
                                   crossAxisAlignment: WrapCrossAlignment.center,
                                   spacing: 8,
+                                  runSpacing: 4,
                                   children: [
                                     Text(
                                       widget.senderDisplayName,
-                                      style: const TextStyle(
+                                      style: TextStyle(
                                         fontWeight: FontWeight.w700,
+                                        color: widget.senderNameColor,
                                       ),
                                     ),
                                     if (widget.showTimestamp)
@@ -6204,48 +6714,60 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                                           ).colorScheme.onSurfaceVariant,
                                         ),
                                       ),
+                                    if (widget.pending)
+                                      Text(
+                                        'Sending...',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .labelMedium
+                                            ?.copyWith(
+                                              color: palette.panelAccent,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                      ),
                                   ],
                                 )
                               : const SizedBox.shrink(),
                         ),
-                        AnimatedOpacity(
-                          opacity: _hovered ? 1 : 0.18,
-                          duration: const Duration(milliseconds: 140),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                onPressed: widget.onReply,
-                                icon: const Icon(Icons.reply, size: 18),
-                                visualDensity: VisualDensity.compact,
-                              ),
-                              IconButton(
-                                onPressed: () async {
-                                  final emoji = await _showEmojiPickerDialog(
-                                    context,
-                                  );
-                                  if (emoji != null) {
-                                    await widget.onToggleReaction(emoji);
-                                  }
-                                },
-                                icon: const Icon(
-                                  Icons.emoji_emotions_outlined,
-                                  size: 18,
-                                ),
-                                visualDensity: VisualDensity.compact,
-                              ),
-                              if (widget.canDelete)
+                        if (actionsEnabled)
+                          AnimatedOpacity(
+                            opacity: _hovered ? 1 : 0.18,
+                            duration: const Duration(milliseconds: 140),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
                                 IconButton(
-                                  onPressed: widget.onDelete,
+                                  onPressed: widget.onReply,
+                                  icon: const Icon(Icons.reply, size: 18),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                                IconButton(
+                                  onPressed: () async {
+                                    final emoji = await _showEmojiPickerDialog(
+                                      context,
+                                    );
+                                    if (emoji != null) {
+                                      await widget.onToggleReaction(emoji);
+                                    }
+                                  },
                                   icon: const Icon(
-                                    Icons.delete_outline,
+                                    Icons.emoji_emotions_outlined,
                                     size: 18,
                                   ),
                                   visualDensity: VisualDensity.compact,
                                 ),
-                            ],
+                                if (widget.canDelete)
+                                  IconButton(
+                                    onPressed: widget.onDelete,
+                                    icon: const Icon(
+                                      Icons.delete_outline,
+                                      size: 18,
+                                    ),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                              ],
+                            ),
                           ),
-                        ),
                       ],
                     ),
                     if (widget.showHeader) const SizedBox(height: 8),
@@ -6312,6 +6834,18 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                       _MessageAttachmentList(
                         repository: widget.repository,
                         attachments: widget.attachments,
+                        pending: widget.pending,
+                      ),
+                    ],
+                    if (widget.pending && !widget.showHeader) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'Sending...',
+                        style: Theme.of(context).textTheme.labelMedium
+                            ?.copyWith(
+                              color: palette.panelAccent,
+                              fontWeight: FontWeight.w700,
+                            ),
                       ),
                     ],
                     if (widget.reactions.isNotEmpty) ...[
@@ -6334,11 +6868,15 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
                                           ?.id ??
                                       '',
                                 ),
-                                onSelected: (_) {
-                                  unawaited(
-                                    widget.onToggleReaction(reaction.emoji),
-                                  );
-                                },
+                                onSelected: widget.pending
+                                    ? null
+                                    : (_) {
+                                        unawaited(
+                                          widget.onToggleReaction(
+                                            reaction.emoji,
+                                          ),
+                                        );
+                                      },
                               ),
                             )
                             .toList(),
@@ -6355,6 +6893,9 @@ class _ChatMessageCardState extends State<_ChatMessageCard> {
   }
 
   Future<void> _showMessageMenu(BuildContext context, Offset position) async {
+    if (widget.pending) {
+      return;
+    }
     final items = <PopupMenuEntry<String>>[
       const PopupMenuItem<String>(value: 'reply', child: Text('Reply')),
       const PopupMenuItem<String>(value: 'react', child: Text('Add reaction')),
@@ -6518,10 +7059,12 @@ class _MessageAttachmentList extends StatelessWidget {
   const _MessageAttachmentList({
     required this.repository,
     required this.attachments,
+    required this.pending,
   });
 
   final WorkspaceRepository repository;
   final List<MessageAttachment> attachments;
+  final bool pending;
 
   @override
   Widget build(BuildContext context) {
@@ -6532,6 +7075,7 @@ class _MessageAttachmentList extends StatelessWidget {
           _MessageAttachmentTile(
             repository: repository,
             attachment: attachments[index],
+            pending: pending,
           ),
           if (index != attachments.length - 1) const SizedBox(height: 10),
         ],
@@ -6544,21 +7088,20 @@ class _MessageAttachmentTile extends StatelessWidget {
   const _MessageAttachmentTile({
     required this.repository,
     required this.attachment,
+    required this.pending,
   });
 
   final WorkspaceRepository repository;
   final MessageAttachment attachment;
+  final bool pending;
 
   @override
   Widget build(BuildContext context) {
-    final attachmentUrl = repository.publicMessageAttachmentUrl(
-      attachment.path,
-    );
-    if (attachmentUrl == null) {
-      return const SizedBox.shrink();
-    }
+    final attachmentUrl = pending
+        ? null
+        : repository.publicMessageAttachmentUrl(attachment.path);
 
-    if (attachment.isImage) {
+    if (!pending && attachmentUrl != null && attachment.isImage) {
       return InkWell(
         onTap: () => _copyAttachmentLink(
           context,
@@ -6579,6 +7122,7 @@ class _MessageAttachmentTile extends StatelessWidget {
                   errorBuilder: (context, error, stackTrace) =>
                       _AttachmentFileCard(
                         attachment: attachment,
+                        pending: false,
                         onCopyLink: () => _copyAttachmentLink(
                           context,
                           fileName: attachment.fileName,
@@ -6612,11 +7156,14 @@ class _MessageAttachmentTile extends StatelessWidget {
 
     return _AttachmentFileCard(
       attachment: attachment,
-      onCopyLink: () => _copyAttachmentLink(
-        context,
-        fileName: attachment.fileName,
-        url: attachmentUrl,
-      ),
+      pending: pending,
+      onCopyLink: attachmentUrl == null
+          ? null
+          : () => _copyAttachmentLink(
+              context,
+              fileName: attachment.fileName,
+              url: attachmentUrl,
+            ),
     );
   }
 }
@@ -6624,11 +7171,13 @@ class _MessageAttachmentTile extends StatelessWidget {
 class _AttachmentFileCard extends StatelessWidget {
   const _AttachmentFileCard({
     required this.attachment,
-    required this.onCopyLink,
+    required this.pending,
+    this.onCopyLink,
   });
 
   final MessageAttachment attachment;
-  final VoidCallback onCopyLink;
+  final bool pending;
+  final VoidCallback? onCopyLink;
 
   @override
   Widget build(BuildContext context) {
@@ -6669,14 +7218,23 @@ class _AttachmentFileCard extends StatelessWidget {
                   _formatBytes(attachment.sizeBytes),
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
+                if (pending)
+                  Text(
+                    'Uploading...',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: palette.panelAccent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
               ],
             ),
           ),
-          TextButton.icon(
-            onPressed: onCopyLink,
-            icon: const Icon(Icons.link, size: 16),
-            label: const Text('Copy link'),
-          ),
+          if (onCopyLink != null)
+            TextButton.icon(
+              onPressed: onCopyLink,
+              icon: const Icon(Icons.link, size: 16),
+              label: const Text('Copy link'),
+            ),
         ],
       ),
     );
@@ -8722,11 +9280,11 @@ class _StageStreamVolumeControl extends StatelessWidget {
     return DecoratedBox(
       decoration: BoxDecoration(
         color: Colors.black.withAlpha(168),
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(18),
         border: Border.all(color: Colors.white.withAlpha(28)),
       ),
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(6, 8, 6, 10),
+        padding: const EdgeInsets.fromLTRB(4, 6, 4, 8),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -8734,31 +9292,31 @@ class _StageStreamVolumeControl extends StatelessWidget {
               onPressed: onToggleMute,
               tooltip: muted ? 'Unmute stream' : 'Mute stream',
               visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
               padding: EdgeInsets.zero,
               icon: Icon(
                 muted ? Icons.volume_off : Icons.volume_up,
-                size: 18,
+                size: 16,
                 color: Colors.white,
               ),
             ),
             SizedBox(
-              height: 124,
+              height: 96,
               child: RotatedBox(
                 quarterTurns: 3,
                 child: SliderTheme(
                   data: SliderTheme.of(context).copyWith(
-                    trackHeight: 4,
+                    trackHeight: 3,
                     thumbColor: colorScheme.secondary,
                     activeTrackColor: Colors.white,
                     inactiveTrackColor: Colors.white24,
                     overlayShape: SliderComponentShape.noOverlay,
                     thumbShape: const RoundSliderThumbShape(
-                      enabledThumbRadius: 7,
+                      enabledThumbRadius: 6,
                     ),
                   ),
                   child: SizedBox(
-                    width: 124,
+                    width: 96,
                     child: Slider(
                       value: volume.clamp(0.0, 2.0),
                       min: 0,

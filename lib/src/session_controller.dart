@@ -123,6 +123,7 @@ class VoiceRemotePeer {
 class VoiceChannelSessionController extends ChangeNotifier {
   static const String _preferredVideoCodec = 'vp9';
   static const String _fallbackVideoCodec = 'vp8';
+  static const Duration _warmedTokenMaxAge = Duration(seconds: 45);
 
   VoiceChannelSessionController({
     required this.channel,
@@ -148,9 +149,13 @@ class VoiceChannelSessionController extends ChangeNotifier {
   final Map<String, double> _screenShareVolumes = <String, double>{};
 
   RealtimeChannel? _presenceChannel;
+  Object? _presenceSubscriptionToken;
   lk.Room? _room;
   lk.EventsListener<lk.RoomEvent>? _roomListener;
   VoidCallback? _roomChangeHandler;
+  Future<String>? _liveKitTokenFuture;
+  String? _warmedLiveKitToken;
+  DateTime? _warmedLiveKitTokenAt;
 
   bool _initialized = false;
   bool _joined = false;
@@ -217,6 +222,16 @@ class VoiceChannelSessionController extends ChangeNotifier {
     await localScreenRenderer.initialize();
   }
 
+  void prewarmJoin() {
+    if (_disposed ||
+        _joined ||
+        AppBootstrap.liveKitUrl.trim().isEmpty ||
+        AppBootstrap.liveKitTokenFunctionName.trim().isEmpty) {
+      return;
+    }
+    unawaited(_resolveLiveKitToken());
+  }
+
   Future<void> join() async {
     if (_joined || _busy) {
       return;
@@ -233,9 +248,11 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
     try {
       await initialize();
-      await _subscribePresenceChannel();
+      final tokenFuture = _resolveLiveKitToken();
+      final presenceFuture = _subscribePresenceChannel();
 
-      final token = await _fetchLiveKitToken();
+      final token = await tokenFuture;
+      _clearWarmedLiveKitToken();
       final room = lk.Room(
         roomOptions: lk.RoomOptions(
           adaptiveStream: false,
@@ -256,6 +273,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
       _muted = false;
       _shareKind = ShareKind.audio;
       _status = 'Connected to voice channel.';
+      await presenceFuture;
       await _trackPresence();
       await _syncRoomState();
       await soundEffects.play(
@@ -263,6 +281,7 @@ class VoiceChannelSessionController extends ChangeNotifier {
         enabled: preferences.playSounds,
       );
     } catch (error) {
+      _clearWarmedLiveKitToken();
       await leave();
       _status = 'Unable to join voice channel: $error';
     } finally {
@@ -723,6 +742,8 @@ class VoiceChannelSessionController extends ChangeNotifier {
 
   Future<void> _subscribePresenceChannel() async {
     await _closePresenceChannel();
+    final subscriptionToken = Object();
+    _presenceSubscriptionToken = subscriptionToken;
 
     await client.realtime.setAuth(client.auth.currentSession?.accessToken);
     final completer = Completer<void>();
@@ -760,20 +781,34 @@ class VoiceChannelSessionController extends ChangeNotifier {
     });
 
     await completer.future;
+    if (_disposed ||
+        !identical(_presenceSubscriptionToken, subscriptionToken)) {
+      await _disposePresenceChannel(realtimeChannel);
+      return;
+    }
     _presenceChannel = realtimeChannel;
     _syncPresenceState(realtimeChannel);
   }
 
   Future<void> _closePresenceChannel() async {
+    _presenceSubscriptionToken = null;
     final presenceChannel = _presenceChannel;
     _presenceChannel = null;
     if (presenceChannel != null) {
-      try {
-        await presenceChannel.untrack();
-      } on Object {
-        // Best-effort cleanup. The channel may already be closing.
-      }
+      await _disposePresenceChannel(presenceChannel);
+    }
+  }
+
+  Future<void> _disposePresenceChannel(RealtimeChannel presenceChannel) async {
+    try {
+      await presenceChannel.untrack();
+    } on Object {
+      // Best-effort cleanup. The channel may already be closing.
+    }
+    try {
       await client.removeChannel(presenceChannel);
+    } on Object {
+      // Channel teardown should not leave the controller in a broken state.
     }
   }
 
@@ -859,6 +894,43 @@ class VoiceChannelSessionController extends ChangeNotifier {
       throw StateError('LiveKit token response was missing a token.');
     }
     return token;
+  }
+
+  Future<String> _resolveLiveKitToken() {
+    final cachedToken = _warmedLiveKitToken;
+    final cachedAt = _warmedLiveKitTokenAt;
+    if (cachedToken != null &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) <= _warmedTokenMaxAge) {
+      return Future<String>.value(cachedToken);
+    }
+
+    final inFlightToken = _liveKitTokenFuture;
+    if (inFlightToken != null) {
+      return inFlightToken;
+    }
+
+    late final Future<String> tokenFuture;
+    tokenFuture = _fetchLiveKitToken()
+        .then((token) {
+          if (!_disposed) {
+            _warmedLiveKitToken = token;
+            _warmedLiveKitTokenAt = DateTime.now();
+          }
+          return token;
+        })
+        .whenComplete(() {
+          if (identical(_liveKitTokenFuture, tokenFuture)) {
+            _liveKitTokenFuture = null;
+          }
+        });
+    _liveKitTokenFuture = tokenFuture;
+    return tokenFuture;
+  }
+
+  void _clearWarmedLiveKitToken() {
+    _warmedLiveKitToken = null;
+    _warmedLiveKitTokenAt = null;
   }
 
   Future<void> _attachRoom(lk.Room room) async {

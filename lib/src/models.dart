@@ -575,6 +575,7 @@ class ServerRole {
     required this.id,
     required this.serverId,
     required this.name,
+    required this.colorHex,
     required this.permissions,
     required this.isSystem,
     required this.createdAt,
@@ -583,6 +584,7 @@ class ServerRole {
   final String id;
   final String serverId;
   final String name;
+  final String? colorHex;
   final Set<ServerPermission> permissions;
   final bool isSystem;
   final DateTime createdAt;
@@ -614,6 +616,7 @@ class ServerRole {
       id: map['id'] as String,
       serverId: map['server_id'] as String,
       name: map['name'] as String,
+      colorHex: map['color_hex'] as String?,
       permissions: permissions,
       isSystem: map['is_system'] as bool? ?? false,
       createdAt: DateTime.parse(map['created_at'] as String).toLocal(),

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_preferences.dart';
 import 'app_toast.dart';
@@ -18,6 +19,8 @@ class ServerSettingsDialog extends StatefulWidget {
     required this.onCreateChannel,
     required this.onCreateCategory,
     required this.onPickServerAvatar,
+    this.onStateChanged,
+    this.onPendingJoinRequestsChanged,
   });
 
   final ServerSummary server;
@@ -27,6 +30,13 @@ class ServerSettingsDialog extends StatefulWidget {
   final Future<void> Function() onCreateChannel;
   final Future<void> Function() onCreateCategory;
   final Future<void> Function() onPickServerAvatar;
+  final void Function({
+    required ServerSummary server,
+    required List<ServerRole> roles,
+    required List<ServerMember> members,
+  })?
+  onStateChanged;
+  final ValueChanged<int>? onPendingJoinRequestsChanged;
 
   @override
   State<ServerSettingsDialog> createState() => _ServerSettingsDialogState();
@@ -38,7 +48,6 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
   bool _loadingOverrides = false;
   bool _loadingJoinRequests = false;
   bool _saving = false;
-  bool _refreshWorkspaceOnClose = false;
   String? _error;
   List<ChannelSummary> _channels = const <ChannelSummary>[];
   List<ServerRole> _roles = const <ServerRole>[];
@@ -48,6 +57,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
   List<ChannelPermissionOverride> _channelOverrides =
       const <ChannelPermissionOverride>[];
   String? _selectedOverrideChannelId;
+  RealtimeChannel? _joinRequestsChannel;
 
   bool get _canManageRoles =>
       widget.access.hasPermission(ServerPermission.manageRoles);
@@ -80,6 +90,12 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
     unawaited(_load());
   }
 
+  @override
+  void dispose() {
+    unawaited(_closeJoinRequestsChannel());
+    super.dispose();
+  }
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -105,9 +121,11 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
             : channels.first.id;
         _loading = false;
       });
+      _publishStateChange();
       await _loadChannelOverrides();
       if (_canReviewJoinRequests) {
         await _loadJoinRequests();
+        await _subscribeJoinRequestUpdates();
       }
     } catch (error) {
       if (!mounted) {
@@ -120,10 +138,12 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
     }
   }
 
-  Future<void> _loadJoinRequests() async {
-    setState(() {
-      _loadingJoinRequests = true;
-    });
+  Future<void> _loadJoinRequests({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _loadingJoinRequests = true;
+      });
+    }
     try {
       final requests = await widget.repository.fetchServerJoinRequests(
         _server.id,
@@ -135,6 +155,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         _joinRequests = requests;
         _loadingJoinRequests = false;
       });
+      _publishJoinRequestCount();
     } catch (error) {
       if (!mounted) {
         return;
@@ -143,6 +164,84 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         _error = error.toString();
         _loadingJoinRequests = false;
       });
+    }
+  }
+
+  void _publishJoinRequestCount() {
+    widget.onPendingJoinRequestsChanged?.call(_joinRequests.length);
+  }
+
+  Future<void> _closeJoinRequestsChannel() async {
+    final joinRequestsChannel = _joinRequestsChannel;
+    _joinRequestsChannel = null;
+    if (joinRequestsChannel != null) {
+      await widget.repository.client.removeChannel(joinRequestsChannel);
+    }
+  }
+
+  Future<void> _subscribeJoinRequestUpdates() async {
+    await _closeJoinRequestsChannel();
+    if (!_canReviewJoinRequests || !mounted) {
+      return;
+    }
+
+    final client = widget.repository.client;
+    final completer = Completer<void>();
+    final realtimeChannel = client
+        .channel('server-settings-join-requests:${_server.id}')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'server_join_requests',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'server_id',
+            value: _server.id,
+          ),
+          callback: (_) {
+            if (mounted) {
+              unawaited(_loadJoinRequests(showLoading: false));
+            }
+          },
+        );
+
+    realtimeChannel.subscribe((status, [error]) {
+      if (completer.isCompleted) {
+        return;
+      }
+      switch (status) {
+        case RealtimeSubscribeStatus.subscribed:
+          completer.complete();
+        case RealtimeSubscribeStatus.channelError:
+          completer.completeError(
+            StateError(
+              'Realtime join request error'
+              '${error == null ? '' : ': $error'}',
+            ),
+          );
+        case RealtimeSubscribeStatus.closed:
+          completer.completeError(
+            StateError('Realtime join request channel closed.'),
+          );
+        case RealtimeSubscribeStatus.timedOut:
+          completer.completeError(
+            StateError('Realtime join request channel timed out.'),
+          );
+      }
+    });
+
+    try {
+      await completer.future;
+      if (!mounted) {
+        await client.removeChannel(realtimeChannel);
+        return;
+      }
+      _joinRequestsChannel = realtimeChannel;
+    } catch (error) {
+      await client.removeChannel(realtimeChannel);
+      debugPrint(
+        'Join request dialog subscription failed for ${_server.id}: $error',
+      );
     }
   }
 
@@ -204,17 +303,20 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       _saving = true;
     });
     try {
-      await widget.repository.createRole(
+      final createdRole = await widget.repository.createRole(
         serverId: widget.server.id,
         name: result.name,
+        colorHex: result.colorHex,
         permissions: result.permissions,
       );
-      _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
       }
+      setState(() {
+        _roles = <ServerRole>[..._roles, createdRole];
+      });
+      _publishStateChange();
       showAppToast(context, 'Role created.', tone: AppToastTone.success);
-      await _load();
     } catch (error) {
       if (!mounted) {
         return;
@@ -233,7 +335,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
     if (!_canManageRoles) {
       return false;
     }
-    return widget.access.isOwner || role.name != 'Owner';
+    return widget.access.isOwner || !_isProtectedOwnerRole(role);
   }
 
   Future<void> _editRole(ServerRole role) async {
@@ -247,8 +349,8 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         title: 'Edit role',
         submitLabel: 'Save changes',
         initialName: role.name,
+        initialColorHex: role.colorHex,
         initialPermissions: role.permissions,
-        lockName: role.name == 'Owner',
       ),
     );
     if (result == null) {
@@ -259,17 +361,17 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       _saving = true;
     });
     try {
-      await widget.repository.updateRole(
+      final updatedRole = await widget.repository.updateRole(
         roleId: role.id,
         name: result.name,
+        colorHex: result.colorHex,
         permissions: result.permissions,
       );
-      _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
       }
+      _replaceRole(updatedRole);
       showAppToast(context, 'Role updated.', tone: AppToastTone.success);
-      await _load();
     } catch (error) {
       if (!mounted) {
         return;
@@ -301,9 +403,79 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       return;
     }
 
-    final roleIdsToAdd = nextSelection.difference(member.roleIds);
-    final roleIdsToRemove = member.roleIds.difference(nextSelection);
-    if (roleIdsToAdd.isEmpty && roleIdsToRemove.isEmpty) {
+    await _saveMemberRoleSelections(
+      selectionsByUserId: <String, Set<String>>{member.userId: nextSelection},
+      successMessage: 'Updated roles for ${member.displayName}.',
+    );
+  }
+
+  Future<void> _editSelectedMemberRoles(List<ServerMember> members) async {
+    if (!_canManageRoles || members.isEmpty) {
+      return;
+    }
+    if (members.length == 1) {
+      await _editMemberRoles(members.single);
+      return;
+    }
+
+    final result = await showDialog<_BulkMemberRoleEditorResult>(
+      context: context,
+      builder: (context) => _BulkMemberRoleDialog(
+        members: members,
+        roles: _roles,
+        serverOwnerId: widget.server.ownerId,
+      ),
+    );
+    if (result == null) {
+      return;
+    }
+
+    final selectionsByUserId = <String, Set<String>>{};
+    for (final member in members) {
+      final nextRoleIds = member.roleIds.toSet()
+        ..addAll(result.roleIdsToAdd)
+        ..removeAll(result.roleIdsToRemove);
+      selectionsByUserId[member.userId] = nextRoleIds;
+    }
+
+    await _saveMemberRoleSelections(
+      selectionsByUserId: selectionsByUserId,
+      successMessage: 'Updated roles for ${members.length} members.',
+    );
+  }
+
+  Future<void> _saveMemberRoleSelections({
+    required Map<String, Set<String>> selectionsByUserId,
+    required String successMessage,
+  }) async {
+    final membersByUserId = {
+      for (final member in _members) member.userId: member,
+    };
+    final operations =
+        <
+          ({
+            String userId,
+            Set<String> roleIdsToAdd,
+            Set<String> roleIdsToRemove,
+          })
+        >[];
+    for (final entry in selectionsByUserId.entries) {
+      final member = membersByUserId[entry.key];
+      if (member == null) {
+        continue;
+      }
+      final roleIdsToAdd = entry.value.difference(member.roleIds);
+      final roleIdsToRemove = member.roleIds.difference(entry.value);
+      if (roleIdsToAdd.isEmpty && roleIdsToRemove.isEmpty) {
+        continue;
+      }
+      operations.add((
+        userId: entry.key,
+        roleIdsToAdd: roleIdsToAdd,
+        roleIdsToRemove: roleIdsToRemove,
+      ));
+    }
+    if (operations.isEmpty) {
       return;
     }
 
@@ -311,30 +483,27 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       _saving = true;
     });
     try {
-      for (final roleId in roleIdsToAdd) {
-        await widget.repository.assignRole(
-          serverId: widget.server.id,
-          userId: member.userId,
-          roleId: roleId,
-        );
+      for (final operation in operations) {
+        for (final roleId in operation.roleIdsToAdd) {
+          await widget.repository.assignRole(
+            serverId: widget.server.id,
+            userId: operation.userId,
+            roleId: roleId,
+          );
+        }
+        for (final roleId in operation.roleIdsToRemove) {
+          await widget.repository.removeRole(
+            serverId: widget.server.id,
+            userId: operation.userId,
+            roleId: roleId,
+          );
+        }
       }
-      for (final roleId in roleIdsToRemove) {
-        await widget.repository.removeRole(
-          serverId: widget.server.id,
-          userId: member.userId,
-          roleId: roleId,
-        );
-      }
-      _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
       }
-      showAppToast(
-        context,
-        'Member roles updated.',
-        tone: AppToastTone.success,
-      );
-      await _load();
+      _applyMemberRoleSelectionsLocally(selectionsByUserId);
+      showAppToast(context, successMessage, tone: AppToastTone.success);
     } catch (error) {
       if (!mounted) {
         return;
@@ -392,16 +561,20 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         allowPermissions: result.allowPermissions,
         denyPermissions: result.denyPermissions,
       );
-      _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
       }
+      _applyChannelOverrideLocally(
+        channelId: selectedChannel.id,
+        roleId: role.id,
+        allowPermissions: result.allowPermissions,
+        denyPermissions: result.denyPermissions,
+      );
       showAppToast(
         context,
         'Updated access for ${role.name}.',
         tone: AppToastTone.success,
       );
-      await _loadChannelOverrides();
     } catch (error) {
       if (!mounted) {
         return;
@@ -424,6 +597,80 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
     await _load();
   }
 
+  void _replaceRole(ServerRole updatedRole) {
+    setState(() {
+      final nextRoles = List<ServerRole>.from(_roles);
+      final existingIndex = nextRoles.indexWhere(
+        (role) => role.id == updatedRole.id,
+      );
+      if (existingIndex == -1) {
+        nextRoles.add(updatedRole);
+      } else {
+        nextRoles[existingIndex] = updatedRole;
+      }
+      _roles = nextRoles;
+    });
+    _publishStateChange();
+  }
+
+  void _applyMemberRoleSelectionsLocally(
+    Map<String, Set<String>> selectionsByUserId,
+  ) {
+    setState(() {
+      _members = _members
+          .map((member) {
+            final nextRoleIds = selectionsByUserId[member.userId];
+            if (nextRoleIds == null) {
+              return member;
+            }
+            return ServerMember(
+              userId: member.userId,
+              displayName: member.displayName,
+              avatarPath: member.avatarPath,
+              joinedAt: member.joinedAt,
+              roleIds: nextRoleIds,
+            );
+          })
+          .toList(growable: false);
+    });
+    _publishStateChange();
+  }
+
+  void _applyChannelOverrideLocally({
+    required String channelId,
+    required String roleId,
+    required Set<ServerPermission> allowPermissions,
+    required Set<ServerPermission> denyPermissions,
+  }) {
+    if (_selectedOverrideChannelId != channelId) {
+      return;
+    }
+    setState(() {
+      final nextOverrides = _channelOverrides
+          .where((overrideEntry) => overrideEntry.roleId != roleId)
+          .toList(growable: true);
+      if (allowPermissions.isNotEmpty || denyPermissions.isNotEmpty) {
+        nextOverrides.add(
+          ChannelPermissionOverride(
+            channelId: channelId,
+            roleId: roleId,
+            allowPermissions: allowPermissions,
+            denyPermissions: denyPermissions,
+          ),
+        );
+      }
+      _channelOverrides = nextOverrides;
+    });
+  }
+
+  void _publishStateChange() {
+    widget.onStateChanged?.call(
+      server: _server,
+      roles: List<ServerRole>.unmodifiable(_roles),
+      members: List<ServerMember>.unmodifiable(_members),
+    );
+  }
+
   Future<void> _updateDiscoverySettings({
     required bool isPublic,
     required String description,
@@ -438,13 +685,13 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
             isPublic: isPublic,
             description: description,
           );
-      _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
       }
       setState(() {
         _server = updatedServer;
       });
+      _publishStateChange();
       showAppToast(
         context,
         'Server visibility updated.',
@@ -476,10 +723,15 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         requestId: request.id,
         approve: approve,
       );
-      _refreshWorkspaceOnClose = true;
       if (!mounted) {
         return;
       }
+      setState(() {
+        _joinRequests = _joinRequests
+            .where((entry) => entry.id != request.id)
+            .toList(growable: false);
+      });
+      _publishJoinRequestCount();
       showAppToast(
         context,
         approve
@@ -487,7 +739,6 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
             : 'Declined ${request.displayName}.',
         tone: AppToastTone.success,
       );
-      await _loadJoinRequests();
     } catch (error) {
       if (!mounted) {
         return;
@@ -543,8 +794,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                     ),
                   ),
                   IconButton(
-                    onPressed: () =>
-                        Navigator.of(context).pop(_refreshWorkspaceOnClose),
+                    onPressed: () => Navigator.of(context).pop(false),
                     icon: const Icon(Icons.close),
                   ),
                 ],
@@ -569,7 +819,12 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                 const Tab(text: 'Members'),
                                 const Tab(text: 'Channel Access'),
                                 if (_canReviewJoinRequests)
-                                  const Tab(text: 'Join Requests'),
+                                  Tab(
+                                    child: _SettingsTabLabel(
+                                      text: 'Join Requests',
+                                      badgeCount: _joinRequests.length,
+                                    ),
+                                  ),
                               ],
                             ),
                             const SizedBox(height: 18),
@@ -598,6 +853,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                   ),
                                   _RolesTab(
                                     roles: _roles,
+                                    members: _members,
                                     canManageRoles: _canManageRoles,
                                     canEditRole: _canEditRole,
                                     onCreateRole: _createRole,
@@ -609,6 +865,8 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                     members: _members,
                                     canManageRoles: _canManageRoles,
                                     onEditMemberRoles: _editMemberRoles,
+                                    onEditSelectedMembers:
+                                        _editSelectedMemberRoles,
                                   ),
                                   _ChannelAccessTab(
                                     channels: _channels,
@@ -655,6 +913,40 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
   }
 }
 
+class _SettingsTabLabel extends StatelessWidget {
+  const _SettingsTabLabel({required this.text, required this.badgeCount});
+
+  final String text;
+  final int badgeCount;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(text),
+        if (badgeCount > 0) ...[
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.primary,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              badgeCount > 99 ? '99+' : '$badgeCount',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onPrimary,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
 class _GeneralTab extends StatelessWidget {
   const _GeneralTab({
     required this.server,
@@ -687,126 +979,309 @@ class _GeneralTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final theme = Theme.of(context);
+    final mutedStyle = theme.textTheme.bodySmall?.copyWith(
+      color: theme.colorScheme.onSurface.withAlpha(140),
+    );
 
     return ListView(
+      padding: const EdgeInsets.only(bottom: 24),
       children: [
-        Text(
-          'Manage the core server setup here. As more server options are added, they will live in this settings surface instead of the channel sidebar.',
-          style: Theme.of(context).textTheme.bodyLarge,
+        // ── Identity ──────────────────────────────────────────────────
+        _GeneralSection(
+          title: 'Server Identity',
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // Avatar
+                  Stack(
+                    children: [
+                      Container(
+                        width: 72,
+                        height: 72,
+                        decoration: BoxDecoration(
+                          color: palette.panelAccent,
+                          borderRadius: BorderRadius.circular(18),
+                          border: Border.all(color: palette.border),
+                        ),
+                        child: Center(
+                          child: Text(
+                            server.name.isNotEmpty
+                                ? server.name[0].toUpperCase()
+                                : '?',
+                            style: theme.textTheme.headlineMedium?.copyWith(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (canEditServerPicture)
+                        Positioned(
+                          right: 0,
+                          bottom: 0,
+                          child: GestureDetector(
+                            onTap: onPickServerAvatar,
+                            child: Container(
+                              width: 24,
+                              height: 24,
+                              decoration: BoxDecoration(
+                                color: theme.colorScheme.primary,
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: palette.panelStrong,
+                                  width: 2,
+                                ),
+                              ),
+                              child: Icon(
+                                Icons.edit,
+                                size: 13,
+                                color: theme.colorScheme.onPrimary,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          server.name,
+                          style: theme.textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Created ${_formatServerDate(server.createdAt)}',
+                          style: mutedStyle,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'ID: ${server.id}',
+                          style: mutedStyle?.copyWith(
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Tooltip(
+                    message: 'Copy server ID',
+                    child: IconButton(
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: server.id));
+                        if (!context.mounted) return;
+                        showAppToast(
+                          context,
+                          'Server ID copied.',
+                          tone: AppToastTone.success,
+                        );
+                      },
+                      icon: const Icon(Icons.badge_outlined, size: 18),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
-        const SizedBox(height: 18),
-        Container(
-          padding: const EdgeInsets.all(18),
-          decoration: BoxDecoration(
-            color: palette.panelStrong,
-            borderRadius: BorderRadius.circular(22),
-            border: Border.all(color: palette.border),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+
+        const SizedBox(height: 16),
+
+        // ── Access ────────────────────────────────────────────────────
+        _GeneralSection(
+          title: 'Access',
+          children: [
+            _GeneralRow(
+              icon: Icons.link,
+              label: 'Invite Code',
+              value: server.inviteCode,
+              trailing: Tooltip(
+                message: 'Copy invite link',
+                child: IconButton(
+                  onPressed: onCopyInvite,
+                  icon: const Icon(Icons.content_copy, size: 18),
+                ),
+              ),
+            ),
+            Divider(height: 1, color: palette.border),
+            _GeneralRow(
+              icon: server.isPublic
+                  ? Icons.public
+                  : Icons.lock_outline,
+              label: 'Visibility',
+              value: server.isPublic ? 'Public' : 'Private',
+              trailing: canManageServer
+                  ? TextButton(
+                      onPressed: () async {
+                        final result =
+                            await showDialog<_ServerDiscoverySettingsResult>(
+                              context: context,
+                              builder: (context) =>
+                                  _ServerDiscoverySettingsDialog(
+                                    initialIsPublic: server.isPublic,
+                                    initialDescription: server.description,
+                                  ),
+                            );
+                        if (result == null) return;
+                        await onUpdateDiscoverySettings(
+                          isPublic: result.isPublic,
+                          description: result.description,
+                        );
+                      },
+                      child: const Text('Edit'),
+                    )
+                  : null,
+            ),
+            if (server.description.trim().isNotEmpty) ...[
+              Divider(height: 1, color: palette.border),
+              _GeneralRow(
+                icon: Icons.info_outline,
+                label: 'Description',
+                value: server.description.trim(),
+              ),
+            ],
+          ],
+        ),
+
+        // ── Channel management ────────────────────────────────────────
+        if (canManageChannels) ...[
+          const SizedBox(height: 16),
+          _GeneralSection(
+            title: 'Channels',
             children: [
-              Text(
-                'Server info',
-                style: Theme.of(
-                  context,
-                ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+              _GeneralRow(
+                icon: Icons.add_comment_outlined,
+                label: 'Create channel',
+                value: 'Add a new text or voice channel',
+                onTap: onCreateChannel,
               ),
-              const SizedBox(height: 10),
-              Text('Name: ${server.name}'),
-              const SizedBox(height: 6),
-              Text('Visibility: ${server.isPublic ? 'Public' : 'Private'}'),
-              const SizedBox(height: 6),
-              OutlinedButton.icon(
-                onPressed: onCopyInvite,
-                icon: const Icon(Icons.content_copy, size: 18),
-                label: Text('Invite code: ${server.inviteCode}'),
-              ),
-              if (server.description.trim().isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text('Description: ${server.description}'),
-              ],
-              const SizedBox(height: 6),
-              Text('Created: ${_formatServerDate(server.createdAt)}'),
-              const SizedBox(height: 6),
-              OutlinedButton.icon(
-                onPressed: () async {
-                  await Clipboard.setData(ClipboardData(text: server.id));
-                  if (!context.mounted) {
-                    return;
-                  }
-                  showAppToast(
-                    context,
-                    'Server ID copied to clipboard.',
-                    tone: AppToastTone.success,
-                  );
-                },
-                icon: const Icon(Icons.badge_outlined, size: 18),
-                label: const Text('Copy server ID'),
+              Divider(height: 1, color: palette.border),
+              _GeneralRow(
+                icon: Icons.create_new_folder_outlined,
+                label: 'Create category',
+                value: 'Group channels under a category',
+                onTap: onCreateCategory,
               ),
             ],
           ),
+        ],
+      ],
+    );
+  }
+}
+
+class _GeneralSection extends StatelessWidget {
+  const _GeneralSection({required this.title, required this.children});
+
+  final String title;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 8),
+          child: Text(
+            title.toUpperCase(),
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurface.withAlpha(160),
+              letterSpacing: 1.2,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ),
-        const SizedBox(height: 18),
-        Wrap(
-          spacing: 12,
-          runSpacing: 12,
-          children: [
-            if (canInviteMembers)
-              FilledButton.tonalIcon(
-                onPressed: onCopyInvite,
-                icon: const Icon(Icons.link),
-                label: const Text('Copy invite'),
-              ),
-            if (canManageServer)
-              FilledButton.tonalIcon(
-                onPressed: () async {
-                  final result =
-                      await showDialog<_ServerDiscoverySettingsResult>(
-                        context: context,
-                        builder: (context) => _ServerDiscoverySettingsDialog(
-                          initialIsPublic: server.isPublic,
-                          initialDescription: server.description,
-                        ),
-                      );
-                  if (result == null) {
-                    return;
-                  }
-                  await onUpdateDiscoverySettings(
-                    isPublic: result.isPublic,
-                    description: result.description,
-                  );
-                },
-                icon: const Icon(Icons.public_outlined),
-                label: const Text('Edit visibility'),
-              ),
-            if (canManageChannels)
-              FilledButton.tonalIcon(
-                onPressed: onCreateChannel,
-                icon: const Icon(Icons.add_comment_outlined),
-                label: const Text('Create channel'),
-              ),
-            if (canManageChannels)
-              FilledButton.tonalIcon(
-                onPressed: onCreateCategory,
-                icon: const Icon(Icons.create_new_folder_outlined),
-                label: const Text('Create category'),
-              ),
-            if (canEditServerPicture)
-              FilledButton.tonalIcon(
-                onPressed: onPickServerAvatar,
-                icon: const Icon(Icons.image_outlined),
-                label: const Text('Change server picture'),
-              ),
-          ],
+        Container(
+          decoration: BoxDecoration(
+            color: palette.panelStrong,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: palette.border),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: children,
+          ),
         ),
       ],
     );
   }
 }
 
+class _GeneralRow extends StatelessWidget {
+  const _GeneralRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+    this.trailing,
+    this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+  final Widget? trailing;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final mutedColor = theme.colorScheme.onSurface.withAlpha(140);
+    final row = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: mutedColor),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  value,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: mutedColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (trailing case final t?) t,
+          if (onTap != null && trailing == null)
+            Icon(Icons.chevron_right, size: 18, color: mutedColor),
+        ],
+      ),
+    );
+
+    if (onTap != null) {
+      return InkWell(onTap: onTap, child: row);
+    }
+    return row;
+  }
+}
+
 class _RolesTab extends StatelessWidget {
   const _RolesTab({
     required this.roles,
+    required this.members,
     required this.canManageRoles,
     required this.canEditRole,
     required this.onCreateRole,
@@ -814,6 +1289,7 @@ class _RolesTab extends StatelessWidget {
   });
 
   final List<ServerRole> roles;
+  final List<ServerMember> members;
   final bool canManageRoles;
   final bool Function(ServerRole role) canEditRole;
   final Future<void> Function() onCreateRole;
@@ -822,13 +1298,23 @@ class _RolesTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final memberCountByRoleId = <String, int>{};
+    for (final member in members) {
+      for (final roleId in member.roleIds) {
+        memberCountByRoleId.update(
+          roleId,
+          (count) => count + 1,
+          ifAbsent: () => 1,
+        );
+      }
+    }
     return Column(
       children: [
         Row(
           children: [
             const Expanded(
               child: Text(
-                'Manage server roles and the permissions bundled into each one.',
+                'Manage each role here, including its name, color, and bundled permissions.',
               ),
             ),
             if (canManageRoles)
@@ -846,6 +1332,7 @@ class _RolesTab extends StatelessWidget {
             separatorBuilder: (context, index) => const SizedBox(height: 12),
             itemBuilder: (context, index) {
               final role = roles[index];
+              final roleColor = _tryParseRoleColor(role.colorHex);
               return Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
@@ -864,11 +1351,13 @@ class _RolesTab extends StatelessWidget {
                             runSpacing: 8,
                             crossAxisAlignment: WrapCrossAlignment.center,
                             children: [
+                              _RoleColorDot(color: roleColor),
                               Text(
                                 role.name,
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 18,
                                   fontWeight: FontWeight.w700,
+                                  color: roleColor,
                                 ),
                               ),
                               if (role.isSystem)
@@ -883,6 +1372,11 @@ class _RolesTab extends StatelessWidget {
                             label: const Text('Edit'),
                           ),
                       ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '${memberCountByRoleId[role.id] ?? 0} members • ${role.permissions.length} permissions',
+                      style: Theme.of(context).textTheme.bodySmall,
                     ),
                     const SizedBox(height: 10),
                     Wrap(
@@ -1076,13 +1570,14 @@ class _ServerDiscoverySettingsDialogState
   }
 }
 
-class _MembersTab extends StatelessWidget {
+class _MembersTab extends StatefulWidget {
   const _MembersTab({
     required this.server,
     required this.roles,
     required this.members,
     required this.canManageRoles,
     required this.onEditMemberRoles,
+    required this.onEditSelectedMembers,
   });
 
   final ServerSummary server;
@@ -1090,81 +1585,317 @@ class _MembersTab extends StatelessWidget {
   final List<ServerMember> members;
   final bool canManageRoles;
   final Future<void> Function(ServerMember member) onEditMemberRoles;
+  final Future<void> Function(List<ServerMember> members) onEditSelectedMembers;
+
+  @override
+  State<_MembersTab> createState() => _MembersTabState();
+}
+
+class _MembersTabState extends State<_MembersTab> {
+  final TextEditingController _searchController = TextEditingController();
+  final Set<String> _selectedUserIds = <String>{};
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _MembersTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final memberIds = widget.members.map((member) => member.userId).toSet();
+    _selectedUserIds.removeWhere((userId) => !memberIds.contains(userId));
+  }
 
   @override
   Widget build(BuildContext context) {
-    final roleById = {for (final role in roles) role.id: role};
+    final roleById = {for (final role in widget.roles) role.id: role};
+    final roleOrder = _roleOrderMap(widget.roles);
     final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final query = _searchController.text.trim().toLowerCase();
+    final visibleMembers = widget.members.where((member) {
+      if (query.isEmpty) {
+        return true;
+      }
+      if (member.displayName.toLowerCase().contains(query)) {
+        return true;
+      }
+      final memberRoles = member.roleIds
+          .map((roleId) => roleById[roleId])
+          .whereType<ServerRole>();
+      return memberRoles.any((role) => role.name.toLowerCase().contains(query));
+    }).toList();
+    final selectedMembers = widget.members
+        .where((member) => _selectedUserIds.contains(member.userId))
+        .toList(growable: false);
+    final allVisibleSelected =
+        visibleMembers.isNotEmpty &&
+        visibleMembers.every(
+          (member) => _selectedUserIds.contains(member.userId),
+        );
 
-    return ListView.separated(
-      itemCount: members.length,
-      separatorBuilder: (context, index) => const SizedBox(height: 12),
-      itemBuilder: (context, index) {
-        final member = members[index];
-        final memberRoles = member.roleIds
-            .map((roleId) => roleById[roleId])
-            .whereType<ServerRole>()
-            .toList();
-
-        return Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: palette.panelStrong,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: palette.border),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          member.displayName,
-                          style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Joined ${_formatServerDate(member.joinedAt)}',
-                          style: TextStyle(
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (canManageRoles)
-                    OutlinedButton.icon(
-                      onPressed: () => onEditMemberRoles(member),
-                      icon: const Icon(Icons.manage_accounts),
-                      label: const Text('Roles'),
-                    ),
-                ],
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Assign roles to one person or select several members and update them together.',
+          style: Theme.of(context).textTheme.bodyLarge,
+        ),
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _searchController,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search),
+                  hintText: 'Search members or roles',
+                ),
               ),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  if (member.userId == server.ownerId)
-                    const Chip(label: Text('Owner')),
-                  ...memberRoles.map((role) => Chip(label: Text(role.name))),
-                  if (memberRoles.isEmpty && member.userId != server.ownerId)
-                    const Chip(label: Text('No roles')),
-                ],
+            ),
+            if (widget.canManageRoles) ...[
+              const SizedBox(width: 12),
+              OutlinedButton.icon(
+                onPressed: visibleMembers.isEmpty
+                    ? null
+                    : () {
+                        setState(() {
+                          if (allVisibleSelected) {
+                            _selectedUserIds.removeAll(
+                              visibleMembers.map((member) => member.userId),
+                            );
+                          } else {
+                            _selectedUserIds.addAll(
+                              visibleMembers.map((member) => member.userId),
+                            );
+                          }
+                        });
+                      },
+                icon: Icon(
+                  allVisibleSelected
+                      ? Icons.deselect_outlined
+                      : Icons.select_all_outlined,
+                ),
+                label: Text(
+                  allVisibleSelected ? 'Clear visible' : 'Select visible',
+                ),
               ),
             ],
+          ],
+        ),
+        if (widget.canManageRoles) ...[
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: palette.panelStrong,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: palette.border),
+            ),
+            child: Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                Text(
+                  selectedMembers.isEmpty
+                      ? 'No members selected'
+                      : '${selectedMembers.length} members selected',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                FilledButton.icon(
+                  onPressed: selectedMembers.isEmpty
+                      ? null
+                      : () => widget.onEditSelectedMembers(selectedMembers),
+                  icon: const Icon(Icons.groups_2_outlined),
+                  label: Text(
+                    selectedMembers.length <= 1
+                        ? 'Edit selected member'
+                        : 'Edit selected members',
+                  ),
+                ),
+                if (selectedMembers.isNotEmpty)
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _selectedUserIds.clear();
+                      });
+                    },
+                    child: const Text('Clear selection'),
+                  ),
+              ],
+            ),
           ),
-        );
-      },
+        ],
+        const SizedBox(height: 16),
+        Expanded(
+          child: visibleMembers.isEmpty
+              ? const Center(child: Text('No members match that search.'))
+              : ListView.separated(
+                  itemCount: visibleMembers.length,
+                  separatorBuilder: (context, index) =>
+                      const SizedBox(height: 12),
+                  itemBuilder: (context, index) {
+                    final member = visibleMembers[index];
+                    final memberRoles = member.roleIds
+                        .map((roleId) => roleById[roleId])
+                        .whereType<ServerRole>()
+                        .toList();
+                    final primaryRole = _primaryRoleForMember(
+                      member,
+                      roleById,
+                      roleOrder,
+                    );
+                    final primaryRoleColor = _tryParseRoleColor(
+                      primaryRole?.colorHex,
+                    );
+                    final selected = _selectedUserIds.contains(member.userId);
+
+                    return InkWell(
+                      onTap: widget.canManageRoles
+                          ? () {
+                              setState(() {
+                                if (selected) {
+                                  _selectedUserIds.remove(member.userId);
+                                } else {
+                                  _selectedUserIds.add(member.userId);
+                                }
+                              });
+                            }
+                          : null,
+                      borderRadius: BorderRadius.circular(20),
+                      child: Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? palette.panelAccent
+                              : palette.panelStrong,
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: selected
+                                ? Theme.of(context).colorScheme.primary
+                                : palette.border,
+                          ),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (widget.canManageRoles) ...[
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                  right: 8,
+                                  top: 2,
+                                ),
+                                child: Checkbox(
+                                  value: selected,
+                                  onChanged: (value) {
+                                    setState(() {
+                                      if (value ?? false) {
+                                        _selectedUserIds.add(member.userId);
+                                      } else {
+                                        _selectedUserIds.remove(member.userId);
+                                      }
+                                    });
+                                  },
+                                ),
+                              ),
+                            ],
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                _RoleColorDot(
+                                                  color: primaryRoleColor,
+                                                ),
+                                                const SizedBox(width: 8),
+                                                Expanded(
+                                                  child: Text(
+                                                    member.displayName,
+                                                    style: TextStyle(
+                                                      fontSize: 18,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                      color: primaryRoleColor,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                            const SizedBox(height: 4),
+                                            Text(
+                                              'Joined ${_formatServerDate(member.joinedAt)}',
+                                              style: TextStyle(
+                                                color: Theme.of(
+                                                  context,
+                                                ).colorScheme.onSurfaceVariant,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      if (widget.canManageRoles)
+                                        OutlinedButton.icon(
+                                          onPressed: () =>
+                                              widget.onEditMemberRoles(member),
+                                          icon: const Icon(
+                                            Icons.manage_accounts,
+                                          ),
+                                          label: const Text('Edit roles'),
+                                        ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: [
+                                      if (member.userId ==
+                                          widget.server.ownerId)
+                                        const Chip(label: Text('Owner')),
+                                      ...memberRoles.map(
+                                        (role) => Chip(
+                                          avatar: _RoleColorDot(
+                                            color: _tryParseRoleColor(
+                                              role.colorHex,
+                                            ),
+                                            size: 12,
+                                          ),
+                                          label: Text(role.name),
+                                        ),
+                                      ),
+                                      if (memberRoles.isEmpty &&
+                                          member.userId !=
+                                              widget.server.ownerId)
+                                        const Chip(label: Text('No roles')),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 }
@@ -1353,15 +2084,15 @@ class _RoleEditorDialog extends StatefulWidget {
     required this.title,
     required this.submitLabel,
     this.initialName = '',
+    this.initialColorHex,
     this.initialPermissions = const <ServerPermission>{},
-    this.lockName = false,
   });
 
   final String title;
   final String submitLabel;
   final String initialName;
+  final String? initialColorHex;
   final Set<ServerPermission> initialPermissions;
-  final bool lockName;
 
   @override
   State<_RoleEditorDialog> createState() => _RoleEditorDialogState();
@@ -1371,47 +2102,234 @@ class _RoleEditorDialogState extends State<_RoleEditorDialog> {
   late final TextEditingController _nameController = TextEditingController(
     text: widget.initialName,
   );
+  late final TextEditingController _colorController = TextEditingController(
+    text: widget.initialColorHex ?? '',
+  );
   late final Set<ServerPermission> _selectedPermissions = widget
       .initialPermissions
       .toSet();
+  String? _colorError;
 
   @override
   void dispose() {
     _nameController.dispose();
+    _colorController.dispose();
     super.dispose();
+  }
+
+  void _submit() {
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      return;
+    }
+    final rawColor = _colorController.text.trim();
+    final normalizedColor = _normalizeRoleColorHexInput(rawColor);
+    if (rawColor.isNotEmpty && normalizedColor == null) {
+      setState(() {
+        _colorError = 'Use the format #RRGGBB.';
+      });
+      return;
+    }
+    Navigator.of(context).pop(
+      _RoleEditorResult(
+        name: name,
+        colorHex: normalizedColor,
+        permissions: _selectedPermissions,
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    final previewColor = _tryParseRoleColor(
+      _normalizeRoleColorHexInput(_colorController.text.trim()),
+    );
     return AlertDialog(
       title: Text(widget.title),
       content: SizedBox(
-        width: 480,
+        width: 620,
         child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               TextField(
                 controller: _nameController,
-                enabled: !widget.lockName,
                 autofocus: true,
                 decoration: const InputDecoration(labelText: 'Role name'),
               ),
-              const SizedBox(height: 18),
-              ...ServerPermission.values.map((permission) {
-                return CheckboxListTile(
-                  value: _selectedPermissions.contains(permission),
-                  title: Text(permission.label),
-                  contentPadding: EdgeInsets.zero,
-                  onChanged: (value) {
-                    setState(() {
-                      if (value ?? false) {
-                        _selectedPermissions.add(permission);
-                      } else {
-                        _selectedPermissions.remove(permission);
-                      }
-                    });
-                  },
+              const SizedBox(height: 16),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _colorController,
+                      textCapitalization: TextCapitalization.characters,
+                      onChanged: (_) {
+                        setState(() {
+                          _colorError = null;
+                        });
+                      },
+                      decoration: InputDecoration(
+                        labelText: 'Role color',
+                        hintText: '#72E0C1',
+                        helperText:
+                            'This color is used for member names and chat author names.',
+                        errorText: _colorError,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      color: previewColor ?? palette.panel,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: previewColor == null
+                            ? palette.border
+                            : Colors.white.withAlpha(120),
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    OutlinedButton(
+                      onPressed: () {
+                        setState(() {
+                          _colorController.clear();
+                          _colorError = null;
+                        });
+                      },
+                      child: const Text('Default'),
+                    ),
+                    ..._roleColorPresets.map((colorHex) {
+                      final swatchColor = _tryParseRoleColor(colorHex)!;
+                      final selected =
+                          _normalizeRoleColorHexInput(_colorController.text) ==
+                          colorHex;
+                      return InkWell(
+                        onTap: () {
+                          setState(() {
+                            _colorController.text = colorHex;
+                            _colorError = null;
+                          });
+                        },
+                        borderRadius: BorderRadius.circular(999),
+                        child: Container(
+                          width: 30,
+                          height: 30,
+                          decoration: BoxDecoration(
+                            color: swatchColor,
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: selected
+                                  ? Theme.of(context).colorScheme.primary
+                                  : Colors.white.withAlpha(96),
+                              width: selected ? 3 : 1.5,
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Permissions',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _selectedPermissions
+                          ..clear()
+                          ..addAll(ServerPermission.values);
+                      });
+                    },
+                    child: const Text('Select all'),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _selectedPermissions.clear();
+                      });
+                    },
+                    child: const Text('Clear all'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              ..._rolePermissionSections.map((section) {
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: palette.panelStrong,
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: palette.border),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          section.title,
+                          style: Theme.of(context).textTheme.titleSmall
+                              ?.copyWith(fontWeight: FontWeight.w700),
+                        ),
+                        if (section.description != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            section.description!,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        ...section.permissions.map((descriptor) {
+                          return SwitchListTile(
+                            value: _selectedPermissions.contains(
+                              descriptor.permission,
+                            ),
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(descriptor.permission.label),
+                            subtitle: Text(descriptor.description),
+                            onChanged: (value) {
+                              setState(() {
+                                if (value) {
+                                  _selectedPermissions.add(
+                                    descriptor.permission,
+                                  );
+                                } else {
+                                  _selectedPermissions.remove(
+                                    descriptor.permission,
+                                  );
+                                }
+                              });
+                            },
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
                 );
               }),
             ],
@@ -1423,18 +2341,7 @@ class _RoleEditorDialogState extends State<_RoleEditorDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
-        FilledButton(
-          onPressed: () {
-            final name = _nameController.text.trim();
-            if (name.isEmpty) {
-              return;
-            }
-            Navigator.of(context).pop(
-              _RoleEditorResult(name: name, permissions: _selectedPermissions),
-            );
-          },
-          child: Text(widget.submitLabel),
-        ),
+        FilledButton(onPressed: _submit, child: Text(widget.submitLabel)),
       ],
     );
   }
@@ -1459,7 +2366,7 @@ class _MemberRoleDialogState extends State<_MemberRoleDialog> {
   late final Set<String> _selectedRoleIds = widget.member.roleIds.toSet();
 
   bool _isLockedRole(ServerRole role) {
-    if (role.name != 'Owner') {
+    if (!_isProtectedOwnerRole(role)) {
       return false;
     }
     return true;
@@ -1467,39 +2374,79 @@ class _MemberRoleDialogState extends State<_MemberRoleDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
     return AlertDialog(
       title: Text('Roles for ${widget.member.displayName}'),
       content: SizedBox(
-        width: 460,
+        width: 520,
         child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
-            children: widget.roles.map((role) {
-              final locked = _isLockedRole(role);
-              final selected = _selectedRoleIds.contains(role.id);
-              final enabled = !locked;
-              final subtitle = role.permissions.isEmpty
-                  ? 'No permissions'
-                  : role.permissions
-                        .map((permission) => permission.label)
-                        .join(', ');
-              return CheckboxListTile(
-                value: selected,
-                enabled: enabled,
-                title: Text(role.name),
-                subtitle: Text(subtitle),
-                contentPadding: EdgeInsets.zero,
-                onChanged: (value) {
-                  setState(() {
-                    if (value ?? false) {
-                      _selectedRoleIds.add(role.id);
-                    } else {
-                      _selectedRoleIds.remove(role.id);
-                    }
-                  });
-                },
-              );
-            }).toList(),
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Choose the exact roles this member should have. Their highest role color will be used in the server member list and text chat.',
+              ),
+              const SizedBox(height: 14),
+              ...widget.roles.map((role) {
+                final locked = _isLockedRole(role);
+                final selected = _selectedRoleIds.contains(role.id);
+                final enabled = !locked;
+                final subtitle = role.permissions.isEmpty
+                    ? 'No permissions'
+                    : role.permissions
+                          .map((permission) => permission.label)
+                          .join(', ');
+                final roleColor = _tryParseRoleColor(role.colorHex);
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: palette.panelStrong,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: palette.border),
+                  ),
+                  child: CheckboxListTile(
+                    value: selected,
+                    enabled: enabled,
+                    contentPadding: EdgeInsets.zero,
+                    title: Row(
+                      children: [
+                        _RoleColorDot(color: roleColor),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            role.name,
+                            style: TextStyle(
+                              color: roleColor,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        if (role.isSystem)
+                          const Chip(label: Text('System role')),
+                      ],
+                    ),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(subtitle),
+                    ),
+                    onChanged: (value) {
+                      setState(() {
+                        if (value ?? false) {
+                          _selectedRoleIds.add(role.id);
+                        } else {
+                          _selectedRoleIds.remove(role.id);
+                        }
+                      });
+                    },
+                  ),
+                );
+              }),
+            ],
           ),
         ),
       ),
@@ -1511,6 +2458,168 @@ class _MemberRoleDialogState extends State<_MemberRoleDialog> {
         FilledButton(
           onPressed: () => Navigator.of(context).pop(_selectedRoleIds),
           child: const Text('Save roles'),
+        ),
+      ],
+    );
+  }
+}
+
+enum _BulkRoleEditMode { keep, add, remove }
+
+class _BulkMemberRoleDialog extends StatefulWidget {
+  const _BulkMemberRoleDialog({
+    required this.members,
+    required this.roles,
+    required this.serverOwnerId,
+  });
+
+  final List<ServerMember> members;
+  final List<ServerRole> roles;
+  final String serverOwnerId;
+
+  @override
+  State<_BulkMemberRoleDialog> createState() => _BulkMemberRoleDialogState();
+}
+
+class _BulkMemberRoleDialogState extends State<_BulkMemberRoleDialog> {
+  late final Map<String, _BulkRoleEditMode> _roleModes = {
+    for (final role in widget.roles) role.id: _BulkRoleEditMode.keep,
+  };
+
+  bool _isLockedRole(ServerRole role) => _isProtectedOwnerRole(role);
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return AlertDialog(
+      title: Text('Update roles for ${widget.members.length} members'),
+      content: SizedBox(
+        width: 680,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Pick which roles to add or remove. Any role left on Keep will stay exactly as it is for each selected member.',
+              ),
+              const SizedBox(height: 16),
+              ...widget.roles.map((role) {
+                final locked = _isLockedRole(role);
+                final roleColor = _tryParseRoleColor(role.colorHex);
+                final assignedCount = widget.members
+                    .where((member) => member.roleIds.contains(role.id))
+                    .length;
+                final mode = _roleModes[role.id] ?? _BulkRoleEditMode.keep;
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: palette.panelStrong,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: palette.border),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Wrap(
+                        spacing: 12,
+                        runSpacing: 12,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _RoleColorDot(color: roleColor),
+                              const SizedBox(width: 8),
+                              Text(
+                                role.name,
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  color: roleColor,
+                                ),
+                              ),
+                            ],
+                          ),
+                          Text(
+                            '$assignedCount of ${widget.members.length} selected members already have this role',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          if (role.isSystem)
+                            const Chip(label: Text('System role')),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      SegmentedButton<_BulkRoleEditMode>(
+                        showSelectedIcon: false,
+                        segments: const [
+                          ButtonSegment<_BulkRoleEditMode>(
+                            value: _BulkRoleEditMode.keep,
+                            label: Text('Keep'),
+                          ),
+                          ButtonSegment<_BulkRoleEditMode>(
+                            value: _BulkRoleEditMode.add,
+                            label: Text('Add'),
+                          ),
+                          ButtonSegment<_BulkRoleEditMode>(
+                            value: _BulkRoleEditMode.remove,
+                            label: Text('Remove'),
+                          ),
+                        ],
+                        selected: {mode},
+                        onSelectionChanged: locked
+                            ? null
+                            : (selection) {
+                                setState(() {
+                                  _roleModes[role.id] = selection.first;
+                                });
+                              },
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: role.permissions.isEmpty
+                            ? const [Chip(label: Text('No permissions'))]
+                            : role.permissions
+                                  .map(
+                                    (permission) =>
+                                        Chip(label: Text(permission.label)),
+                                  )
+                                  .toList(),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final roleIdsToAdd = _roleModes.entries
+                .where((entry) => entry.value == _BulkRoleEditMode.add)
+                .map((entry) => entry.key)
+                .toSet();
+            final roleIdsToRemove = _roleModes.entries
+                .where((entry) => entry.value == _BulkRoleEditMode.remove)
+                .map((entry) => entry.key)
+                .toSet();
+            Navigator.of(context).pop(
+              _BulkMemberRoleEditorResult(
+                roleIdsToAdd: roleIdsToAdd,
+                roleIdsToRemove: roleIdsToRemove,
+              ),
+            );
+          },
+          child: const Text('Apply changes'),
         ),
       ],
     );
@@ -1634,10 +2743,25 @@ class _ChannelOverrideDialogState extends State<_ChannelOverrideDialog> {
 }
 
 class _RoleEditorResult {
-  const _RoleEditorResult({required this.name, required this.permissions});
+  const _RoleEditorResult({
+    required this.name,
+    required this.colorHex,
+    required this.permissions,
+  });
 
   final String name;
+  final String? colorHex;
   final Set<ServerPermission> permissions;
+}
+
+class _BulkMemberRoleEditorResult {
+  const _BulkMemberRoleEditorResult({
+    required this.roleIdsToAdd,
+    required this.roleIdsToRemove,
+  });
+
+  final Set<String> roleIdsToAdd;
+  final Set<String> roleIdsToRemove;
 }
 
 class _ChannelOverrideEditorResult {
@@ -1648,6 +2772,197 @@ class _ChannelOverrideEditorResult {
 
   final Set<ServerPermission> allowPermissions;
   final Set<ServerPermission> denyPermissions;
+}
+
+const List<String> _roleColorPresets = <String>[
+  '#F5B85A',
+  '#FF8A65',
+  '#F06292',
+  '#BA68C8',
+  '#7E57C2',
+  '#7DD3FC',
+  '#4FC3F7',
+  '#4DB6AC',
+  '#81C784',
+  '#AED581',
+  '#FFD54F',
+  '#C6CBD5',
+];
+
+const List<_PermissionSectionDescriptor>
+_rolePermissionSections = <_PermissionSectionDescriptor>[
+  _PermissionSectionDescriptor(
+    title: 'Server setup',
+    description: 'High-level admin actions for the server itself.',
+    permissions: <_PermissionDescriptor>[
+      _PermissionDescriptor(
+        permission: ServerPermission.manageServer,
+        description:
+            'Change server visibility and other top-level server settings.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.manageRoles,
+        description: 'Create roles, edit permissions, and assign roles.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.manageChannels,
+        description:
+            'Create channels, categories, and edit channel-specific access.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.inviteMembers,
+        description:
+            'Invite people directly and review join requests when needed.',
+      ),
+    ],
+  ),
+  _PermissionSectionDescriptor(
+    title: 'Text chat',
+    description: 'What the role can do inside text channels.',
+    permissions: <_PermissionDescriptor>[
+      _PermissionDescriptor(
+        permission: ServerPermission.viewChannel,
+        description: 'See the server channels and read channel content.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.sendMessages,
+        description: 'Send messages and attachments in text channels.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.manageMessages,
+        description: 'Delete other people’s messages in server text channels.',
+      ),
+    ],
+  ),
+  _PermissionSectionDescriptor(
+    title: 'Voice and streaming',
+    description: 'Audio, camera, and screen sharing controls.',
+    permissions: <_PermissionDescriptor>[
+      _PermissionDescriptor(
+        permission: ServerPermission.joinVoice,
+        description: 'Join voice channels in the server.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.streamCamera,
+        description: 'Turn on camera in voice channels.',
+      ),
+      _PermissionDescriptor(
+        permission: ServerPermission.shareScreen,
+        description: 'Share a screen or window in voice channels.',
+      ),
+    ],
+  ),
+];
+
+class _PermissionSectionDescriptor {
+  const _PermissionSectionDescriptor({
+    required this.title,
+    required this.permissions,
+    this.description,
+  });
+
+  final String title;
+  final String? description;
+  final List<_PermissionDescriptor> permissions;
+}
+
+class _PermissionDescriptor {
+  const _PermissionDescriptor({
+    required this.permission,
+    required this.description,
+  });
+
+  final ServerPermission permission;
+  final String description;
+}
+
+class _RoleColorDot extends StatelessWidget {
+  const _RoleColorDot({required this.color, this.size = 14});
+
+  final Color? color;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = Theme.of(context).extension<AppThemePalette>()!;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: color ?? palette.panel,
+        shape: BoxShape.circle,
+        border: Border.all(color: palette.border),
+      ),
+    );
+  }
+}
+
+String? _normalizeRoleColorHexInput(String value) {
+  final normalized = value.trim().toUpperCase();
+  if (normalized.isEmpty) {
+    return null;
+  }
+  if (!RegExp(r'^#[0-9A-F]{6}$').hasMatch(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+Color? _tryParseRoleColor(String? colorHex) {
+  final normalized = _normalizeRoleColorHexInput(colorHex ?? '');
+  if (normalized == null) {
+    return null;
+  }
+  final hexValue = normalized.substring(1);
+  return Color(int.parse('FF$hexValue', radix: 16));
+}
+
+Map<String, int> _roleOrderMap(List<ServerRole> roles) {
+  return {
+    for (var index = 0; index < roles.length; index++) roles[index].id: index,
+  };
+}
+
+ServerRole? _primaryRoleForMember(
+  ServerMember member,
+  Map<String, ServerRole> roleById,
+  Map<String, int> roleOrder,
+) {
+  final assignedRoles = member.roleIds
+      .map((roleId) => roleById[roleId])
+      .whereType<ServerRole>()
+      .toList();
+  if (assignedRoles.isEmpty) {
+    return null;
+  }
+  assignedRoles.sort(
+    (left, right) => _roleSortScore(
+      left,
+      roleOrder,
+    ).compareTo(_roleSortScore(right, roleOrder)),
+  );
+  return assignedRoles.first;
+}
+
+int _roleSortScore(ServerRole role, Map<String, int> roleOrder) {
+  final normalizedName = role.name.toLowerCase();
+  if (_isProtectedOwnerRole(role)) {
+    return -3000;
+  }
+  if (normalizedName == 'admin') {
+    return -2000;
+  }
+  if (normalizedName == 'member') {
+    return 9000;
+  }
+  final index = roleOrder[role.id] ?? 0;
+  return role.isSystem ? 1000 + index : index;
+}
+
+bool _isProtectedOwnerRole(ServerRole role) {
+  return role.isSystem &&
+      role.permissions.length == ServerPermission.values.length &&
+      role.permissions.containsAll(ServerPermission.values);
 }
 
 String _formatServerDate(DateTime timestamp) {

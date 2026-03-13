@@ -540,7 +540,7 @@ class WorkspaceRepository {
         await client
                 .from('server_roles')
                 .select(
-                  'id, server_id, name, permissions, is_system, created_at',
+                  'id, server_id, name, color_hex, permissions, is_system, created_at',
                 )
                 .eq('server_id', serverId)
                 .order('created_at', ascending: true)
@@ -746,24 +746,29 @@ class WorkspaceRepository {
   Future<ServerRole> createRole({
     required String serverId,
     required String name,
+    String? colorHex,
     required Set<ServerPermission> permissions,
   }) async {
     final cleanName = name.trim();
     if (cleanName.isEmpty) {
       throw StateError('Role name is required.');
     }
+    final normalizedColorHex = _normalizeRoleColorHex(colorHex);
 
     final row = await client
         .from('server_roles')
         .insert({
           'server_id': serverId,
           'name': cleanName,
+          'color_hex': normalizedColorHex,
           'permissions': {
             for (final permission in ServerPermission.values)
               permission.key: permissions.contains(permission),
           },
         })
-        .select('id, server_id, name, permissions, is_system, created_at')
+        .select(
+          'id, server_id, name, color_hex, permissions, is_system, created_at',
+        )
         .single();
 
     return ServerRole.fromMap(row);
@@ -772,24 +777,29 @@ class WorkspaceRepository {
   Future<ServerRole> updateRole({
     required String roleId,
     required String name,
+    String? colorHex,
     required Set<ServerPermission> permissions,
   }) async {
     final cleanName = name.trim();
     if (cleanName.isEmpty) {
       throw StateError('Role name is required.');
     }
+    final normalizedColorHex = _normalizeRoleColorHex(colorHex);
 
     final row = await client
         .from('server_roles')
         .update({
           'name': cleanName,
+          'color_hex': normalizedColorHex,
           'permissions': {
             for (final permission in ServerPermission.values)
               permission.key: permissions.contains(permission),
           },
         })
         .eq('id', roleId)
-        .select('id, server_id, name, permissions, is_system, created_at')
+        .select(
+          'id, server_id, name, color_hex, permissions, is_system, created_at',
+        )
         .single();
 
     return ServerRole.fromMap(row);
@@ -903,16 +913,17 @@ class WorkspaceRepository {
     ChannelMessage? replyToMessage,
     List<OutgoingMessageAttachment> attachments =
         const <OutgoingMessageAttachment>[],
+    String? messageId,
   }) async {
     final cleanBody = body.trim();
     if (cleanBody.isEmpty && attachments.isEmpty) {
       return;
     }
 
-    final messageId = _uuid.v4();
+    final resolvedMessageId = messageId ?? _uuid.v4();
     final senderAvatarPath = await _currentUserAvatarPath();
     final uploadedAttachments = await _uploadMessageAttachments(
-      messageId: messageId,
+      messageId: resolvedMessageId,
       scope: 'channel',
       scopeId: channelId,
       attachments: attachments,
@@ -920,7 +931,7 @@ class WorkspaceRepository {
 
     try {
       await client.from('channel_messages').insert({
-        'id': messageId,
+        'id': resolvedMessageId,
         'channel_id': channelId,
         'sender_id': authService.userId,
         'sender_display_name': authService.displayName,
@@ -1079,16 +1090,17 @@ class WorkspaceRepository {
     DirectMessage? replyToMessage,
     List<OutgoingMessageAttachment> attachments =
         const <OutgoingMessageAttachment>[],
+    String? messageId,
   }) async {
     final cleanBody = body.trim();
     if (cleanBody.isEmpty && attachments.isEmpty) {
       return;
     }
 
-    final messageId = _uuid.v4();
+    final resolvedMessageId = messageId ?? _uuid.v4();
     final senderAvatarPath = await _currentUserAvatarPath();
     final uploadedAttachments = await _uploadMessageAttachments(
-      messageId: messageId,
+      messageId: resolvedMessageId,
       scope: 'direct',
       scopeId: conversationId,
       attachments: attachments,
@@ -1096,7 +1108,7 @@ class WorkspaceRepository {
 
     try {
       await client.from('direct_messages').insert({
-        'id': messageId,
+        'id': resolvedMessageId,
         'conversation_id': conversationId,
         'sender_id': authService.userId,
         'sender_display_name': authService.displayName,
@@ -1196,6 +1208,17 @@ class WorkspaceRepository {
       return normalized;
     }
     return '${normalized.substring(0, 137)}...';
+  }
+
+  String? _normalizeRoleColorHex(String? colorHex) {
+    final normalized = colorHex?.trim().toUpperCase() ?? '';
+    if (normalized.isEmpty) {
+      return null;
+    }
+    if (!RegExp(r'^#[0-9A-F]{6}$').hasMatch(normalized)) {
+      throw StateError('Role color must use the format #RRGGBB.');
+    }
+    return normalized;
   }
 
   Future<String?> _currentUserAvatarPath() async {
