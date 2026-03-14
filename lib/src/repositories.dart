@@ -848,6 +848,52 @@ class WorkspaceRepository {
     );
   }
 
+  // --- Soundboard ---
+
+  String? soundboardClipUrl(String? filePath) {
+    if (filePath == null) return null;
+    return client.storage.from('server-assets').getPublicUrl(filePath);
+  }
+
+  Future<List<SoundboardClip>> fetchSoundboardClips(String serverId) async {
+    final response = await client
+        .from('server_soundboard')
+        .select()
+        .eq('server_id', serverId)
+        .order('created_at');
+    return (response as List)
+        .map((item) => SoundboardClip.fromMap(Map<String, dynamic>.from(item)))
+        .toList();
+  }
+
+  Future<void> uploadSoundboardClip({
+    required String serverId,
+    required String name,
+    required Uint8List bytes,
+    required String extension,
+  }) async {
+    final path = '$serverId/soundboard-${_uuid.v4()}.$extension';
+    await client.storage.from('server-assets').uploadBinary(
+          path,
+          bytes,
+          fileOptions: const FileOptions(upsert: false),
+        );
+    await client.from('server_soundboard').insert(<String, dynamic>{
+      'server_id': serverId,
+      'name': name.trim(),
+      'file_path': path,
+      'created_by': authService.userId,
+    });
+  }
+
+  Future<void> deleteSoundboardClip({
+    required String clipId,
+    required String filePath,
+  }) async {
+    await client.storage.from('server-assets').remove([filePath]);
+    await client.from('server_soundboard').delete().eq('id', clipId);
+  }
+
   Future<void> deleteServer(String serverId) async {
     await client.from('servers').delete().eq('id', serverId);
   }

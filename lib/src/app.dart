@@ -24,6 +24,7 @@ class ChatApp extends StatefulWidget {
 class _ChatAppState extends State<ChatApp> {
   final AppPreferences _preferences = AppPreferences();
   final AppUpdateController _updateController = AppUpdateController();
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
   StreamSubscription<Uri>? _desktopDeepLinkSubscription;
 
   @override
@@ -71,6 +72,7 @@ class _ChatAppState extends State<ChatApp> {
         final palette = paletteForTheme(_preferences.themeScheme);
 
         return MaterialApp(
+          navigatorKey: _navigatorKey,
           title: 'ChitChat',
           debugShowCheckedModeBanner: false,
           theme: ThemeData(
@@ -138,6 +140,7 @@ class _ChatAppState extends State<ChatApp> {
             return _DesktopWindowFrame(
               appVersion: _updateController.currentVersion,
               updateController: _updateController,
+              navigatorKey: _navigatorKey,
               immersiveMode: desktopFullscreenPresentationActive,
               child: content,
             );
@@ -664,12 +667,14 @@ class _DesktopWindowFrame extends StatelessWidget {
   const _DesktopWindowFrame({
     required this.child,
     required this.updateController,
+    required this.navigatorKey,
     required this.immersiveMode,
     this.appVersion,
   });
 
   final Widget child;
   final AppUpdateController updateController;
+  final GlobalKey<NavigatorState> navigatorKey;
   final bool immersiveMode;
   final String? appVersion;
 
@@ -690,6 +695,7 @@ class _DesktopWindowFrame extends StatelessWidget {
             return _DesktopTitleBar(
               appVersion: appVersion,
               updateController: updateController,
+              navigatorKey: navigatorKey,
               heightOverride: maxHeight <= 0 ? 0 : maxHeight,
               showControls: false,
             );
@@ -701,6 +707,7 @@ class _DesktopWindowFrame extends StatelessWidget {
               _DesktopTitleBar(
                 appVersion: appVersion,
                 updateController: updateController,
+                navigatorKey: navigatorKey,
               ),
               Expanded(child: child),
             ],
@@ -714,12 +721,14 @@ class _DesktopWindowFrame extends StatelessWidget {
 class _DesktopTitleBar extends StatelessWidget {
   const _DesktopTitleBar({
     required this.updateController,
+    required this.navigatorKey,
     this.appVersion,
     this.heightOverride,
     this.showControls = true,
   });
 
   final AppUpdateController updateController;
+  final GlobalKey<NavigatorState> navigatorKey;
   final String? appVersion;
   final double? heightOverride;
   final bool showControls;
@@ -808,6 +817,7 @@ class _DesktopTitleBar extends StatelessWidget {
                     if (showUpdate)
                       _DesktopUpdateButton(
                         updateController: updateController,
+                        navigatorKey: navigatorKey,
                         buttonSize: titleBarButtonSize,
                       ),
                     const _DesktopWindowButtons(),
@@ -825,17 +835,19 @@ class _DesktopTitleBar extends StatelessWidget {
 class _DesktopUpdateButton extends StatelessWidget {
   const _DesktopUpdateButton({
     required this.updateController,
+    required this.navigatorKey,
     required this.buttonSize,
   });
 
   final AppUpdateController updateController;
+  final GlobalKey<NavigatorState> navigatorKey;
   final Size buttonSize;
 
   Future<void> _handlePressed(BuildContext context) async {
     if (updateController.hasUpdate) {
       final version = updateController.latestVersion ?? 'a newer version';
       final confirmed = await showDialog<bool>(
-        context: context,
+        context: navigatorKey.currentContext!,
         builder: (context) => AlertDialog(
           title: const Text('Update available'),
           content: Text(

@@ -36,7 +36,9 @@ enum ServerPermission {
   joinVoice('join_voice', 'Join voice'),
   streamCamera('stream_camera', 'Stream camera'),
   shareScreen('share_screen', 'Share screen'),
-  banMembers('ban_members', 'Ban members');
+  banMembers('ban_members', 'Ban members'),
+  useSoundboard('use_soundboard', 'Use soundboard'),
+  manageSoundboard('manage_soundboard', 'Manage soundboard');
 
   const ServerPermission(this.key, this.label);
 
@@ -842,6 +844,35 @@ class MessageSearchResult {
       senderId: map['sender_id'] as String,
       senderDisplayName: map['sender_display_name'] as String? ?? 'Unknown',
       senderAvatarPath: map['sender_avatar_path'] as String?,
+      createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
+    );
+  }
+}
+
+class SoundboardClip {
+  const SoundboardClip({
+    required this.id,
+    required this.serverId,
+    required this.name,
+    required this.filePath,
+    required this.createdBy,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String serverId;
+  final String name;
+  final String filePath;
+  final String createdBy;
+  final DateTime createdAt;
+
+  factory SoundboardClip.fromMap(Map<String, dynamic> map) {
+    return SoundboardClip(
+      id: map['id'] as String,
+      serverId: map['server_id'] as String,
+      name: map['name'] as String,
+      filePath: map['file_path'] as String,
+      createdBy: map['created_by'] as String,
       createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
     );
   }

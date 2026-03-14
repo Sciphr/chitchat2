@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -2582,6 +2583,17 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 activeVoiceController: activeVoiceController,
                 canStreamCamera: true,
                 canShareScreen: true,
+                canUseSoundboard:
+                    _serverAccess?.hasPermission(
+                      ServerPermission.useSoundboard,
+                    ) ??
+                    true,
+                canManageSoundboard:
+                    _serverAccess?.hasPermission(
+                      ServerPermission.manageSoundboard,
+                    ) ??
+                    false,
+                repository: widget.workspaceRepository,
                 onOpenActiveVoiceChannel: _openActiveVoiceChannel,
                 onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
                 onOpenUserSettings: _openUserSettings,
@@ -2606,6 +2618,17 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 activeVoiceController: activeVoiceController,
                 canStreamCamera: true,
                 canShareScreen: true,
+                canUseSoundboard:
+                    _serverAccess?.hasPermission(
+                      ServerPermission.useSoundboard,
+                    ) ??
+                    true,
+                canManageSoundboard:
+                    _serverAccess?.hasPermission(
+                      ServerPermission.manageSoundboard,
+                    ) ??
+                    false,
+                repository: widget.workspaceRepository,
                 onSelectChannel: _selectChannel,
                 onRenameCategory: _promptRenameCategory,
                 onReorderCategories: _reorderCategories,
@@ -2646,6 +2669,17 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                   activeVoiceController: activeVoiceController,
                   canStreamCamera: true,
                   canShareScreen: true,
+                  canUseSoundboard:
+                      _serverAccess?.hasPermission(
+                        ServerPermission.useSoundboard,
+                      ) ??
+                      true,
+                  canManageSoundboard:
+                      _serverAccess?.hasPermission(
+                        ServerPermission.manageSoundboard,
+                      ) ??
+                      false,
+                  repository: widget.workspaceRepository,
                   onSelectChannel: _selectChannel,
                   onRenameCategory: _promptRenameCategory,
                   onReorderCategories: _reorderCategories,
@@ -3243,6 +3277,9 @@ class _DirectMessagesSidebar extends StatelessWidget {
     required this.activeVoiceController,
     required this.canStreamCamera,
     required this.canShareScreen,
+    required this.canUseSoundboard,
+    required this.canManageSoundboard,
+    required this.repository,
     required this.onOpenActiveVoiceChannel,
     required this.onLeaveActiveVoiceChannel,
     required this.onOpenUserSettings,
@@ -3265,6 +3302,9 @@ class _DirectMessagesSidebar extends StatelessWidget {
   final VoiceChannelSessionController? activeVoiceController;
   final bool canStreamCamera;
   final bool canShareScreen;
+  final bool canUseSoundboard;
+  final bool canManageSoundboard;
+  final WorkspaceRepository repository;
   final Future<void> Function() onOpenActiveVoiceChannel;
   final Future<void> Function() onLeaveActiveVoiceChannel;
   final Future<void> Function() onOpenUserSettings;
@@ -3404,8 +3444,11 @@ class _DirectMessagesSidebar extends StatelessWidget {
               _ActiveVoiceDock(
                 channel: dockChannel,
                 controller: dockController,
+                repository: repository,
                 canStreamCamera: canStreamCamera,
                 canShareScreen: canShareScreen,
+                canUseSoundboard: canUseSoundboard,
+                canManageSoundboard: canManageSoundboard,
                 onOpenChannel: onOpenActiveVoiceChannel,
                 onLeaveCall: onLeaveActiveVoiceChannel,
               ),
@@ -3557,28 +3600,102 @@ class _DetailsPanelToggle extends StatelessWidget {
   }
 }
 
-class _ActiveVoiceDock extends StatelessWidget {
+class _ActiveVoiceDock extends StatefulWidget {
   const _ActiveVoiceDock({
     required this.channel,
     required this.controller,
+    required this.repository,
     required this.canStreamCamera,
     required this.canShareScreen,
+    required this.canUseSoundboard,
+    required this.canManageSoundboard,
     required this.onOpenChannel,
     required this.onLeaveCall,
   });
 
   final ChannelSummary channel;
   final VoiceChannelSessionController controller;
+  final WorkspaceRepository repository;
   final bool canStreamCamera;
   final bool canShareScreen;
+  final bool canUseSoundboard;
+  final bool canManageSoundboard;
   final Future<void> Function() onOpenChannel;
   final Future<void> Function() onLeaveCall;
+
+  @override
+  State<_ActiveVoiceDock> createState() => _ActiveVoiceDockState();
+}
+
+class _ActiveVoiceDockState extends State<_ActiveVoiceDock> {
+  RealtimeChannel? _soundboardChannel;
+  final AudioPlayer _soundboardPlayer = AudioPlayer();
+
+  @override
+  void initState() {
+    super.initState();
+    _subscribeSoundboard();
+  }
+
+  @override
+  void dispose() {
+    _unsubscribeSoundboard();
+    _soundboardPlayer.dispose();
+    super.dispose();
+  }
+
+  Future<void> _subscribeSoundboard() async {
+    final client = Supabase.instance.client;
+    final channel = client.channel('soundboard:${widget.channel.id}');
+    channel.onBroadcast(
+      event: 'play',
+      callback: (payload) {
+        final url = payload['url'] as String?;
+        if (url != null && mounted) {
+          unawaited(_soundboardPlayer.play(UrlSource(url)));
+        }
+      },
+    );
+    channel.subscribe();
+    _soundboardChannel = channel;
+  }
+
+  Future<void> _unsubscribeSoundboard() async {
+    final ch = _soundboardChannel;
+    _soundboardChannel = null;
+    if (ch != null) {
+      await Supabase.instance.client.removeChannel(ch);
+    }
+  }
+
+  Future<void> _broadcastAndPlayClip(String url) async {
+    final ch = _soundboardChannel;
+    if (ch != null) {
+      await ch.sendBroadcastMessage(
+        event: 'play',
+        payload: <String, dynamic>{'url': url},
+      );
+    }
+    unawaited(_soundboardPlayer.play(UrlSource(url)));
+  }
+
+  void _showSoundboard(BuildContext context) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => _SoundboardDialog(
+        serverId: widget.channel.serverId,
+        repository: widget.repository,
+        canManage: widget.canManageSoundboard,
+        onPlayClip: _broadcastAndPlayClip,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final palette = Theme.of(context).extension<AppThemePalette>()!;
     return AnimatedBuilder(
-      animation: controller,
+      animation: widget.controller,
       builder: (context, _) {
         return DecoratedBox(
           decoration: BoxDecoration(
@@ -3592,7 +3709,7 @@ class _ActiveVoiceDock extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 InkWell(
-                  onTap: onOpenChannel,
+                  onTap: widget.onOpenChannel,
                   borderRadius: BorderRadius.circular(14),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
@@ -3605,7 +3722,7 @@ class _ActiveVoiceDock extends StatelessWidget {
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
-                            channel.name,
+                            widget.channel.name,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(fontWeight: FontWeight.w700),
@@ -3623,44 +3740,44 @@ class _ActiveVoiceDock extends StatelessWidget {
                   runSpacing: 8,
                   children: [
                     IconButton.filledTonal(
-                      onPressed: controller.busy ? null : controller.toggleMute,
-                      icon: Icon(controller.muted ? Icons.mic_off : Icons.mic),
+                      onPressed: widget.controller.busy ? null : widget.controller.toggleMute,
+                      icon: Icon(widget.controller.muted ? Icons.mic_off : Icons.mic),
                     ),
                     IconButton.filledTonal(
-                      onPressed: controller.busy
+                      onPressed: widget.controller.busy
                           ? null
-                          : controller.toggleDeafen,
+                          : widget.controller.toggleDeafen,
                       icon: Icon(
-                        controller.deafened
+                        widget.controller.deafened
                             ? Icons.hearing_disabled
                             : Icons.hearing,
                       ),
                     ),
                     IconButton.filledTonal(
-                      onPressed: controller.busy || !canStreamCamera
+                      onPressed: widget.controller.busy || !widget.canStreamCamera
                           ? null
                           : () async {
-                              if (controller.isCameraSharing) {
-                                await controller.stopCameraShare();
+                              if (widget.controller.isCameraSharing) {
+                                await widget.controller.stopCameraShare();
                                 return;
                               }
-                              await controller.startCameraShare();
+                              await widget.controller.startCameraShare();
                             },
                       icon: Icon(
-                        controller.isCameraSharing
+                        widget.controller.isCameraSharing
                             ? Icons.videocam_off
                             : Icons.videocam,
                       ),
                     ),
                     IconButton.filledTonal(
                       onPressed:
-                          controller.busy ||
-                              !canShareScreen ||
+                          widget.controller.busy ||
+                              !widget.canShareScreen ||
                               !WebRTC.platformIsDesktop
                           ? null
                           : () async {
-                              if (controller.isScreenSharing) {
-                                await controller.stopScreenShare();
+                              if (widget.controller.isScreenSharing) {
+                                await widget.controller.stopScreenShare();
                                 return;
                               }
                               final selection =
@@ -3668,11 +3785,11 @@ class _ActiveVoiceDock extends StatelessWidget {
                                     context: context,
                                     builder: (context) =>
                                         ScreenSourcePickerDialog(
-                                          controller: controller,
+                                          controller: widget.controller,
                                         ),
                                   );
                               if (selection != null) {
-                                await controller.startScreenShare(
+                                await widget.controller.startScreenShare(
                                   selection.source,
                                   maxWidth: selection.preset.width,
                                   maxHeight: selection.preset.height,
@@ -3683,13 +3800,19 @@ class _ActiveVoiceDock extends StatelessWidget {
                               }
                             },
                       icon: Icon(
-                        controller.isScreenSharing
+                        widget.controller.isScreenSharing
                             ? Icons.stop_screen_share
                             : Icons.screen_share,
                       ),
                     ),
+                    if (widget.canUseSoundboard)
+                      IconButton.filledTonal(
+                        onPressed: () => _showSoundboard(context),
+                        tooltip: 'Soundboard',
+                        icon: const Icon(Icons.music_note),
+                      ),
                     IconButton.filled(
-                      onPressed: controller.busy ? null : onLeaveCall,
+                      onPressed: widget.controller.busy ? null : widget.onLeaveCall,
                       icon: const Icon(Icons.call_end),
                     ),
                   ],
@@ -4112,6 +4235,9 @@ class _ChannelSidebar extends StatefulWidget {
     required this.activeVoiceController,
     required this.canStreamCamera,
     required this.canShareScreen,
+    required this.canUseSoundboard,
+    required this.canManageSoundboard,
+    required this.repository,
     required this.onSelectChannel,
     required this.onRenameCategory,
     required this.onReorderCategories,
@@ -4144,6 +4270,9 @@ class _ChannelSidebar extends StatefulWidget {
   final VoiceChannelSessionController? activeVoiceController;
   final bool canStreamCamera;
   final bool canShareScreen;
+  final bool canUseSoundboard;
+  final bool canManageSoundboard;
+  final WorkspaceRepository repository;
   final Future<void> Function(ChannelSummary? channel) onSelectChannel;
   final Future<void> Function(ChannelCategorySummary category) onRenameCategory;
   final Future<void> Function(int oldIndex, int newIndex) onReorderCategories;
@@ -4461,8 +4590,11 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
               _ActiveVoiceDock(
                 channel: widget.activeVoiceChannel!,
                 controller: widget.activeVoiceController!,
+                repository: widget.repository,
                 canStreamCamera: widget.canStreamCamera,
                 canShareScreen: widget.canShareScreen,
+                canUseSoundboard: widget.canUseSoundboard,
+                canManageSoundboard: widget.canManageSoundboard,
                 onOpenChannel: widget.onOpenActiveVoiceChannel,
                 onLeaveCall: widget.onLeaveActiveVoiceChannel,
               ),
@@ -10802,6 +10934,263 @@ class _MessageSearchDialogState extends State<_MessageSearchDialog> {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Soundboard
+// ---------------------------------------------------------------------------
+
+class _SoundboardDialog extends StatefulWidget {
+  const _SoundboardDialog({
+    required this.serverId,
+    required this.repository,
+    required this.canManage,
+    required this.onPlayClip,
+  });
+
+  final String serverId;
+  final WorkspaceRepository repository;
+  final bool canManage;
+  final Future<void> Function(String url) onPlayClip;
+
+  @override
+  State<_SoundboardDialog> createState() => _SoundboardDialogState();
+}
+
+class _SoundboardDialogState extends State<_SoundboardDialog> {
+  List<SoundboardClip> _clips = [];
+  bool _loading = true;
+  String? _playingId;
+  bool _uploading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadClips();
+  }
+
+  Future<void> _loadClips() async {
+    try {
+      final clips = await widget.repository.fetchSoundboardClips(
+        widget.serverId,
+      );
+      if (mounted) {
+        setState(() {
+          _clips = clips;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loading = false);
+        showAppToast(
+          context,
+          'Failed to load soundboard: $e',
+          tone: AppToastTone.error,
+        );
+      }
+    }
+  }
+
+  Future<void> _playClip(SoundboardClip clip) async {
+    final url = widget.repository.soundboardClipUrl(clip.filePath);
+    if (url == null) return;
+    setState(() => _playingId = clip.id);
+    try {
+      await widget.onPlayClip(url);
+    } finally {
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (mounted) setState(() => _playingId = null);
+    }
+  }
+
+  Future<void> _uploadClip() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['mp3', 'wav', 'ogg', 'm4a', 'aac'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    if (file.bytes == null) return;
+    if (!mounted) return;
+
+    final extension = (file.extension ?? 'mp3').toLowerCase();
+    final defaultName = file.name.replaceAll(RegExp(r'\.\w+$'), '').trim();
+    final nameController = TextEditingController(text: defaultName);
+
+    final confirmed = await showDialog<bool>(
+      context: context, // ignore: use_build_context_synchronously
+      builder: (ctx) => AlertDialog(
+        title: const Text('Name this clip'),
+        content: TextField(
+          controller: nameController,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Clip name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Upload'),
+          ),
+        ],
+      ),
+    );
+    final name = nameController.text.trim().isEmpty
+        ? defaultName
+        : nameController.text.trim();
+    nameController.dispose();
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _uploading = true);
+    try {
+      await widget.repository.uploadSoundboardClip(
+        serverId: widget.serverId,
+        name: name,
+        bytes: file.bytes!,
+        extension: extension,
+      );
+      await _loadClips();
+    } catch (e) {
+      if (mounted) {
+        showAppToast(context, 'Upload failed: $e', tone: AppToastTone.error);
+      }
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  Future<void> _deleteClip(SoundboardClip clip) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete clip?'),
+        content: Text('Remove "${clip.name}" from the soundboard?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.repository.deleteSoundboardClip(
+        clipId: clip.id,
+        filePath: clip.filePath,
+      );
+      await _loadClips();
+    } catch (e) {
+      if (mounted) {
+        showAppToast(context, 'Delete failed: $e', tone: AppToastTone.error);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.music_note),
+          SizedBox(width: 10),
+          Text('Soundboard'),
+        ],
+      ),
+      content: SizedBox(
+        width: 420,
+        child: _loading
+            ? const Center(
+                heightFactor: 3,
+                child: CircularProgressIndicator(),
+              )
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (_clips.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 24),
+                      child: Text(
+                        widget.canManage
+                            ? 'No clips yet. Add one below.'
+                            : 'No clips have been added to this server yet.',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyMedium,
+                      ),
+                    )
+                  else
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _clips.map((clip) {
+                        final isPlaying = _playingId == clip.id;
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(20),
+                          onTap: () => unawaited(_playClip(clip)),
+                          child: Chip(
+                            avatar: isPlaying
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.play_arrow, size: 16),
+                            label: Text(clip.name),
+                            onDeleted: widget.canManage
+                                ? () => unawaited(_deleteClip(clip))
+                                : null,
+                            deleteIcon: const Icon(Icons.close, size: 14),
+                            backgroundColor: isPlaying
+                                ? theme.colorScheme.primaryContainer
+                                : null,
+                            side: BorderSide(
+                              color: isPlaying
+                                  ? theme.colorScheme.primary
+                                  : theme.colorScheme.outline.withAlpha(80),
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  if (widget.canManage) ...[
+                    const SizedBox(height: 16),
+                    FilledButton.tonalIcon(
+                      onPressed: _uploading ? null : _uploadClip,
+                      icon: _uploading
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.add),
+                      label: const Text('Add clip'),
+                    ),
+                  ],
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
     );
   }
 }
