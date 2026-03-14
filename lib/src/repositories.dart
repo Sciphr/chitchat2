@@ -159,21 +159,6 @@ class WorkspaceRepository {
     });
   }
 
-  Future<UserProfileSummary> fetchCurrentUserProfile() async {
-    final row =
-        await client
-            .from('user_profiles')
-            .select('id, display_name, avatar_path')
-            .eq('id', authService.userId)
-            .maybeSingle() ??
-        <String, dynamic>{
-          'id': authService.userId,
-          'display_name': authService.displayName,
-          'avatar_path': null,
-        };
-    return UserProfileSummary.fromMap(Map<String, dynamic>.from(row));
-  }
-
   Future<List<ServerSummary>> fetchServers() async {
     final membershipRows =
         await client
@@ -732,11 +717,135 @@ class WorkspaceRepository {
     required String serverId,
     required String userId,
   }) async {
-    await client
-        .from('server_members')
-        .delete()
-        .eq('server_id', serverId)
-        .eq('user_id', userId);
+    await client.rpc(
+      'kick_server_member',
+      params: <String, dynamic>{
+        'server_id_input': serverId,
+        'user_id_input': userId,
+      },
+    );
+  }
+
+  Future<void> banMember({
+    required String serverId,
+    required String userId,
+    String? reason,
+  }) async {
+    await client.rpc(
+      'ban_server_member',
+      params: <String, dynamic>{
+        'server_id_input': serverId,
+        'user_id_input': userId,
+        'reason_input': reason,
+      },
+    );
+  }
+
+  Future<void> unbanMember({
+    required String serverId,
+    required String userId,
+  }) async {
+    await client.rpc(
+      'unban_server_member',
+      params: <String, dynamic>{
+        'server_id_input': serverId,
+        'user_id_input': userId,
+      },
+    );
+  }
+
+  Future<List<ServerBan>> fetchServerBans(String serverId) async {
+    final response = await client.rpc(
+      'list_server_bans',
+      params: <String, dynamic>{'server_id_input': serverId},
+    );
+    if (response is! List) return const <ServerBan>[];
+    return response
+        .map(
+          (row) => ServerBan.fromMap(Map<String, dynamic>.from(row as Map)),
+        )
+        .toList();
+  }
+
+  Future<List<AuditLogEntry>> fetchAuditLog({
+    required String serverId,
+    String? actionFilter,
+    int pageSize = 50,
+    String? beforeId,
+  }) async {
+    final response = await client.rpc(
+      'list_server_audit_log',
+      params: <String, dynamic>{
+        'server_id_input': serverId,
+        'action_filter': actionFilter,
+        'page_size': pageSize,
+        'before_id': beforeId,
+      },
+    );
+    if (response is! List) return const <AuditLogEntry>[];
+    return response
+        .map(
+          (row) =>
+              AuditLogEntry.fromMap(Map<String, dynamic>.from(row as Map)),
+        )
+        .toList();
+  }
+
+  Future<List<MessageSearchResult>> searchMessages({
+    required String serverId,
+    required String query,
+    int pageSize = 25,
+  }) async {
+    final cleanQuery = query.trim();
+    if (cleanQuery.isEmpty) return const <MessageSearchResult>[];
+    final response = await client.rpc(
+      'search_server_messages',
+      params: <String, dynamic>{
+        'server_id_input': serverId,
+        'query_input': cleanQuery,
+        'page_size': pageSize,
+      },
+    );
+    if (response is! List) return const <MessageSearchResult>[];
+    return response
+        .map(
+          (row) => MessageSearchResult.fromMap(
+            Map<String, dynamic>.from(row as Map),
+          ),
+        )
+        .toList();
+  }
+
+  Future<UserProfileSummary> fetchCurrentUserProfile() async {
+    final row =
+        await client
+            .from('user_profiles')
+            .select('id, display_name, avatar_path, status, activity_text')
+            .eq('id', authService.userId)
+            .maybeSingle() ??
+        <String, dynamic>{
+          'id': authService.userId,
+          'display_name': authService.displayName,
+          'avatar_path': null,
+          'status': 'online',
+          'activity_text': null,
+        };
+    return UserProfileSummary.fromMap(Map<String, dynamic>.from(row));
+  }
+
+  Future<void> setUserStatus({
+    required UserStatus status,
+    String? activityText,
+  }) async {
+    await client.rpc(
+      'set_user_status',
+      params: <String, dynamic>{
+        'status_input': status.key,
+        'activity_text_input': activityText?.trim().isEmpty == true
+            ? null
+            : activityText?.trim(),
+      },
+    );
   }
 
   Future<void> deleteServer(String serverId) async {

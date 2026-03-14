@@ -58,6 +58,11 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       const <ChannelPermissionOverride>[];
   String? _selectedOverrideChannelId;
   RealtimeChannel? _joinRequestsChannel;
+  List<ServerBan> _bans = const <ServerBan>[];
+  bool _loadingBans = false;
+  List<AuditLogEntry> _auditLog = const <AuditLogEntry>[];
+  bool _loadingAuditLog = false;
+  String? _auditLogActionFilter;
 
   bool get _canManageRoles =>
       widget.access.hasPermission(ServerPermission.manageRoles);
@@ -67,6 +72,8 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       widget.access.hasPermission(ServerPermission.inviteMembers);
   bool get _canManageServer =>
       widget.access.hasPermission(ServerPermission.manageServer);
+  bool get _canBanMembers =>
+      widget.access.hasPermission(ServerPermission.banMembers);
   bool get _canReviewJoinRequests =>
       widget.access.isOwner || _canInviteMembers || _canManageServer;
   bool get _canEditServerPicture => widget.access.isOwner;
@@ -126,6 +133,12 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       if (_canReviewJoinRequests) {
         await _loadJoinRequests();
         await _subscribeJoinRequestUpdates();
+      }
+      if (_canBanMembers) {
+        await _loadBans();
+      }
+      if (_canManageServer) {
+        await _loadAuditLog();
       }
     } catch (error) {
       if (!mounted) {
@@ -242,6 +255,106 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
       debugPrint(
         'Join request dialog subscription failed for ${_server.id}: $error',
       );
+    }
+  }
+
+  Future<void> _loadBans() async {
+    setState(() => _loadingBans = true);
+    try {
+      final bans = await widget.repository.fetchServerBans(_server.id);
+      if (!mounted) return;
+      setState(() {
+        _bans = bans;
+        _loadingBans = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loadingBans = false);
+    }
+  }
+
+  Future<void> _loadAuditLog({String? actionFilter}) async {
+    setState(() {
+      _loadingAuditLog = true;
+      _auditLogActionFilter = actionFilter;
+    });
+    try {
+      final entries = await widget.repository.fetchAuditLog(
+        serverId: _server.id,
+        actionFilter: actionFilter,
+      );
+      if (!mounted) return;
+      setState(() {
+        _auditLog = entries;
+        _loadingAuditLog = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loadingAuditLog = false);
+    }
+  }
+
+  Future<void> _banMember(ServerMember member) async {
+    String? reason;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        final reasonController = TextEditingController();
+        return AlertDialog(
+          title: Text('Ban ${member.displayName}?'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('This will remove them from the server and prevent rejoining.'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: reasonController,
+                decoration: const InputDecoration(labelText: 'Reason (optional)'),
+                onChanged: (v) => reason = v.trim().isEmpty ? null : v.trim(),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              style: FilledButton.styleFrom(backgroundColor: Colors.red),
+              child: const Text('Ban'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await widget.repository.banMember(
+        serverId: _server.id,
+        userId: member.userId,
+        reason: reason,
+      );
+      if (!mounted) return;
+      await _loadBans();
+      await _load();
+    } catch (error) {
+      if (mounted) {
+        showAppToast(context, 'Failed to ban: $error', tone: AppToastTone.error);
+      }
+    }
+  }
+
+  Future<void> _unbanMember(ServerBan ban) async {
+    try {
+      await widget.repository.unbanMember(
+        serverId: _server.id,
+        userId: ban.userId,
+      );
+      if (!mounted) return;
+      await _loadBans();
+    } catch (error) {
+      if (mounted) {
+        showAppToast(context, 'Failed to unban: $error', tone: AppToastTone.error);
+      }
     }
   }
 
@@ -809,10 +922,15 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                 child: _loading
                     ? const Center(child: CircularProgressIndicator())
                     : DefaultTabController(
-                        length: _canReviewJoinRequests ? 5 : 4,
+                        length: 4 +
+                            (_canReviewJoinRequests ? 1 : 0) +
+                            (_canBanMembers ? 1 : 0) +
+                            (_canManageServer ? 1 : 0),
                         child: Column(
                           children: [
                             TabBar(
+                              isScrollable: true,
+                              tabAlignment: TabAlignment.start,
                               tabs: [
                                 const Tab(text: 'General'),
                                 const Tab(text: 'Roles'),
@@ -825,6 +943,10 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                       badgeCount: _joinRequests.length,
                                     ),
                                   ),
+                                if (_canBanMembers)
+                                  const Tab(text: 'Bans'),
+                                if (_canManageServer)
+                                  const Tab(text: 'Audit Log'),
                               ],
                             ),
                             const SizedBox(height: 18),
@@ -867,6 +989,8 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                     onEditMemberRoles: _editMemberRoles,
                                     onEditSelectedMembers:
                                         _editSelectedMemberRoles,
+                                    canBanMembers: _canBanMembers,
+                                    onBanMember: _banMember,
                                   ),
                                   _ChannelAccessTab(
                                     channels: _channels,
@@ -897,6 +1021,20 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                                         request,
                                         approve: false,
                                       ),
+                                    ),
+                                  if (_canBanMembers)
+                                    _BansTab(
+                                      loading: _loadingBans,
+                                      bans: _bans,
+                                      onUnban: _unbanMember,
+                                    ),
+                                  if (_canManageServer)
+                                    _AuditLogTab(
+                                      loading: _loadingAuditLog,
+                                      entries: _auditLog,
+                                      actionFilter: _auditLogActionFilter,
+                                      onFilterChanged: (filter) =>
+                                          _loadAuditLog(actionFilter: filter),
                                     ),
                                 ],
                               ),
@@ -1578,6 +1716,8 @@ class _MembersTab extends StatefulWidget {
     required this.canManageRoles,
     required this.onEditMemberRoles,
     required this.onEditSelectedMembers,
+    this.canBanMembers = false,
+    this.onBanMember,
   });
 
   final ServerSummary server;
@@ -1586,6 +1726,8 @@ class _MembersTab extends StatefulWidget {
   final bool canManageRoles;
   final Future<void> Function(ServerMember member) onEditMemberRoles;
   final Future<void> Function(List<ServerMember> members) onEditSelectedMembers;
+  final bool canBanMembers;
+  final Future<void> Function(ServerMember member)? onBanMember;
 
   @override
   State<_MembersTab> createState() => _MembersTabState();
@@ -1857,6 +1999,18 @@ class _MembersTabState extends State<_MembersTab> {
                                             Icons.manage_accounts,
                                           ),
                                           label: const Text('Edit roles'),
+                                        ),
+                                      if (widget.canBanMembers &&
+                                          member.userId !=
+                                              widget.server.ownerId)
+                                        OutlinedButton.icon(
+                                          onPressed: () =>
+                                              widget.onBanMember?.call(member),
+                                          icon: const Icon(Icons.block),
+                                          label: const Text('Ban'),
+                                          style: OutlinedButton.styleFrom(
+                                            foregroundColor: Colors.red,
+                                          ),
                                         ),
                                     ],
                                   ),
@@ -2970,4 +3124,140 @@ String _formatServerDate(DateTime timestamp) {
   final month = timestamp.month.toString().padLeft(2, '0');
   final day = timestamp.day.toString().padLeft(2, '0');
   return '$year-$month-$day';
+}
+
+// ─── Bans Tab ────────────────────────────────────────────────────────────────
+
+class _BansTab extends StatelessWidget {
+  const _BansTab({
+    required this.loading,
+    required this.bans,
+    required this.onUnban,
+  });
+
+  final bool loading;
+  final List<ServerBan> bans;
+  final Future<void> Function(ServerBan ban) onUnban;
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (bans.isEmpty) {
+      return const Center(child: Text('No banned members.'));
+    }
+    return ListView.separated(
+      itemCount: bans.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        final ban = bans[index];
+        return ListTile(
+          title: Text(ban.displayName),
+          subtitle: Text(
+            ban.reason?.isNotEmpty == true
+                ? 'Reason: ${ban.reason}'
+                : 'Banned ${_formatServerDate(ban.createdAt)}',
+          ),
+          trailing: TextButton.icon(
+            onPressed: () => onUnban(ban),
+            icon: const Icon(Icons.undo),
+            label: const Text('Unban'),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ─── Audit Log Tab ───────────────────────────────────────────────────────────
+
+const _kAuditLogActions = <String?>[
+  null,
+  'member_banned',
+  'member_unbanned',
+  'member_kicked',
+];
+
+const _kAuditLogActionLabels = <String?>[
+  'All actions',
+  'Member banned',
+  'Member unbanned',
+  'Member kicked',
+];
+
+class _AuditLogTab extends StatelessWidget {
+  const _AuditLogTab({
+    required this.loading,
+    required this.entries,
+    required this.actionFilter,
+    required this.onFilterChanged,
+  });
+
+  final bool loading;
+  final List<AuditLogEntry> entries;
+  final String? actionFilter;
+  final void Function(String? filter) onFilterChanged;
+
+  String _actionLabel(String action) {
+    final index = _kAuditLogActions.indexOf(action);
+    if (index >= 0) return _kAuditLogActionLabels[index] ?? action;
+    return action.replaceAll('_', ' ');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text('Filter: '),
+            const SizedBox(width: 8),
+            DropdownButton<String?>(
+              value: actionFilter,
+              items: List.generate(
+                _kAuditLogActions.length,
+                (i) => DropdownMenuItem<String?>(
+                  value: _kAuditLogActions[i],
+                  child: Text(_kAuditLogActionLabels[i] ?? 'All actions'),
+                ),
+              ),
+              onChanged: onFilterChanged,
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : entries.isEmpty
+              ? const Center(child: Text('No audit log entries.'))
+              : ListView.separated(
+                  itemCount: entries.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final entry = entries[index];
+                    final target = entry.targetDisplayName;
+                    return ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.history, size: 18),
+                      title: Text(
+                        target != null
+                            ? '${entry.actorDisplayName} → $target'
+                            : entry.actorDisplayName,
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      subtitle: Text(_actionLabel(entry.action)),
+                      trailing: Text(
+                        _formatServerDate(entry.createdAt),
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
 }

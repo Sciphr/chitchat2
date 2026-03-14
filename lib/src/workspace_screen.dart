@@ -85,6 +85,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
   Map<String, int> _lastDirectUnreadCounts = const <String, int>{};
   int _pendingJoinRequestCount = 0;
   String? _currentUserAvatarPath;
+  UserStatus _currentUserStatus = UserStatus.online;
 
   @override
   void initState() {
@@ -226,6 +227,11 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       break;
     }
     if (latestUnreadMessage == null) {
+      return;
+    }
+    // Suppress notifications for muted servers.
+    if (_selectedServer != null &&
+        widget.preferences.isServerMuted(_selectedServer!.id)) {
       return;
     }
     final unreadMessage = latestUnreadMessage;
@@ -1468,6 +1474,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
       if (mounted) {
         setState(() {
           _currentUserAvatarPath = currentProfile.avatarPath;
+          _currentUserStatus = currentProfile.status;
         });
       }
     } catch (error) {
@@ -1499,7 +1506,17 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
     if (mounted) {
       setState(() {
         _currentUserAvatarPath = currentProfile.avatarPath;
+        _currentUserStatus = currentProfile.status;
       });
+    }
+  }
+
+  Future<void> _setStatus(UserStatus status) async {
+    setState(() => _currentUserStatus = status);
+    try {
+      await widget.workspaceRepository.setUserStatus(status: status);
+    } catch (_) {
+      // Silently ignore — status is cosmetic.
     }
   }
 
@@ -2569,6 +2586,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
                 onOpenUserSettings: _openUserSettings,
                 onSignOut: widget.authService.signOut,
+                currentStatus: _currentUserStatus,
+                onSetStatus: _setStatus,
               )
             : activeVoiceController == null
             ? _ChannelSidebar(
@@ -2598,6 +2617,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                 currentDisplayName: widget.authService.displayName,
                 currentAvatarUrl: widget.workspaceRepository
                     .publicProfileAvatarUrl(_currentUserAvatarPath),
+                currentStatus: _currentUserStatus,
+                onSetStatus: _setStatus,
                 onOpenActiveVoiceChannel: _openActiveVoiceChannel,
                 onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
                 onStartDirectMessage:
@@ -2636,6 +2657,8 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                   currentDisplayName: widget.authService.displayName,
                   currentAvatarUrl: widget.workspaceRepository
                       .publicProfileAvatarUrl(_currentUserAvatarPath),
+                  currentStatus: _currentUserStatus,
+                  onSetStatus: _setStatus,
                   onOpenActiveVoiceChannel: _openActiveVoiceChannel,
                   onLeaveActiveVoiceChannel: _leaveActiveVoiceChannel,
                   onStartDirectMessage:
@@ -2813,6 +2836,7 @@ class _WorkspaceScreenState extends State<WorkspaceScreen> {
                         onDeleteServer: _deleteServer,
                         avatarUrlForPath:
                             widget.workspaceRepository.publicServerAvatarUrl,
+                        preferences: widget.preferences,
                       ),
                     ),
                     const SizedBox(width: 18),
@@ -3024,14 +3048,31 @@ class _SidebarAccountFooter extends StatelessWidget {
   const _SidebarAccountFooter({
     required this.displayName,
     required this.avatarUrl,
+    required this.currentStatus,
+    required this.onSetStatus,
     required this.onOpenUserSettings,
     required this.onSignOut,
   });
 
   final String displayName;
   final String? avatarUrl;
+  final UserStatus currentStatus;
+  final ValueChanged<UserStatus> onSetStatus;
   final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
+
+  Color _statusColor(UserStatus s) {
+    switch (s) {
+      case UserStatus.online:
+        return const Color(0xFF43B581);
+      case UserStatus.away:
+        return const Color(0xFFFAA61A);
+      case UserStatus.dnd:
+        return const Color(0xFFF04747);
+      case UserStatus.invisible:
+        return const Color(0xFF747F8D);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3060,21 +3101,67 @@ class _SidebarAccountFooter extends StatelessWidget {
                     ),
                     child: Row(
                       children: [
-                        _UserAvatar(
-                          displayName: displayName,
-                          avatarUrl: avatarUrl,
-                          size: 38,
-                          backgroundColor: palette.panelAccent.withAlpha(120),
+                        // Avatar with status dot overlay and status popup on dot tap.
+                        SizedBox(
+                          width: 38,
+                          height: 38,
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              _UserAvatar(
+                                displayName: displayName,
+                                avatarUrl: avatarUrl,
+                                size: 38,
+                                backgroundColor:
+                                    palette.panelAccent.withAlpha(120),
+                              ),
+                              Positioned(
+                                right: -2,
+                                bottom: -2,
+                                child: GestureDetector(
+                                  onTap: () =>
+                                      _showStatusMenu(context),
+                                  child: Container(
+                                    width: 14,
+                                    height: 14,
+                                    decoration: BoxDecoration(
+                                      color: _statusColor(currentStatus),
+                                      shape: BoxShape.circle,
+                                      border: Border.all(
+                                        color: palette.panelStrong,
+                                        width: 2,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                         const SizedBox(width: 12),
                         Expanded(
-                          child: Text(
-                            displayName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w700,
-                            ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                displayName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                currentStatus.label,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: _statusColor(currentStatus),
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],
@@ -3096,6 +3183,47 @@ class _SidebarAccountFooter extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  void _showStatusMenu(BuildContext context) {
+    final renderBox = context.findRenderObject() as RenderBox?;
+    if (renderBox == null) return;
+    final offset = renderBox.localToGlobal(Offset.zero);
+    final size = renderBox.size;
+    showMenu<UserStatus>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        offset.dx,
+        offset.dy - 160,
+        offset.dx + size.width,
+        offset.dy,
+      ),
+      items: UserStatus.values.map((s) {
+        return PopupMenuItem<UserStatus>(
+          value: s,
+          child: Row(
+            children: [
+              Container(
+                width: 12,
+                height: 12,
+                decoration: BoxDecoration(
+                  color: _statusColor(s),
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(s.label),
+              if (s == currentStatus) ...[
+                const Spacer(),
+                const Icon(Icons.check, size: 16),
+              ],
+            ],
+          ),
+        );
+      }).toList(),
+    ).then((selected) {
+      if (selected != null) onSetStatus(selected);
+    });
   }
 }
 
@@ -3119,6 +3247,8 @@ class _DirectMessagesSidebar extends StatelessWidget {
     required this.onLeaveActiveVoiceChannel,
     required this.onOpenUserSettings,
     required this.onSignOut,
+    required this.currentStatus,
+    required this.onSetStatus,
   });
 
   final List<DirectConversationSummary> conversations;
@@ -3139,6 +3269,8 @@ class _DirectMessagesSidebar extends StatelessWidget {
   final Future<void> Function() onLeaveActiveVoiceChannel;
   final Future<void> Function() onOpenUserSettings;
   final Future<void> Function() onSignOut;
+  final UserStatus currentStatus;
+  final ValueChanged<UserStatus> onSetStatus;
 
   @override
   Widget build(BuildContext context) {
@@ -3284,6 +3416,8 @@ class _DirectMessagesSidebar extends StatelessWidget {
             _SidebarAccountFooter(
               displayName: currentDisplayName,
               avatarUrl: currentAvatarUrl,
+              currentStatus: currentStatus,
+              onSetStatus: onSetStatus,
               onOpenUserSettings: onOpenUserSettings,
               onSignOut: onSignOut,
             ),
@@ -3671,6 +3805,7 @@ class _ServerRail extends StatelessWidget {
     required this.onLeaveServer,
     required this.onDeleteServer,
     required this.avatarUrlForPath,
+    required this.preferences,
   });
 
   final List<ServerSummary> servers;
@@ -3689,6 +3824,7 @@ class _ServerRail extends StatelessWidget {
   final Future<void> Function(ServerSummary server) onLeaveServer;
   final Future<void> Function(ServerSummary server) onDeleteServer;
   final String? Function(String? avatarPath) avatarUrlForPath;
+  final AppPreferences preferences;
 
   Future<void> _showServerMenu(
     BuildContext context,
@@ -3696,6 +3832,7 @@ class _ServerRail extends StatelessWidget {
     ServerSummary server,
   ) async {
     final isOwner = server.ownerId == currentUserId;
+    final isMuted = preferences.isServerMuted(server.id);
     final selection = await showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
@@ -3706,13 +3843,20 @@ class _ServerRail extends StatelessWidget {
       ),
       items: [
         PopupMenuItem<String>(
+          value: 'toggle_mute',
+          child: Text(isMuted ? 'Unmute server' : 'Mute server'),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
           value: isOwner ? 'delete' : 'leave',
           child: Text(isOwner ? 'Delete server' : 'Leave server'),
         ),
       ],
     );
 
-    if (selection == 'leave') {
+    if (selection == 'toggle_mute') {
+      await preferences.setServerMuted(server.id, muted: !isMuted);
+    } else if (selection == 'leave') {
       await onLeaveServer(server);
     } else if (selection == 'delete') {
       await onDeleteServer(server);
@@ -3978,6 +4122,8 @@ class _ChannelSidebar extends StatefulWidget {
     required this.onSignOut,
     required this.currentDisplayName,
     required this.currentAvatarUrl,
+    required this.currentStatus,
+    required this.onSetStatus,
     required this.onOpenActiveVoiceChannel,
     required this.onLeaveActiveVoiceChannel,
     required this.onStartDirectMessage,
@@ -4013,6 +4159,8 @@ class _ChannelSidebar extends StatefulWidget {
   final Future<void> Function() onSignOut;
   final String currentDisplayName;
   final String? currentAvatarUrl;
+  final UserStatus currentStatus;
+  final ValueChanged<UserStatus> onSetStatus;
   final Future<void> Function() onOpenActiveVoiceChannel;
   final Future<void> Function() onLeaveActiveVoiceChannel;
   final Future<void> Function({
@@ -4325,6 +4473,8 @@ class _ChannelSidebarState extends State<_ChannelSidebar> {
             _SidebarAccountFooter(
               displayName: widget.currentDisplayName,
               avatarUrl: widget.currentAvatarUrl,
+              currentStatus: widget.currentStatus,
+              onSetStatus: widget.onSetStatus,
               onOpenUserSettings: widget.onOpenUserSettings,
               onSignOut: widget.onSignOut,
             ),
@@ -4877,26 +5027,9 @@ class _ChannelTile extends StatelessWidget {
                   : 'Mute locally',
             ),
           ),
-          const PopupMenuDivider(),
           const PopupMenuItem<String>(
-            value: 'volume_25',
-            child: Text('Volume 25%'),
-          ),
-          const PopupMenuItem<String>(
-            value: 'volume_50',
-            child: Text('Volume 50%'),
-          ),
-          const PopupMenuItem<String>(
-            value: 'volume_100',
-            child: Text('Volume 100%'),
-          ),
-          const PopupMenuItem<String>(
-            value: 'volume_150',
-            child: Text('Volume 150%'),
-          ),
-          const PopupMenuItem<String>(
-            value: 'volume_200',
-            child: Text('Volume 200%'),
+            value: 'adjust_volume',
+            child: Text('Adjust volume...'),
           ),
         ],
       ],
@@ -4921,35 +5054,82 @@ class _ChannelTile extends StatelessWidget {
           await voiceController.setParticipantVolume(participant.clientId, 1);
         }
         break;
-      case 'volume_25':
-        if (voiceController != null) {
-          await voiceController.setParticipantVolume(
+      case 'adjust_volume':
+        if (voiceController != null && context.mounted) {
+          final current = voiceController.participantVolume(
             participant.clientId,
-            0.25,
+          );
+          await _showVolumeSliderDialog(
+            context,
+            participant,
+            voiceController,
+            current,
           );
         }
         break;
-      case 'volume_50':
-        if (voiceController != null) {
-          await voiceController.setParticipantVolume(participant.clientId, 0.5);
-        }
-        break;
-      case 'volume_100':
-        if (voiceController != null) {
-          await voiceController.setParticipantVolume(participant.clientId, 1);
-        }
-        break;
-      case 'volume_150':
-        if (voiceController != null) {
-          await voiceController.setParticipantVolume(participant.clientId, 1.5);
-        }
-        break;
-      case 'volume_200':
-        if (voiceController != null) {
-          await voiceController.setParticipantVolume(participant.clientId, 2);
-        }
-        break;
     }
+  }
+
+  Future<void> _showVolumeSliderDialog(
+    BuildContext context,
+    VoiceParticipant participant,
+    VoiceChannelSessionController voiceController,
+    double initialVolume,
+  ) async {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        var volume = initialVolume.clamp(0.0, 2.0);
+        return StatefulBuilder(
+          builder: (context, setState) {
+            final percent = (volume * 100).round();
+            return AlertDialog(
+              title: Text('Volume — ${participant.displayName}'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '$percent%',
+                    style: Theme.of(context).textTheme.headlineSmall,
+                  ),
+                  const SizedBox(height: 8),
+                  Slider(
+                    value: volume,
+                    min: 0,
+                    max: 2,
+                    divisions: 40,
+                    label: '$percent%',
+                    onChanged: (v) {
+                      setState(() => volume = v);
+                      unawaited(
+                        voiceController.setParticipantVolume(
+                          participant.clientId,
+                          v,
+                        ),
+                      );
+                    },
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: const [
+                      Text('0%', style: TextStyle(fontSize: 11)),
+                      Text('100%', style: TextStyle(fontSize: 11)),
+                      Text('200%', style: TextStyle(fontSize: 11)),
+                    ],
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Done'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 }
 
@@ -5644,18 +5824,111 @@ class _TextChannelViewState extends State<TextChannelView> {
   List<ChannelMessage> _latestMessages = const <ChannelMessage>[];
   List<ChannelMessage> _optimisticMessages = const <ChannelMessage>[];
 
+  // Typing indicators.
+  RealtimeChannel? _typingChannel;
+  final Map<String, String> _typingUsers = <String, String>{}; // userId -> displayName
+  final Map<String, Timer> _typingExpiry = <String, Timer>{};
+  Timer? _typingDebounce;
+  bool _isBroadcastingTyping = false;
+
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_handleScroll);
+    _messageController.addListener(_handleTextChanged);
+    unawaited(_subscribeTyping());
   }
 
   @override
   void dispose() {
     _scrollController.removeListener(_handleScroll);
+    _messageController.removeListener(_handleTextChanged);
     _messageController.dispose();
     _scrollController.dispose();
+    _typingDebounce?.cancel();
+    for (final t in _typingExpiry.values) {
+      t.cancel();
+    }
+    unawaited(_unsubscribeTyping());
     super.dispose();
+  }
+
+  Future<void> _subscribeTyping() async {
+    final client = Supabase.instance.client;
+    final channel = client.channel('typing:${widget.channel.id}');
+    channel.onBroadcast(
+      event: 'typing',
+      callback: (payload) {
+        final userId = payload['user_id'] as String?;
+        final displayName = payload['display_name'] as String?;
+        if (userId == null ||
+            displayName == null ||
+            userId == widget.currentUserId) {
+          return;
+        }
+        _typingExpiry[userId]?.cancel();
+        if (!mounted) return;
+        setState(() => _typingUsers[userId] = displayName);
+        _typingExpiry[userId] = Timer(const Duration(seconds: 4), () {
+          if (!mounted) return;
+          setState(() {
+            _typingUsers.remove(userId);
+            _typingExpiry.remove(userId);
+          });
+        });
+      },
+    );
+    channel.subscribe();
+    _typingChannel = channel;
+  }
+
+  Future<void> _unsubscribeTyping() async {
+    final ch = _typingChannel;
+    _typingChannel = null;
+    if (ch != null) {
+      await Supabase.instance.client.removeChannel(ch);
+    }
+  }
+
+  void _handleTextChanged() {
+    if (_messageController.text.isEmpty) return;
+    if (_isBroadcastingTyping) return;
+    _isBroadcastingTyping = true;
+    _typingDebounce?.cancel();
+    unawaited(_broadcastTyping());
+    _typingDebounce = Timer(const Duration(seconds: 3), () {
+      _isBroadcastingTyping = false;
+    });
+  }
+
+  Future<void> _showSearchDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _MessageSearchDialog(
+        serverId: widget.channel.serverId,
+        repository: widget.repository,
+        use24HourTime: widget.use24HourTime,
+      ),
+    );
+  }
+
+  String _typingLabel() {
+    final names = _typingUsers.values.toList();
+    if (names.length == 1) return '${names[0]} is typing...';
+    if (names.length == 2) return '${names[0]} and ${names[1]} are typing...';
+    return 'Several people are typing...';
+  }
+
+  Future<void> _broadcastTyping() async {
+    final ch = _typingChannel;
+    if (ch == null) return;
+    await ch.sendBroadcastMessage(
+      event: 'typing',
+      payload: <String, dynamic>{
+        'user_id': widget.currentUserId,
+        'display_name': widget.repository.authService.displayName,
+      },
+    );
   }
 
   Future<void> _send() async {
@@ -5894,9 +6167,23 @@ class _TextChannelViewState extends State<TextChannelView> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              '# ${widget.channel.name}',
-              style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w700),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '# ${widget.channel.name}',
+                    style: const TextStyle(
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: _showSearchDialog,
+                  icon: const Icon(Icons.search),
+                  tooltip: 'Search messages',
+                ),
+              ],
             ),
             const SizedBox(height: 16),
             Expanded(
@@ -6019,6 +6306,14 @@ class _TextChannelViewState extends State<TextChannelView> {
                 },
               ),
             ],
+            if (_typingUsers.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6, bottom: 2),
+                child: Text(
+                  _typingLabel(),
+                  style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
+                ),
+              ),
             const SizedBox(height: 14),
             Row(
               children: [
@@ -7745,26 +8040,9 @@ class _LegacyVoiceChannelView extends StatelessWidget {
                 : 'Mute locally',
           ),
         ),
-        const PopupMenuDivider(),
         const PopupMenuItem<String>(
-          value: 'volume_25',
-          child: Text('Volume 25%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_50',
-          child: Text('Volume 50%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_100',
-          child: Text('Volume 100%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_150',
-          child: Text('Volume 150%'),
-        ),
-        const PopupMenuItem<String>(
-          value: 'volume_200',
-          child: Text('Volume 200%'),
+          value: 'adjust_volume',
+          child: Text('Adjust volume...'),
         ),
         if (canManageServer && !participant.isSelf) ...[
           const PopupMenuDivider(),
@@ -7810,20 +8088,66 @@ class _LegacyVoiceChannelView extends StatelessWidget {
       case 'unmute_local':
         await voiceController.setParticipantVolume(participant.clientId, 1);
         break;
-      case 'volume_25':
-        await voiceController.setParticipantVolume(participant.clientId, 0.25);
-        break;
-      case 'volume_50':
-        await voiceController.setParticipantVolume(participant.clientId, 0.5);
-        break;
-      case 'volume_100':
-        await voiceController.setParticipantVolume(participant.clientId, 1);
-        break;
-      case 'volume_150':
-        await voiceController.setParticipantVolume(participant.clientId, 1.5);
-        break;
-      case 'volume_200':
-        await voiceController.setParticipantVolume(participant.clientId, 2);
+      case 'adjust_volume':
+        if (context.mounted) {
+          final current = voiceController.participantVolume(
+            participant.clientId,
+          );
+          await showDialog<void>(
+            context: context,
+            builder: (dialogContext) {
+              var volume = current.clamp(0.0, 2.0);
+              return StatefulBuilder(
+                builder: (context, setState) {
+                  final percent = (volume * 100).round();
+                  return AlertDialog(
+                    title: Text('Volume — ${participant.displayName}'),
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '$percent%',
+                          style: Theme.of(context).textTheme.headlineSmall,
+                        ),
+                        const SizedBox(height: 8),
+                        Slider(
+                          value: volume,
+                          min: 0,
+                          max: 2,
+                          divisions: 40,
+                          label: '$percent%',
+                          onChanged: (v) {
+                            setState(() => volume = v);
+                            unawaited(
+                              voiceController.setParticipantVolume(
+                                participant.clientId,
+                                v,
+                              ),
+                            );
+                          },
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: const [
+                            Text('0%', style: TextStyle(fontSize: 11)),
+                            Text('100%', style: TextStyle(fontSize: 11)),
+                            Text('200%', style: TextStyle(fontSize: 11)),
+                          ],
+                        ),
+                      ],
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Text('Done'),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          );
+        }
         break;
       case 'kick':
         await repository.removeMemberFromServer(
@@ -10353,4 +10677,131 @@ String _formatTime(DateTime timestamp, {bool use24HourTime = false}) {
   final suffix = hours >= 12 ? 'PM' : 'AM';
   final normalizedHour = hours % 12 == 0 ? 12 : hours % 12;
   return '$normalizedHour:$minutes $suffix';
+}
+
+class _MessageSearchDialog extends StatefulWidget {
+  const _MessageSearchDialog({
+    required this.serverId,
+    required this.repository,
+    required this.use24HourTime,
+  });
+
+  final String serverId;
+  final WorkspaceRepository repository;
+  final bool use24HourTime;
+
+  @override
+  State<_MessageSearchDialog> createState() => _MessageSearchDialogState();
+}
+
+class _MessageSearchDialogState extends State<_MessageSearchDialog> {
+  final TextEditingController _queryController = TextEditingController();
+  List<MessageSearchResult> _results = const <MessageSearchResult>[];
+  bool _searching = false;
+  Timer? _debounce;
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    _debounce?.cancel();
+    super.dispose();
+  }
+
+  void _onQueryChanged(String value) {
+    _debounce?.cancel();
+    if (value.trim().isEmpty) {
+      setState(() => _results = const <MessageSearchResult>[]);
+      return;
+    }
+    _debounce = Timer(const Duration(milliseconds: 400), () => _search(value));
+  }
+
+  Future<void> _search(String query) async {
+    setState(() => _searching = true);
+    try {
+      final results = await widget.repository.searchMessages(
+        serverId: widget.serverId,
+        query: query,
+      );
+      if (mounted) setState(() => _results = results);
+    } catch (_) {
+      // ignore search errors
+    } finally {
+      if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 600, maxHeight: 560),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.search),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Search messages',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: _queryController,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  hintText: 'Search for messages...',
+                  prefixIcon: Icon(Icons.search),
+                ),
+                onChanged: _onQueryChanged,
+              ),
+              const SizedBox(height: 14),
+              Expanded(
+                child: _searching
+                    ? const Center(child: CircularProgressIndicator())
+                    : _results.isEmpty
+                    ? Center(
+                        child: Text(
+                          _queryController.text.trim().isEmpty
+                              ? 'Type to search'
+                              : 'No results.',
+                        ),
+                      )
+                    : ListView.separated(
+                        itemCount: _results.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final result = _results[index];
+                          return ListTile(
+                            dense: true,
+                            title: Text(
+                              result.body,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              '${result.senderDisplayName} • #${result.channelName} • '
+                              '${_formatTime(result.createdAt, use24HourTime: widget.use24HourTime)}',
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

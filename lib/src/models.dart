@@ -2,6 +2,25 @@ import 'dart:typed_data';
 
 enum ChannelKind { text, voice }
 
+enum UserStatus {
+  online('online', 'Online'),
+  away('away', 'Away'),
+  dnd('dnd', 'Do Not Disturb'),
+  invisible('invisible', 'Invisible');
+
+  const UserStatus(this.key, this.label);
+
+  final String key;
+  final String label;
+
+  static UserStatus fromKey(String key) {
+    return UserStatus.values.firstWhere(
+      (s) => s.key == key,
+      orElse: () => UserStatus.online,
+    );
+  }
+}
+
 enum ShareKind { audio, camera, screen }
 
 enum MessageAttachmentKind { image, video, audio, file }
@@ -16,7 +35,8 @@ enum ServerPermission {
   sendMessages('send_messages', 'Send messages'),
   joinVoice('join_voice', 'Join voice'),
   streamCamera('stream_camera', 'Stream camera'),
-  shareScreen('share_screen', 'Share screen');
+  shareScreen('share_screen', 'Share screen'),
+  banMembers('ban_members', 'Ban members');
 
   const ServerPermission(this.key, this.label);
 
@@ -120,17 +140,23 @@ class UserProfileSummary {
     required this.id,
     required this.displayName,
     required this.avatarPath,
+    this.status = UserStatus.online,
+    this.activityText,
   });
 
   final String id;
   final String displayName;
   final String? avatarPath;
+  final UserStatus status;
+  final String? activityText;
 
   factory UserProfileSummary.fromMap(Map<String, dynamic> map) {
     return UserProfileSummary(
       id: map['id'] as String,
       displayName: map['display_name'] as String? ?? 'Unknown',
       avatarPath: map['avatar_path'] as String?,
+      status: UserStatus.fromKey(map['status'] as String? ?? 'online'),
+      activityText: map['activity_text'] as String?,
     );
   }
 }
@@ -710,4 +736,113 @@ class ChannelOrderUpdate {
   final String channelId;
   final int position;
   final String? categoryId;
+}
+
+class ServerBan {
+  const ServerBan({
+    required this.id,
+    required this.serverId,
+    required this.userId,
+    required this.bannedBy,
+    required this.displayName,
+    required this.reason,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String serverId;
+  final String userId;
+  final String bannedBy;
+  final String displayName;
+  final String? reason;
+  final DateTime createdAt;
+
+  factory ServerBan.fromMap(Map<String, dynamic> map) {
+    return ServerBan(
+      id: map['id'] as String,
+      serverId: map['server_id'] as String,
+      userId: map['user_id'] as String,
+      bannedBy: map['banned_by'] as String,
+      displayName: map['display_name'] as String? ?? 'Unknown',
+      reason: map['reason'] as String?,
+      createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
+    );
+  }
+}
+
+class AuditLogEntry {
+  const AuditLogEntry({
+    required this.id,
+    required this.serverId,
+    required this.actorId,
+    required this.actorDisplayName,
+    required this.targetUserId,
+    required this.targetDisplayName,
+    required this.action,
+    required this.details,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String serverId;
+  final String actorId;
+  final String actorDisplayName;
+  final String? targetUserId;
+  final String? targetDisplayName;
+  final String action;
+  final Map<String, dynamic> details;
+  final DateTime createdAt;
+
+  factory AuditLogEntry.fromMap(Map<String, dynamic> map) {
+    final rawDetails = map['details'];
+    final details = rawDetails is Map
+        ? Map<String, dynamic>.from(rawDetails)
+        : const <String, dynamic>{};
+    return AuditLogEntry(
+      id: map['id'] as String,
+      serverId: map['server_id'] as String,
+      actorId: map['actor_id'] as String,
+      actorDisplayName: map['actor_display_name'] as String? ?? 'Unknown',
+      targetUserId: map['target_user_id'] as String?,
+      targetDisplayName: map['target_display_name'] as String?,
+      action: map['action'] as String,
+      details: details,
+      createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
+    );
+  }
+}
+
+class MessageSearchResult {
+  const MessageSearchResult({
+    required this.id,
+    required this.channelId,
+    required this.channelName,
+    required this.body,
+    required this.senderId,
+    required this.senderDisplayName,
+    required this.senderAvatarPath,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String channelId;
+  final String channelName;
+  final String body;
+  final String senderId;
+  final String senderDisplayName;
+  final String? senderAvatarPath;
+  final DateTime createdAt;
+
+  factory MessageSearchResult.fromMap(Map<String, dynamic> map) {
+    return MessageSearchResult(
+      id: map['id'] as String,
+      channelId: map['channel_id'] as String,
+      channelName: map['channel_name'] as String? ?? '',
+      body: map['body'] as String,
+      senderId: map['sender_id'] as String,
+      senderDisplayName: map['sender_display_name'] as String? ?? 'Unknown',
+      senderAvatarPath: map['sender_avatar_path'] as String?,
+      createdAt: DateTime.parse(map['created_at'] as String).toLocal(),
+    );
+  }
 }

@@ -19,6 +19,7 @@ class AppPreferences extends ChangeNotifier {
   Map<String, DateTime> _channelLastReadAtById = const <String, DateTime>{};
   Map<String, double> _speakerVolumeByUserId = const <String, double>{};
   Map<String, double> _screenShareVolumeByUserId = const <String, double>{};
+  Set<String> _mutedServerIds = const <String>{};
 
   AppThemeScheme get themeScheme => _themeScheme;
   bool get desktopNotifications => _desktopNotifications;
@@ -36,6 +37,7 @@ class AppPreferences extends ChangeNotifier {
       _speakerVolumeByUserId[userId] ?? 1.0;
   double screenShareVolumeForUser(String userId) =>
       _screenShareVolumeByUserId[userId] ?? 1.0;
+  bool isServerMuted(String serverId) => _mutedServerIds.contains(serverId);
 
   Duration get motionDuration =>
       _reduceMotion ? Duration.zero : const Duration(milliseconds: 280);
@@ -55,6 +57,7 @@ class AppPreferences extends ChangeNotifier {
   static const _channelLastReadAtKey = 'prefs.channel_last_read_at';
   static const _speakerVolumeKey = 'prefs.speaker_volume_by_user';
   static const _screenShareVolumeKey = 'prefs.screen_share_volume_by_user';
+  static const _mutedServerIdsKey = 'prefs.muted_server_ids';
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -83,6 +86,8 @@ class AppPreferences extends ChangeNotifier {
     _speakerVolumeByUserId = _decodeVolumeMap(rawSpeakerVolumes);
     final rawScreenShareVolumes = prefs.getString(_screenShareVolumeKey);
     _screenShareVolumeByUserId = _decodeVolumeMap(rawScreenShareVolumes);
+    final rawMutedServers = prefs.getString(_mutedServerIdsKey);
+    _mutedServerIds = _decodeStringSet(rawMutedServers);
     notifyListeners();
   }
 
@@ -283,6 +288,26 @@ class AppPreferences extends ChangeNotifier {
     return values.entries
         .map((entry) => '${entry.key}=${entry.value.clamp(0.0, 2.0)}')
         .join('|');
+  }
+
+  Set<String> _decodeStringSet(String? raw) {
+    if (raw == null || raw.isEmpty) return const <String>{};
+    return raw.split('|').where((s) => s.isNotEmpty).toSet();
+  }
+
+  String _encodeStringSet(Set<String> values) => values.join('|');
+
+  Future<void> setServerMuted(String serverId, {required bool muted}) async {
+    final updated = Set<String>.from(_mutedServerIds);
+    if (muted) {
+      updated.add(serverId);
+    } else {
+      updated.remove(serverId);
+    }
+    _mutedServerIds = updated;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_mutedServerIdsKey, _encodeStringSet(_mutedServerIds));
   }
 }
 

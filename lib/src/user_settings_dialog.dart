@@ -9,6 +9,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'app_preferences.dart';
 import 'app_toast.dart';
+import 'models.dart';
 import 'repositories.dart';
 import 'session_controller.dart';
 
@@ -62,6 +63,10 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
   RTCRtpSender? _micMeterSender;
   Timer? _micMeterTimer;
   String? _avatarPath;
+  UserStatus _status = UserStatus.online;
+  late final TextEditingController _activityController =
+      TextEditingController();
+  bool _savingStatus = false;
 
   @override
   void initState() {
@@ -77,6 +82,7 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
   void dispose() {
     navigator.mediaDevices.ondevicechange = null;
     _displayNameController.dispose();
+    _activityController.dispose();
     _micMeterTimer?.cancel();
     unawaited(_disposeMicMeter());
     unawaited(widget.screenShareService.stopStream(_micStream));
@@ -103,6 +109,23 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
     );
   }
 
+  Future<void> _saveStatus() async {
+    setState(() => _savingStatus = true);
+    try {
+      await widget.repository.setUserStatus(
+        status: _status,
+        activityText: _activityController.text.trim().isEmpty
+            ? null
+            : _activityController.text.trim(),
+      );
+      if (mounted) showAppToast(context, 'Status updated.', tone: AppToastTone.success);
+    } catch (error) {
+      if (mounted) showAppToast(context, 'Failed: $error', tone: AppToastTone.error);
+    } finally {
+      if (mounted) setState(() => _savingStatus = false);
+    }
+  }
+
   Future<void> _loadProfile() async {
     try {
       final profile = await widget.repository.fetchCurrentUserProfile();
@@ -111,6 +134,8 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
       }
       setState(() {
         _avatarPath = profile.avatarPath;
+        _status = profile.status;
+        _activityController.text = profile.activityText ?? '';
         _loadingProfile = false;
       });
     } catch (_) {
@@ -665,6 +690,11 @@ class _UserSettingsDialogState extends State<UserSettingsDialog> {
                         uploadingAvatar: _uploadingAvatar,
                         onUploadAvatar: _pickAndUploadAvatar,
                         onSave: _saveProfile,
+                        status: _status,
+                        activityController: _activityController,
+                        savingStatus: _savingStatus,
+                        onStatusChanged: (s) => setState(() => _status = s),
+                        onSaveStatus: _saveStatus,
                       ),
                       _AppearanceSettingsTab(preferences: widget.preferences),
                       _NotificationSettingsTab(preferences: widget.preferences),
@@ -715,6 +745,11 @@ class _ProfileSettingsTab extends StatelessWidget {
     required this.uploadingAvatar,
     required this.onUploadAvatar,
     required this.onSave,
+    required this.status,
+    required this.activityController,
+    required this.savingStatus,
+    required this.onStatusChanged,
+    required this.onSaveStatus,
   });
 
   final TextEditingController controller;
@@ -724,6 +759,11 @@ class _ProfileSettingsTab extends StatelessWidget {
   final bool uploadingAvatar;
   final Future<void> Function() onUploadAvatar;
   final Future<void> Function() onSave;
+  final UserStatus status;
+  final TextEditingController activityController;
+  final bool savingStatus;
+  final void Function(UserStatus) onStatusChanged;
+  final Future<void> Function() onSaveStatus;
 
   @override
   Widget build(BuildContext context) {
@@ -789,7 +829,80 @@ class _ProfileSettingsTab extends StatelessWidget {
             label: Text(saving ? 'Saving...' : 'Save profile'),
           ),
         ),
+        const SizedBox(height: 28),
+        const Divider(),
+        const SizedBox(height: 16),
+        Text('Status', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 12),
+        DropdownButtonFormField<UserStatus>(
+          initialValue: status,
+          decoration: const InputDecoration(labelText: 'Status'),
+          items: UserStatus.values
+              .map(
+                (s) => DropdownMenuItem<UserStatus>(
+                  value: s,
+                  child: Row(
+                    children: [
+                      _StatusDot(status: s, size: 10),
+                      const SizedBox(width: 8),
+                      Text(s.label),
+                    ],
+                  ),
+                ),
+              )
+              .toList(),
+          onChanged: (s) {
+            if (s != null) onStatusChanged(s);
+          },
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: activityController,
+          decoration: const InputDecoration(
+            labelText: 'Activity text (optional)',
+            hintText: 'e.g. Playing a game, listening to music...',
+          ),
+          maxLength: 128,
+        ),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FilledButton.icon(
+            onPressed: savingStatus ? null : onSaveStatus,
+            icon: const Icon(Icons.check),
+            label: Text(savingStatus ? 'Saving...' : 'Save status'),
+          ),
+        ),
       ],
+    );
+  }
+}
+
+class _StatusDot extends StatelessWidget {
+  const _StatusDot({required this.status, this.size = 12});
+
+  final UserStatus status;
+  final double size;
+
+  Color get _color {
+    switch (status) {
+      case UserStatus.online:
+        return const Color(0xFF43B581);
+      case UserStatus.away:
+        return const Color(0xFFFAA61A);
+      case UserStatus.dnd:
+        return const Color(0xFFF04747);
+      case UserStatus.invisible:
+        return const Color(0xFF747F8D);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(color: _color, shape: BoxShape.circle),
     );
   }
 }

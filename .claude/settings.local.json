@@ -11,7 +11,16 @@
       "Bash(flutter pub:*)",
       "Bash(flutter build:*)",
       "Bash(cat /d/chitchat2/.github/workflows/*.yml)",
-      "Bash(xargs ls:*)"
+      "Bash(xargs ls:*)",
+      "Bash(grep -E \"\\\\.dart$\")",
+      "Bash(grep -n \"has_server_permission\\\\|has_channel_permission\" /d/chitchat2/supabase/migrations/*.sql)",
+      "Bash(grep -n \"create.*function.*has_channel_permission\\\\|create.*function.*has_server_permission\\\\|is_server_member\\\\|is_server_owner\" /d/chitchat2/supabase/migrations/*.sql)",
+      "Bash(grep -rn \"function.*permission\\\\|has_.*permission\" /d/chitchat2/supabase/migrations/*.sql)",
+      "Bash(grep -l \"has_channel_permission\" /d/chitchat2/supabase/migrations/*.sql)",
+      "Bash(find C:/Users/jacob/AppData/Local/Pub/Cache/hosted/pub.dev/ -name *.dart -path *realtime*)",
+      "Bash(awk 'NR>=150 && NR<=200')",
+      "Bash(flutter analyze:*)",
+      "Bash(grep -rn \"has_server_permission\\\\|target_server\" d:/chitchat2/supabase/migrations/*.sql)"
     ]
   }
 }
